@@ -199,37 +199,8 @@ def map_command(args):
     gdf.set_crs("EPSG:4326", inplace=True)  # Set the coordinate system to WGS84
 
     # Plot the map
-    # Check if world map shapefile exists
-    world_map_path = Path("world_map/ne_110m_admin_0_countries.shp")
-    if not world_map_path.exists():
-        print("Using Natural Earth world map from online source.")
-        # Use Natural Earth data directly from their URL with custom user agent
-        import requests
-        import tempfile
-
-        world_url = "https://www.naturalearthdata.com/http//www.naturalearthdata.com/download/110m/cultural/ne_110m_admin_0_countries.zip"
-
-        # Get version for user agent
-        from . import __version__
-
-        user_agent = f"GeoTessera/{__version__}"
-
-        headers = {"User-Agent": user_agent}
-
-        # Download with custom user agent
-        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as temp_file:
-            response = requests.get(world_url, headers=headers)
-            response.raise_for_status()
-            temp_file.write(response.content)
-            temp_file_path = temp_file.name
-
-        try:
-            world = geopandas.read_file(temp_file_path)
-        finally:
-            # Clean up temporary file
-            Path(temp_file_path).unlink(missing_ok=True)
-    else:
-        world = geopandas.read_file(world_map_path)
+    world_url = "https://naciscdn.org/naturalearth/110m/cultural/ne_110m_admin_0_countries.zip"
+    world = geopandas.read_file(world_url)
 
     # Create the plotting area
     print("Creating map...")
