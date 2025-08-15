@@ -21,7 +21,12 @@ from .visualization import (
 
 
 def download_command(args):
-    """Download tiles for a bounding box and export as GeoTIFFs."""
+    """Export region of interest as discrete GeoTIFF files with native UTM projections.
+    
+    Each tile is exported as a separate GeoTIFF file preserving the original UTM 
+    coordinate system from the corresponding landmask tile. Files are not merged,
+    allowing individual tile inspection and processing.
+    """
     gt = GeoTessera(
         dataset_version=args.dataset_version,
         cache_dir=args.cache_dir,
@@ -34,15 +39,22 @@ def download_command(args):
         if len(bbox) != 4:
             print("Error: bbox must be 'min_lon,min_lat,max_lon,max_lat'")
             return
+        print(f"Using bounding box: {bbox}")
     elif args.region_file:
         try:
             bbox = calculate_bbox_from_file(args.region_file)
             print(f"Calculated bbox from {args.region_file}: {bbox}")
+            print(f"  - Longitude range: {bbox[0]:.6f} to {bbox[2]:.6f}")
+            print(f"  - Latitude range: {bbox[1]:.6f} to {bbox[3]:.6f}")
         except Exception as e:
             print(f"Error reading region file: {e}")
+            print("Supported formats: GeoJSON, Shapefile, etc.")
             return
     else:
         print("Error: Must specify either --bbox or --region-file")
+        print("Examples:")
+        print("  --bbox '-0.2,51.4,0.1,51.6'  # London area")
+        print("  --region-file london.geojson  # From GeoJSON file")
         return
     
     # Parse bands
@@ -50,19 +62,23 @@ def download_command(args):
     if args.bands:
         try:
             bands = list(map(int, args.bands.split(',')))
-            print(f"Exporting bands: {bands}")
+            print(f"Exporting {len(bands)} selected bands: {bands}")
         except ValueError:
-            print("Error: bands must be comma-separated integers")
+            print("Error: bands must be comma-separated integers (0-127)")
+            print("Example: --bands '0,1,2' for first 3 bands")
             return
     else:
         print("Exporting all 128 bands")
     
-    print(f"Downloading tiles for bbox: {bbox}")
-    print(f"Year: {args.year}")
-    print(f"Output directory: {args.output}")
+    print(f"\\nRegion of Interest Export:")
+    print(f"  Year: {args.year}")
+    print(f"  Output directory: {args.output}")
+    print(f"  Compression: {args.compress}")
+    print(f"  Dataset version: {args.dataset_version}")
     
     try:
-        # Export tiles as GeoTIFFs
+        # Export tiles as discrete GeoTIFFs with UTM projections
+        print(f"\\n🔄 Fetching embedding tiles and exporting as discrete GeoTIFFs...")
         files = gt.export_embedding_geotiffs(
             bbox=bbox,
             output_dir=args.output,
@@ -71,15 +87,56 @@ def download_command(args):
             compress=args.compress
         )
         
-        print(f"\\nSUCCESS: Created {len(files)} GeoTIFF files")
+        if not files:
+            print("⚠️  No tiles found in the specified region.")
+            print("Try expanding your bounding box or checking data availability.")
+            return
+        
+        print(f"\\n✅ SUCCESS: Exported {len(files)} discrete GeoTIFF files")
+        print(f"   Each file preserves its native UTM projection from landmask tiles")
+        print(f"   Files can be individually inspected and processed")
+        
+        if args.verbose or args.list_files:
+            print(f"\\n📁 Created files:")
+            for i, f in enumerate(files, 1):
+                file_path = Path(f)
+                file_size = file_path.stat().st_size if file_path.exists() else 0
+                print(f"  {i:2d}. {file_path.name} ({file_size:,} bytes)")
+        elif len(files) > 0:
+            print(f"\\n📁 Sample files (use --verbose or --list-files to see all):")
+            for f in files[:3]:
+                file_path = Path(f)
+                file_size = file_path.stat().st_size if file_path.exists() else 0
+                print(f"     {file_path.name} ({file_size:,} bytes)")
+            if len(files) > 3:
+                print(f"     ... and {len(files) - 3} more files")
+        
+        # Show tile coordinate information
+        print(f"\\n🗺️  Spatial Information:")
         if args.verbose:
-            for f in files[:5]:  # Show first 5 files
-                print(f"  {f}")
-            if len(files) > 5:
-                print(f"  ... and {len(files) - 5} more files")
+            try:
+                import rasterio
+                # Sample the first file to show projection info
+                with rasterio.open(files[0]) as src:
+                    print(f"   CRS: {src.crs}")
+                    print(f"   Transform: {src.transform}")
+                    print(f"   Dimensions: {src.width} x {src.height} pixels")
+                    print(f"   Data type: {src.dtypes[0]}")
+            except Exception:
+                pass
+        
+        print(f"   Output directory: {Path(args.output).resolve()}")
+        print(f"\\n💡 Next steps:")
+        print(f"   - Inspect individual tiles with QGIS, GDAL, or rasterio")
+        print(f"   - Use 'gdalinfo <filename>' to see projection details")
+        print(f"   - Process tiles individually or in groups as needed")
                 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"\\n❌ Error: {e}")
+        if args.verbose:
+            import traceback
+            print("\\nFull traceback:")
+            traceback.print_exc()
         return
 
 
@@ -268,13 +325,14 @@ def main():
     subparsers = parser.add_subparsers(dest='command', help='Commands')
     
     # Download command
-    download_parser = subparsers.add_parser('download', help='Download tiles as GeoTIFFs')
+    download_parser = subparsers.add_parser('download', help='Export region as discrete GeoTIFFs with UTM projections')
     download_parser.add_argument('--bbox', help='Bounding box: min_lon,min_lat,max_lon,max_lat')
     download_parser.add_argument('--region-file', help='GeoJSON/Shapefile to define region')
     download_parser.add_argument('--year', type=int, default=2024, help='Year of embeddings')
     download_parser.add_argument('--bands', help='Comma-separated band indices (default: all 128)')
     download_parser.add_argument('--output', '-o', required=True, help='Output directory')
     download_parser.add_argument('--compress', default='lzw', help='Compression method')
+    download_parser.add_argument('--list-files', action='store_true', help='List all created files with details')
     download_parser.set_defaults(func=download_command)
     
     # Visualize command  

@@ -127,9 +127,58 @@ class GeoTessera:
         scales = np.load(scales_file)
         
         # Dequantize using scales
+        # Handle both 2D scales (H, W) and 3D scales (H, W, 128)
+        if scales.ndim == 2 and quantized_embedding.ndim == 3:
+            # Broadcast 2D scales to match 3D embedding shape
+            scales = scales[..., np.newaxis]  # Add channel dimension
+        
         dequantized = quantized_embedding.astype(np.float32) * scales
         
         return dequantized
+
+    def _get_utm_projection_from_landmask(self, lat: float, lon: float):
+        """Get UTM projection info from corresponding landmask tile.
+        
+        Args:
+            lat: Tile center latitude
+            lon: Tile center longitude
+            
+        Returns:
+            Tuple of (crs, transform) from landmask tile
+            
+        Raises:
+            ImportError: If rasterio is not available
+            RuntimeError: If landmask tile cannot be fetched or read
+        """
+        try:
+            import rasterio
+        except ImportError:
+            raise ImportError("rasterio required for UTM projection retrieval: pip install rasterio")
+            
+        try:
+            from .registry import tile_to_landmask_filename
+            
+            # Get landmask filename
+            landmask_filename = tile_to_landmask_filename(lat, lon)
+            
+            # Ensure registry block is loaded
+            self.registry.ensure_tile_block_loaded(lon, lat)
+            
+            # Fetch landmask file
+            landmask_path = self.registry.fetch_landmask(landmask_filename, progressbar=False)
+            
+            # Extract CRS and transform
+            with rasterio.open(landmask_path) as src:
+                if src.crs is None:
+                    raise RuntimeError(f"Landmask tile {landmask_filename} has no CRS information")
+                if src.transform is None:
+                    raise RuntimeError(f"Landmask tile {landmask_filename} has no transform information")
+                return src.crs, src.transform
+                
+        except Exception as e:
+            if isinstance(e, (ImportError, RuntimeError)):
+                raise
+            raise RuntimeError(f"Failed to get UTM projection from landmask for ({lat:.2f}, {lon:.2f}): {e}") from e
 
     def export_embedding_geotiff(
         self,
@@ -140,7 +189,7 @@ class GeoTessera:
         bands: Optional[List[int]] = None,
         compress: str = "lzw"
     ) -> str:
-        """Export a single embedding tile as a GeoTIFF file.
+        """Export a single embedding tile as a GeoTIFF file with native UTM projection.
         
         Args:
             lat: Tile center latitude
@@ -152,6 +201,11 @@ class GeoTessera:
             
         Returns:
             Path to created GeoTIFF file
+            
+        Raises:
+            ImportError: If rasterio is not available
+            RuntimeError: If landmask tile or embedding data cannot be fetched
+            FileNotFoundError: If registry files are missing
         """
         try:
             import rasterio
@@ -173,13 +227,11 @@ class GeoTessera:
             data = embedding.copy()
             band_count = 128
             
-        # Get tile bounds
-        from .registry import get_tile_bounds
-        west, south, east, north = get_tile_bounds(lat, lon)
-        
-        # Create georeferencing transform
+        # Get dimensions for GeoTIFF
         height, width = data.shape[:2]
-        transform = from_bounds(west, south, east, north, width, height)
+        
+        # Get UTM projection from landmask
+        crs, transform = self._get_utm_projection_from_landmask(lat, lon)
         
         # Write GeoTIFF
         with rasterio.open(
@@ -190,7 +242,7 @@ class GeoTessera:
             width=width,
             count=band_count,
             dtype='float32',
-            crs='EPSG:4326',
+            crs=crs,
             transform=transform,
             compress=compress,
             tiled=True,
@@ -229,7 +281,7 @@ class GeoTessera:
         bands: Optional[List[int]] = None,
         compress: str = "lzw"
     ) -> List[str]:
-        """Export all embedding tiles in bounding box as individual GeoTIFF files.
+        """Export all embedding tiles in bounding box as individual GeoTIFF files with native UTM projections.
         
         Args:
             bbox: Bounding box as (min_lon, min_lat, max_lon, max_lat)
@@ -240,6 +292,11 @@ class GeoTessera:
             
         Returns:
             List of paths to created GeoTIFF files
+            
+        Raises:
+            ImportError: If rasterio is not available
+            RuntimeError: If landmask tiles or embedding data cannot be fetched
+            FileNotFoundError: If registry files are missing
         """
         try:
             import rasterio
@@ -272,13 +329,11 @@ class GeoTessera:
             filename = f"tessera_{year}_lat{tile_lat:.2f}_lon{tile_lon:.2f}.tif"
             output_path = output_dir / filename
             
-            # Get tile bounds
-            from .registry import get_tile_bounds
-            west, south, east, north = get_tile_bounds(tile_lat, tile_lon)
-            
-            # Create georeferencing transform
+            # Get dimensions for GeoTIFF
             height, width = data.shape[:2]
-            transform = from_bounds(west, south, east, north, width, height)
+            
+            # Get UTM projection from landmask
+            crs, transform = self._get_utm_projection_from_landmask(tile_lat, tile_lon)
             
             # Write GeoTIFF
             with rasterio.open(
@@ -289,7 +344,7 @@ class GeoTessera:
                 width=width,
                 count=band_count,
                 dtype='float32',
-                crs='EPSG:4326',
+                crs=crs,
                 transform=transform,
                 compress=compress,
                 tiled=True,

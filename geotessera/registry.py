@@ -535,8 +535,7 @@ class Registry:
             registry_file = embeddings_dir / registry_filename
             
             if not registry_file.exists():
-                # Silently skip if file doesn't exist - it may not have data for this block
-                return
+                raise FileNotFoundError(f"Embeddings registry file not found: {registry_file}")
             
             # Load the registry file directly (now in correct pooch format)
             self._pooch.load_registry(str(registry_file))
@@ -729,7 +728,7 @@ class Registry:
                     self.ensure_block_loaded(year, center_lon, center_lat)
                     blocks_loaded += 1
                 except Exception as e:
-                    print(f"Warning: Failed to load block ({block_lon}, {block_lat}): {e}")
+                    raise RuntimeError(f"Failed to load registry block ({block_lon}, {block_lat}): {e}") from e
         
         # Calculate how many blocks are actually available
         blocks_available = sum(
