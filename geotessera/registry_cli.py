@@ -25,7 +25,7 @@ from rich.progress import (
     TaskProgressColumn,
 )
 
-from .registry_utils import (
+from .registry import (
     get_block_coordinates,
     get_embeddings_registry_filename,
     get_landmasks_registry_filename,
