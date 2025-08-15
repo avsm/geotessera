@@ -694,8 +694,8 @@ class Registry:
         except Exception as e:
             print(f"Error loading all blocks: {e}")
     
-    def load_blocks_for_region(self, bounds: Tuple[float, float, float, float], year: int):
-        """Load only the registry blocks needed for a specific region.
+    def load_blocks_for_region(self, bounds: Tuple[float, float, float, float], year: int) -> List[Tuple[float, float]]:
+        """Load only the registry blocks needed for a specific region and return available tiles.
         
         This is much more efficient than loading all blocks globally when only
         working with a specific geographic region.
@@ -703,6 +703,9 @@ class Registry:
         Args:
             bounds: Geographic bounds as (min_lon, min_lat, max_lon, max_lat)
             year: Year of embeddings to load
+            
+        Returns:
+            List of (tile_lat, tile_lon) tuples for tiles available in the region
         """
         min_lon, min_lat, max_lon, max_lat = bounds
         
@@ -747,6 +750,23 @@ class Registry:
         
         # Update available embeddings cache
         self._parse_available_embeddings()
+        
+        # Filter tiles that are in the region for the specified year
+        tiles_in_region = []
+        for emb_year, lat, lon in self._available_embeddings:
+            if emb_year != year:
+                continue
+                
+            # Check if tile intersects with region bounds
+            # Tiles are centered on 0.05-degree offsets and cover 0.1-degree squares
+            tile_min_lon, tile_min_lat = lon - 0.05, lat - 0.05
+            tile_max_lon, tile_max_lat = lon + 0.05, lat + 0.05
+            
+            if (tile_min_lon < max_lon and tile_max_lon > min_lon and
+                tile_min_lat < max_lat and tile_max_lat > min_lat):
+                tiles_in_region.append((lat, lon))
+        
+        return tiles_in_region
     
     def ensure_tile_block_loaded(self, lon: float, lat: float):
         """Ensure registry data for a specific tile block is loaded.

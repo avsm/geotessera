@@ -3,10 +3,18 @@
 Focused on downloading tiles and creating visualizations from the generated GeoTIFFs.
 """
 
-import argparse
 import sys
 from pathlib import Path
-import json
+from typing import Optional, List, Callable
+from typing_extensions import Annotated
+
+import typer
+from rich.console import Console
+from rich.progress import Progress, TaskID, BarColumn, TextColumn, TimeRemainingColumn
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+from rich import print as rprint
 
 from .core import GeoTessera
 from .visualization import (
@@ -19,355 +27,501 @@ from .visualization import (
     analyze_geotiff_coverage
 )
 
+app = typer.Typer(
+    name="geotessera",
+    help="GeoTessera: Download satellite embedding tiles as GeoTIFFs",
+    add_completion=False,
+    rich_markup_mode="rich"
+)
 
-def download_command(args):
-    """Export region of interest as discrete GeoTIFF files with native UTM projections.
+console = Console()
+
+
+def create_progress_callback(progress: Progress, task_id: TaskID) -> Callable:
+    """Create a progress callback for core library operations."""
+    def progress_callback(current: int, total: int, status: str = None):
+        if status:
+            progress.update(task_id, completed=current, total=total, status=status)
+        else:
+            progress.update(task_id, completed=current, total=total)
+    return progress_callback
+
+
+@app.command()
+def download(
+    output: Annotated[Path, typer.Option(
+        "--output", "-o",
+        help="Output directory"
+    )],
+    bbox: Annotated[Optional[str], typer.Option(
+        "--bbox",
+        help="Bounding box: 'min_lon,min_lat,max_lon,max_lat'"
+    )] = None,
+    region_file: Annotated[Optional[Path], typer.Option(
+        "--region-file",
+        help="GeoJSON/Shapefile to define region",
+        exists=True
+    )] = None,
+    year: Annotated[int, typer.Option(
+        "--year",
+        help="Year of embeddings"
+    )] = 2024,
+    bands: Annotated[Optional[str], typer.Option(
+        "--bands",
+        help="Comma-separated band indices (default: all 128)"
+    )] = None,
+    compress: Annotated[str, typer.Option(
+        "--compress",
+        help="Compression method"
+    )] = "lzw",
+    list_files: Annotated[bool, typer.Option(
+        "--list-files",
+        help="List all created files with details"
+    )] = False,
+    dataset_version: Annotated[str, typer.Option(
+        "--dataset-version",
+        help="Tessera dataset version (e.g., v1, v2)"
+    )] = "v1",
+    cache_dir: Annotated[Optional[Path], typer.Option(
+        "--cache-dir",
+        help="Cache directory"
+    )] = None,
+    registry_dir: Annotated[Optional[Path], typer.Option(
+        "--registry-dir",
+        help="Registry directory"
+    )] = None,
+    verbose: Annotated[bool, typer.Option(
+        "--verbose", "-v",
+        help="Verbose output"
+    )] = False
+):
+    """Export region as discrete GeoTIFFs with UTM projections.
     
     Each tile is exported as a separate GeoTIFF file preserving the original UTM 
     coordinate system from the corresponding landmask tile. Files are not merged,
     allowing individual tile inspection and processing.
     """
+    
+    # Initialize GeoTessera
     gt = GeoTessera(
-        dataset_version=args.dataset_version,
-        cache_dir=args.cache_dir,
-        registry_dir=args.registry_dir
+        dataset_version=dataset_version,
+        cache_dir=str(cache_dir) if cache_dir else None,
+        registry_dir=str(registry_dir) if registry_dir else None
     )
     
     # Parse bounding box
-    if args.bbox:
-        bbox = tuple(map(float, args.bbox.split(',')))
-        if len(bbox) != 4:
-            print("Error: bbox must be 'min_lon,min_lat,max_lon,max_lat'")
-            return
-        print(f"Using bounding box: {bbox}")
-    elif args.region_file:
+    if bbox:
         try:
-            bbox = calculate_bbox_from_file(args.region_file)
-            print(f"Calculated bbox from {args.region_file}: {bbox}")
-            print(f"  - Longitude range: {bbox[0]:.6f} to {bbox[2]:.6f}")
-            print(f"  - Latitude range: {bbox[1]:.6f} to {bbox[3]:.6f}")
+            bbox_coords = tuple(map(float, bbox.split(',')))
+            if len(bbox_coords) != 4:
+                rprint("[red]Error: bbox must be 'min_lon,min_lat,max_lon,max_lat'[/red]")
+                raise typer.Exit(1)
+            rprint(f"[green]Using bounding box:[/green] {bbox_coords}")
+        except ValueError:
+            rprint("[red]Error: Invalid bbox format. Use: 'min_lon,min_lat,max_lon,max_lat'[/red]")
+            raise typer.Exit(1)
+    elif region_file:
+        try:
+            bbox_coords = calculate_bbox_from_file(region_file)
+            rprint(f"[green]Calculated bbox from {region_file}:[/green] {bbox_coords}")
+            rprint(f"  • Longitude range: {bbox_coords[0]:.6f} to {bbox_coords[2]:.6f}")
+            rprint(f"  • Latitude range: {bbox_coords[1]:.6f} to {bbox_coords[3]:.6f}")
         except Exception as e:
-            print(f"Error reading region file: {e}")
-            print("Supported formats: GeoJSON, Shapefile, etc.")
-            return
+            rprint(f"[red]Error reading region file: {e}[/red]")
+            rprint("Supported formats: GeoJSON, Shapefile, etc.")
+            raise typer.Exit(1)
     else:
-        print("Error: Must specify either --bbox or --region-file")
-        print("Examples:")
-        print("  --bbox '-0.2,51.4,0.1,51.6'  # London area")
-        print("  --region-file london.geojson  # From GeoJSON file")
-        return
+        rprint("[red]Error: Must specify either --bbox or --region-file[/red]")
+        rprint("Examples:")
+        rprint("  --bbox '-0.2,51.4,0.1,51.6'  # London area")
+        rprint("  --region-file london.geojson  # From GeoJSON file")
+        raise typer.Exit(1)
     
     # Parse bands
-    bands = None
-    if args.bands:
+    bands_list = None
+    if bands:
         try:
-            bands = list(map(int, args.bands.split(',')))
-            print(f"Exporting {len(bands)} selected bands: {bands}")
+            bands_list = list(map(int, bands.split(',')))
+            rprint(f"[blue]Exporting {len(bands_list)} selected bands:[/blue] {bands_list}")
         except ValueError:
-            print("Error: bands must be comma-separated integers (0-127)")
-            print("Example: --bands '0,1,2' for first 3 bands")
-            return
+            rprint("[red]Error: bands must be comma-separated integers (0-127)[/red]")
+            rprint("Example: --bands '0,1,2' for first 3 bands")
+            raise typer.Exit(1)
     else:
-        print("Exporting all 128 bands")
+        rprint("[blue]Exporting all 128 bands[/blue]")
     
-    print(f"\\nRegion of Interest Export:")
-    print(f"  Year: {args.year}")
-    print(f"  Output directory: {args.output}")
-    print(f"  Compression: {args.compress}")
-    print(f"  Dataset version: {args.dataset_version}")
+    # Display export info
+    info_table = Table(show_header=False, box=None)
+    info_table.add_row("Year:", str(year))
+    info_table.add_row("Output directory:", str(output))
+    info_table.add_row("Compression:", compress)
+    info_table.add_row("Dataset version:", dataset_version)
+    
+    rprint(Panel(info_table, title="[bold]Region of Interest Export[/bold]", border_style="blue"))
     
     try:
-        # Export tiles as discrete GeoTIFFs with UTM projections
-        print(f"\\n🔄 Fetching embedding tiles and exporting as discrete GeoTIFFs...")
-        files = gt.export_embedding_geotiffs(
-            bbox=bbox,
-            output_dir=args.output,
-            year=args.year,
-            bands=bands,
-            compress=args.compress
-        )
+        # Export tiles with progress tracking
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TextColumn("•"),
+            TextColumn("[dim]{task.fields[status]}", justify="left"),
+            TimeRemainingColumn(),
+            console=console
+        ) as progress:
+            
+            task = progress.add_task("🔄 Processing tiles...", total=100, status="Starting...")
+            
+            # Export with progress callback
+            files = gt.export_embedding_geotiffs(
+                bbox=bbox_coords,
+                output_dir=output,
+                year=year,
+                bands=bands_list,
+                compress=compress,
+                progress_callback=create_progress_callback(progress, task)
+            )
         
         if not files:
-            print("⚠️  No tiles found in the specified region.")
-            print("Try expanding your bounding box or checking data availability.")
+            rprint("[yellow]⚠️  No tiles found in the specified region.[/yellow]")
+            rprint("Try expanding your bounding box or checking data availability.")
             return
         
-        print(f"\\n✅ SUCCESS: Exported {len(files)} discrete GeoTIFF files")
-        print(f"   Each file preserves its native UTM projection from landmask tiles")
-        print(f"   Files can be individually inspected and processed")
+        rprint(f"\n[green]✅ SUCCESS: Exported {len(files)} discrete GeoTIFF files[/green]")
+        rprint("   Each file preserves its native UTM projection from landmask tiles")
+        rprint("   Files can be individually inspected and processed")
         
-        if args.verbose or args.list_files:
-            print(f"\\n📁 Created files:")
+        if verbose or list_files:
+            rprint(f"\n[blue]📁 Created files:[/blue]")
+            file_table = Table(show_header=True, header_style="bold blue")
+            file_table.add_column("#", style="dim", width=3)
+            file_table.add_column("Filename")
+            file_table.add_column("Size", justify="right")
+            
             for i, f in enumerate(files, 1):
                 file_path = Path(f)
                 file_size = file_path.stat().st_size if file_path.exists() else 0
-                print(f"  {i:2d}. {file_path.name} ({file_size:,} bytes)")
+                file_table.add_row(str(i), file_path.name, f"{file_size:,} bytes")
+            
+            console.print(file_table)
         elif len(files) > 0:
-            print(f"\\n📁 Sample files (use --verbose or --list-files to see all):")
+            rprint(f"\n[blue]📁 Sample files (use --verbose or --list-files to see all):[/blue]")
             for f in files[:3]:
                 file_path = Path(f)
                 file_size = file_path.stat().st_size if file_path.exists() else 0
-                print(f"     {file_path.name} ({file_size:,} bytes)")
+                rprint(f"     {file_path.name} ({file_size:,} bytes)")
             if len(files) > 3:
-                print(f"     ... and {len(files) - 3} more files")
+                rprint(f"     ... and {len(files) - 3} more files")
         
-        # Show tile coordinate information
-        print(f"\\n🗺️  Spatial Information:")
-        if args.verbose:
+        # Show spatial information
+        rprint(f"\n[blue]🗺️  Spatial Information:[/blue]")
+        if verbose:
             try:
                 import rasterio
-                # Sample the first file to show projection info
                 with rasterio.open(files[0]) as src:
-                    print(f"   CRS: {src.crs}")
-                    print(f"   Transform: {src.transform}")
-                    print(f"   Dimensions: {src.width} x {src.height} pixels")
-                    print(f"   Data type: {src.dtypes[0]}")
+                    rprint(f"   CRS: {src.crs}")
+                    rprint(f"   Transform: {src.transform}")
+                    rprint(f"   Dimensions: {src.width} x {src.height} pixels")
+                    rprint(f"   Data type: {src.dtypes[0]}")
             except Exception:
                 pass
         
-        print(f"   Output directory: {Path(args.output).resolve()}")
-        print(f"\\n💡 Next steps:")
-        print(f"   - Inspect individual tiles with QGIS, GDAL, or rasterio")
-        print(f"   - Use 'gdalinfo <filename>' to see projection details")
-        print(f"   - Process tiles individually or in groups as needed")
+        rprint(f"   Output directory: {Path(output).resolve()}")
+        
+        tips_table = Table(show_header=False, box=None)
+        tips_table.add_row("• Inspect individual tiles with QGIS, GDAL, or rasterio")
+        tips_table.add_row("• Use 'gdalinfo <filename>' to see projection details")
+        tips_table.add_row("• Process tiles individually or in groups as needed")
+        
+        rprint(Panel(tips_table, title="[bold]💡 Next steps[/bold]", border_style="green"))
                 
     except Exception as e:
-        print(f"\\n❌ Error: {e}")
-        if args.verbose:
+        rprint(f"\n[red]❌ Error: {e}[/red]")
+        if verbose:
             import traceback
-            print("\\nFull traceback:")
-            traceback.print_exc()
-        return
+            rprint("\n[dim]Full traceback:[/dim]")
+            console.print_exception()
+        raise typer.Exit(1)
 
 
-def visualize_command(args):
+@app.command()
+def visualize(
+    input_path: Annotated[Path, typer.Argument(
+        help="Input GeoTIFF file or directory"
+    )],
+    output: Annotated[Path, typer.Option(
+        "--output", "-o",
+        help="Output directory"
+    )],
+    vis_type: Annotated[str, typer.Option(
+        "--type",
+        help="Visualization type"
+    )] = "rgb",
+    bands: Annotated[Optional[str], typer.Option(
+        "--bands",
+        help="Comma-separated band indices"
+    )] = None,
+    normalize: Annotated[bool, typer.Option(
+        "--normalize",
+        help="Normalize bands"
+    )] = False,
+    min_zoom: Annotated[int, typer.Option(
+        "--min-zoom",
+        help="Min zoom for web tiles"
+    )] = 8,
+    max_zoom: Annotated[int, typer.Option(
+        "--max-zoom",
+        help="Max zoom for web tiles"
+    )] = 15,
+    initial_zoom: Annotated[int, typer.Option(
+        "--initial-zoom",
+        help="Initial zoom level"
+    )] = 10
+):
     """Create visualizations from GeoTIFF files."""
+    
+    # Validate visualization type
+    if vis_type not in ['rgb', 'web', 'coverage']:
+        rprint(f"[red]Error: Invalid visualization type '{vis_type}'. Must be one of: rgb, web, coverage[/red]")
+        raise typer.Exit(1)
+    
     # Find GeoTIFF files
-    input_dir = Path(args.input)
-    if input_dir.is_file():
-        geotiff_paths = [str(input_dir)]
+    if input_path.is_file():
+        geotiff_paths = [str(input_path)]
     else:
-        geotiff_paths = list(map(str, input_dir.glob("*.tif")))
-        geotiff_paths.extend(map(str, input_dir.glob("*.tiff")))
+        geotiff_paths = list(map(str, input_path.glob("*.tif")))
+        geotiff_paths.extend(map(str, input_path.glob("*.tiff")))
     
     if not geotiff_paths:
-        print(f"No GeoTIFF files found in {args.input}")
-        return
+        rprint(f"[red]No GeoTIFF files found in {input_path}[/red]")
+        raise typer.Exit(1)
         
-    print(f"Found {len(geotiff_paths)} GeoTIFF files")
+    rprint(f"[blue]Found {len(geotiff_paths)} GeoTIFF files[/blue]")
     
-    output_dir = Path(args.output)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output.mkdir(parents=True, exist_ok=True)
     
-    if args.type == 'rgb':
-        # Create RGB mosaic
-        bands = [0, 1, 2]  # Default RGB bands
-        if args.bands:
-            bands = list(map(int, args.bands.split(',')))
-            if len(bands) != 3:
-                print("Error: RGB visualization requires exactly 3 bands")
-                return
-                
-        output_path = output_dir / "rgb_mosaic.tif"
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TextColumn("•"),
+        TextColumn("[dim]{task.fields[status]}", justify="left"),
+        TimeRemainingColumn(),
+        console=console
+    ) as progress:
         
-        try:
-            created_file = create_rgb_mosaic_from_geotiffs(
-                geotiff_paths=geotiff_paths,
-                output_path=str(output_path),
-                bands=tuple(bands),
-                normalize=args.normalize
-            )
-            print(f"Created RGB mosaic: {created_file}")
+        if vis_type == 'rgb':
+            # Create RGB mosaic
+            bands_list = [0, 1, 2]  # Default RGB bands
+            if bands:
+                bands_list = list(map(int, bands.split(',')))
+                if len(bands_list) != 3:
+                    rprint("[red]Error: RGB visualization requires exactly 3 bands[/red]")
+                    raise typer.Exit(1)
+                    
+            output_path = output / "rgb_mosaic.tif"
             
-        except Exception as e:
-            print(f"Error creating RGB mosaic: {e}")
-            return
+            task = progress.add_task("Creating RGB mosaic...", total=100, status="Starting...")
             
-    elif args.type == 'web':
-        # Create web tiles
-        if len(geotiff_paths) > 1:
-            # First create RGB mosaic
-            mosaic_path = output_dir / "temp_mosaic.tif"
-            bands = [0, 1, 2]
-            if args.bands:
-                bands = list(map(int, args.bands.split(',')))[:3]
-                
             try:
-                create_rgb_mosaic_from_geotiffs(
+                created_file = create_rgb_mosaic_from_geotiffs(
                     geotiff_paths=geotiff_paths,
-                    output_path=str(mosaic_path),
-                    bands=tuple(bands),
-                    normalize=args.normalize
+                    output_path=str(output_path),
+                    bands=tuple(bands_list),
+                    normalize=normalize,
+                    progress_callback=create_progress_callback(progress, task)
                 )
-                source_file = str(mosaic_path)
+                rprint(f"[green]Created RGB mosaic: {created_file}[/green]")
                 
             except Exception as e:
-                print(f"Error creating mosaic for web tiles: {e}")
-                return
-        else:
-            source_file = geotiff_paths[0]
+                rprint(f"[red]Error creating RGB mosaic: {e}[/red]")
+                raise typer.Exit(1)
+                
+        elif vis_type == 'web':
+            # Create web tiles
+            if len(geotiff_paths) > 1:
+                # First create RGB mosaic
+                mosaic_path = output / "temp_mosaic.tif"
+                bands_list = [0, 1, 2]
+                if bands:
+                    bands_list = list(map(int, bands.split(',')))[:3]
+                    
+                task1 = progress.add_task("Creating mosaic for web tiles...", total=50, status="Starting...")
+                
+                try:
+                    # Create wrapper callback for the first phase (0-50%)
+                    def mosaic_progress_callback(current: int, total: int, status: str = None):
+                        overall_progress = int((current / total) * 50)
+                        create_progress_callback(progress, task1)(overall_progress, 50, status)
+                    
+                    create_rgb_mosaic_from_geotiffs(
+                        geotiff_paths=geotiff_paths,
+                        output_path=str(mosaic_path),
+                        bands=tuple(bands_list),
+                        normalize=normalize,
+                        progress_callback=mosaic_progress_callback
+                    )
+                    progress.update(task1, completed=50)
+                    source_file = str(mosaic_path)
+                    
+                except Exception as e:
+                    rprint(f"[red]Error creating mosaic for web tiles: {e}[/red]")
+                    raise typer.Exit(1)
+            else:
+                source_file = geotiff_paths[0]
+                
+            # Generate web tiles
+            tiles_dir = output / "tiles"
             
-        # Generate web tiles
-        tiles_dir = output_dir / "tiles"
-        
-        try:
-            geotiff_to_web_tiles(
-                geotiff_path=source_file,
-                output_dir=str(tiles_dir),
-                zoom_levels=(args.min_zoom, args.max_zoom)
-            )
+            task2 = progress.add_task("Generating web tiles...", total=100, status="Starting...")
             
-            # Create HTML viewer
-            html_path = output_dir / "viewer.html"
+            try:
+                geotiff_to_web_tiles(
+                    geotiff_path=source_file,
+                    output_dir=str(tiles_dir),
+                    zoom_levels=(min_zoom, max_zoom)
+                )
+                progress.update(task2, completed=80)
+                
+                # Create HTML viewer
+                html_path = output / "viewer.html"
+                
+                # Calculate center from coverage
+                coverage = analyze_geotiff_coverage(geotiff_paths)
+                bounds = coverage["bounds"]
+                center_lat = (bounds["min_lat"] + bounds["max_lat"]) / 2
+                center_lon = (bounds["min_lon"] + bounds["max_lon"]) / 2
+                
+                create_simple_web_viewer(
+                    tiles_dir=str(tiles_dir),
+                    output_html=str(html_path),
+                    center_lat=center_lat,
+                    center_lon=center_lon,
+                    zoom=initial_zoom,
+                    title=f"GeoTessera - {input_path}"
+                )
+                
+                progress.update(task2, completed=100)
+                
+                rprint(f"[green]Created web tiles in: {tiles_dir}[/green]")
+                rprint(f"[green]Created viewer: {html_path}[/green]")
+                rprint(f"[blue]Open {html_path} in a web browser to view[/blue]")
+                
+            except Exception as e:
+                rprint(f"[red]Error creating web visualization: {e}[/red]")
+                raise typer.Exit(1)
+                
+        elif vis_type == 'coverage':
+            # Create coverage map
+            html_path = output / "coverage.html"
             
-            # Calculate center from coverage
-            coverage = analyze_geotiff_coverage(geotiff_paths)
-            bounds = coverage["bounds"]
-            center_lat = (bounds["min_lat"] + bounds["max_lat"]) / 2
-            center_lon = (bounds["min_lon"] + bounds["max_lon"]) / 2
+            task = progress.add_task("Creating coverage map...", total=100, status="Starting...")
             
-            create_simple_web_viewer(
-                tiles_dir=str(tiles_dir),
-                output_html=str(html_path),
-                center_lat=center_lat,
-                center_lon=center_lon,
-                zoom=args.initial_zoom,
-                title=f"GeoTessera - {args.input}"
-            )
-            
-            print(f"Created web tiles in: {tiles_dir}")
-            print(f"Created viewer: {html_path}")
-            print(f"Open {html_path} in a web browser to view")
-            
-        except Exception as e:
-            print(f"Error creating web visualization: {e}")
-            return
-            
-    elif args.type == 'coverage':
-        # Create coverage map
-        html_path = output_dir / "coverage.html"
-        
-        try:
-            create_coverage_summary_map(
-                geotiff_paths=geotiff_paths,
-                output_html=str(html_path),
-                title=f"Coverage Map - {args.input}"
-            )
-            
-            print(f"Created coverage map: {html_path}")
-            print(f"Open {html_path} in a web browser to view")
-            
-        except Exception as e:
-            print(f"Error creating coverage map: {e}")
-            return
+            try:
+                create_coverage_summary_map(
+                    geotiff_paths=geotiff_paths,
+                    output_html=str(html_path),
+                    title=f"Coverage Map - {input_path}"
+                )
+                
+                progress.update(task, completed=100)
+                
+                rprint(f"[green]Created coverage map: {html_path}[/green]")
+                rprint(f"[blue]Open {html_path} in a web browser to view[/blue]")
+                
+            except Exception as e:
+                rprint(f"[red]Error creating coverage map: {e}[/red]")
+                raise typer.Exit(1)
 
 
-def info_command(args):
+@app.command()
+def info(
+    geotiffs: Annotated[Optional[Path], typer.Option(
+        "--geotiffs",
+        help="Analyze GeoTIFF files/directory"
+    )] = None,
+    dataset_version: Annotated[str, typer.Option(
+        "--dataset-version",
+        help="Tessera dataset version (e.g., v1, v2)"
+    )] = "v1",
+    verbose: Annotated[bool, typer.Option(
+        "--verbose", "-v",
+        help="Verbose output"
+    )] = False
+):
     """Show information about GeoTIFF files or library."""
-    if args.geotiffs:
+    
+    if geotiffs:
         # Analyze GeoTIFF files
-        input_path = Path(args.geotiffs)
-        if input_path.is_file():
-            geotiff_paths = [str(input_path)]
+        if geotiffs.is_file():
+            geotiff_paths = [str(geotiffs)]
         else:
-            geotiff_paths = list(map(str, input_path.glob("*.tif")))
-            geotiff_paths.extend(map(str, input_path.glob("*.tiff")))
+            geotiff_paths = list(map(str, geotiffs.glob("*.tif")))
+            geotiff_paths.extend(map(str, geotiffs.glob("*.tiff")))
             
         if not geotiff_paths:
-            print(f"No GeoTIFF files found in {args.geotiffs}")
-            return
+            rprint(f"[red]No GeoTIFF files found in {geotiffs}[/red]")
+            raise typer.Exit(1)
             
         coverage = analyze_geotiff_coverage(geotiff_paths)
         
-        print("=== GeoTIFF Analysis ===")
-        print(f"Total files: {coverage['total_files']}")
-        print(f"Years: {', '.join(coverage['years'])}")
-        print(f"CRS: {', '.join(coverage['crs'])}")
+        # Create analysis table
+        analysis_table = Table(show_header=False, box=None)
+        analysis_table.add_row("Total files:", str(coverage['total_files']))
+        analysis_table.add_row("Years:", ', '.join(coverage['years']))
+        analysis_table.add_row("CRS:", ', '.join(coverage['crs']))
+        
+        rprint(Panel(analysis_table, title="[bold]📊 GeoTIFF Analysis[/bold]", border_style="blue"))
         
         bounds = coverage['bounds']
-        print(f"\\nBounding box:")
-        print(f"  Longitude: {bounds['min_lon']:.6f} to {bounds['max_lon']:.6f}")
-        print(f"  Latitude: {bounds['min_lat']:.6f} to {bounds['max_lat']:.6f}")
         
-        print(f"\\nBand counts:")
-        for bands, count in coverage['band_counts'].items():
-            print(f"  {bands} bands: {count} files")
+        bounds_table = Table(show_header=False, box=None)
+        bounds_table.add_row("Longitude:", f"{bounds['min_lon']:.6f} to {bounds['max_lon']:.6f}")
+        bounds_table.add_row("Latitude:", f"{bounds['min_lat']:.6f} to {bounds['max_lat']:.6f}")
+        
+        rprint(Panel(bounds_table, title="[bold]🗺️ Bounding Box[/bold]", border_style="green"))
+        
+        bands_table = Table(show_header=True, header_style="bold blue")
+        bands_table.add_column("Band Count")
+        bands_table.add_column("Files", justify="right")
+        
+        for bands_count, count in coverage['band_counts'].items():
+            bands_table.add_row(f"{bands_count} bands", str(count))
             
-        if args.verbose:
-            print(f"\\nFirst 10 tiles:")
-            for i, tile in enumerate(coverage['tiles'][:10]):
-                print(f"  {Path(tile['path']).name}: ({tile['tile_lat']}, {tile['tile_lon']}) - {tile['bands']} bands")
+        rprint(Panel(bands_table, title="[bold]🎵 Band Information[/bold]", border_style="cyan"))
+            
+        if verbose:
+            tiles_table = Table(show_header=True, header_style="bold blue")
+            tiles_table.add_column("Filename")
+            tiles_table.add_column("Coordinates")
+            tiles_table.add_column("Bands", justify="right")
+            
+            for tile in coverage['tiles'][:10]:
+                tiles_table.add_row(
+                    Path(tile['path']).name,
+                    f"({tile['tile_lat']}, {tile['tile_lon']})",
+                    str(tile['bands'])
+                )
+                
+            rprint(Panel(tiles_table, title="[bold]📁 First 10 Tiles[/bold]", border_style="yellow"))
                 
     else:
         # Show library info
-        gt = GeoTessera(dataset_version=getattr(args, 'dataset_version', 'v1'))
+        gt = GeoTessera(dataset_version=dataset_version)
         years = gt.get_available_years()
         
-        print("=== GeoTessera Library Info ===")
-        print(f"Version: {gt.version}")
-        print(f"Available years: {', '.join(map(str, years))}")
-        print(f"Registry loaded blocks: {len(gt.registry.loaded_blocks)}")
+        info_table = Table(show_header=False, box=None)
+        info_table.add_row("Version:", gt.version)
+        info_table.add_row("Available years:", ', '.join(map(str, years)))
+        info_table.add_row("Registry loaded blocks:", str(len(gt.registry.loaded_blocks)))
+        
+        rprint(Panel(info_table, title="[bold]🌍 GeoTessera Library Info[/bold]", border_style="blue"))
 
 
 def main():
     """Main CLI entry point."""
-    parser = argparse.ArgumentParser(
-        description="GeoTessera: Download satellite embedding tiles as GeoTIFFs",
-        formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    
-    # Global options
-    parser.add_argument('--dataset-version', default='v1', help='Tessera dataset version (e.g., v1, v2)')
-    parser.add_argument('--cache-dir', help='Cache directory')
-    parser.add_argument('--registry-dir', help='Registry directory')
-    parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
-    
-    subparsers = parser.add_subparsers(dest='command', help='Commands')
-    
-    # Download command
-    download_parser = subparsers.add_parser('download', help='Export region as discrete GeoTIFFs with UTM projections')
-    download_parser.add_argument('--bbox', help='Bounding box: min_lon,min_lat,max_lon,max_lat')
-    download_parser.add_argument('--region-file', help='GeoJSON/Shapefile to define region')
-    download_parser.add_argument('--year', type=int, default=2024, help='Year of embeddings')
-    download_parser.add_argument('--bands', help='Comma-separated band indices (default: all 128)')
-    download_parser.add_argument('--output', '-o', required=True, help='Output directory')
-    download_parser.add_argument('--compress', default='lzw', help='Compression method')
-    download_parser.add_argument('--list-files', action='store_true', help='List all created files with details')
-    download_parser.set_defaults(func=download_command)
-    
-    # Visualize command  
-    viz_parser = subparsers.add_parser('visualize', help='Create visualizations from GeoTIFFs')
-    viz_parser.add_argument('input', help='Input GeoTIFF file or directory')
-    viz_parser.add_argument('--output', '-o', required=True, help='Output directory')
-    viz_parser.add_argument('--type', choices=['rgb', 'web', 'coverage'], default='rgb',
-                           help='Visualization type')
-    viz_parser.add_argument('--bands', help='Comma-separated band indices')
-    viz_parser.add_argument('--normalize', action='store_true', help='Normalize bands')
-    viz_parser.add_argument('--min-zoom', type=int, default=8, help='Min zoom for web tiles')
-    viz_parser.add_argument('--max-zoom', type=int, default=15, help='Max zoom for web tiles')
-    viz_parser.add_argument('--initial-zoom', type=int, default=10, help='Initial zoom level')
-    viz_parser.set_defaults(func=visualize_command)
-    
-    # Info command
-    info_parser = subparsers.add_parser('info', help='Show information')
-    info_parser.add_argument('--geotiffs', help='Analyze GeoTIFF files/directory')
-    info_parser.set_defaults(func=info_command)
-    
-    args = parser.parse_args()
-    
-    if not args.command:
-        parser.print_help()
-        return
-        
-    try:
-        args.func(args)
-    except KeyboardInterrupt:
-        print("\\nInterrupted by user")
-    except Exception as e:
-        print(f"Error: {e}")
-        if args.verbose:
-            import traceback
-            traceback.print_exc()
+    app()
 
 
 if __name__ == "__main__":

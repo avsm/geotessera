@@ -76,8 +76,8 @@ class TestGeoTIFFMetadataTags:
         # Setup mocks
         mock_registry_instance = Mock()
         mock_registry_class.return_value = mock_registry_instance
-        mock_registry_instance.load_blocks_for_region.return_value = None
-        mock_registry_instance.available_embeddings = [(2024, 51.55, -0.05)]
+        mock_registry_instance.load_blocks_for_region.return_value = [(51.55, -0.15)]
+        mock_registry_instance.available_embeddings = [(2024, 51.55, -0.15)]
         mock_registry_instance.ensure_block_loaded.return_value = None
         mock_registry_instance.fetch.return_value = "/fake/path"
         
@@ -119,12 +119,15 @@ class TestGeoTIFFMetadataTags:
                         
                         # Verify library version tag is separate
                         assert 'GEOTESSERA_VERSION' in call_args
-                        assert 'geotessera' in call_args['GEOTESSERA_VERSION'].lower()
+                        # Version should be a valid version string (e.g., "0.4.0")
+                        version = call_args['GEOTESSERA_VERSION']
+                        assert version != "unknown"
+                        assert len(version.split('.')) >= 2  # Should have at least major.minor
                         
                         # Verify other required tags
                         assert call_args['TESSERA_YEAR'] == '2024'
                         assert call_args['TESSERA_TILE_LAT'] == '51.55'
-                        assert call_args['TESSERA_TILE_LON'] == '-0.05'
+                        assert call_args['TESSERA_TILE_LON'] == '-0.15'
 
 
 class TestCLIDatasetVersion:
@@ -132,58 +135,43 @@ class TestCLIDatasetVersion:
     
     def test_cli_dataset_version_argument_exists(self):
         """Test that CLI accepts --dataset-version argument."""
-        from geotessera.cli import main
-        import sys
-        from io import StringIO
+        from typer.testing import CliRunner
+        from geotessera.cli import app
         
-        # Capture help output
-        old_stdout = sys.stdout
-        old_argv = sys.argv
+        runner = CliRunner()
+        result = runner.invoke(app, ["download", "--help"])
         
-        try:
-            sys.stdout = mystdout = StringIO()
-            sys.argv = ['geotessera', '--help']
-            
-            with pytest.raises(SystemExit):
-                main()
-            
-            help_output = mystdout.getvalue()
-            assert '--dataset-version' in help_output
-            assert 'Tessera dataset version' in help_output
-            
-        finally:
-            sys.stdout = old_stdout
-            sys.argv = old_argv
+        assert result.exit_code == 0
+        assert '--dataset-version' in result.stdout
+        assert 'Tessera dataset version' in result.stdout
     
     @patch('geotessera.cli.GeoTessera')
     def test_cli_passes_dataset_version_to_geotessera(self, mock_geotessera_class):
         """Test that CLI properly passes dataset-version to GeoTessera."""
-        from geotessera.cli import download_command
-        from argparse import Namespace
+        from typer.testing import CliRunner
+        from geotessera.cli import app
         
         # Mock GeoTessera instance
         mock_gt_instance = Mock()
         mock_gt_instance.export_embedding_geotiffs.return_value = ["test.tif"]
         mock_geotessera_class.return_value = mock_gt_instance
         
-        # Create mock args
-        args = Namespace(
-            dataset_version='v2',
-            cache_dir=None,
-            registry_dir=None,
-            bbox='0,51,1,52',
-            region_file=None,
-            year=2024,
-            bands=None,
-            output='/tmp/test',
-            compress='lzw',
-            verbose=False
-        )
+        runner = CliRunner()
+        with patch('pathlib.Path.stat') as mock_stat, \
+             patch('pathlib.Path.exists', return_value=True):
+            mock_stat.return_value.st_size = 1024
+            
+            result = runner.invoke(app, [
+                "download",
+                "--output", "/tmp/test",
+                "--bbox", "0,51,1,52",
+                "--dataset-version", "v2"
+            ])
         
-        # Call download command
-        download_command(args)
+        # Should succeed
+        assert result.exit_code == 0
         
-        # Verify GeoTessera was initialized with correct dataset_version
+        # Verify GeoTessera was initialized with v2
         mock_geotessera_class.assert_called_once_with(
             dataset_version='v2',
             cache_dir=None,

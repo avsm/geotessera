@@ -165,7 +165,7 @@ class TestUTMProjectionExportSimple:
         gt = GeoTessera()
         
         # Mock the embedding fetch system
-        gt.registry.load_blocks_for_region = Mock()
+        gt.registry.load_blocks_for_region = Mock(return_value=[(51.55, -0.05)])
         gt.registry.ensure_tile_block_loaded = Mock()
         gt.registry.fetch = Mock(return_value="/fake/path")
         

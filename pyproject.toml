@@ -29,6 +29,7 @@ dependencies = [
     "rasterio",
     "sphinx>=8.2.3",
     "rich",
+    "typer",
 ]
 
 [project.urls]

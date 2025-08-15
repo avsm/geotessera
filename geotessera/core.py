@@ -13,6 +13,12 @@ import numpy as np
 
 from .registry import Registry, world_to_tile_coords
 
+try:
+    import importlib.metadata
+    __version__ = importlib.metadata.version("geotessera")
+except importlib.metadata.PackageNotFoundError:
+    __version__ = "unknown"
+
 
 class GeoTessera:
     """Simplified GeoTessera for downloading tiles and exporting GeoTIFFs.
@@ -48,6 +54,11 @@ class GeoTessera:
             auto_update=auto_update,
             manifests_repo_url=manifests_repo_url
         )
+        
+    @property
+    def version(self) -> str:
+        """Get the GeoTessera library version."""
+        return __version__
 
     def get_available_years(self) -> List[int]:
         """Get list of available years."""
@@ -56,43 +67,36 @@ class GeoTessera:
     def fetch_embeddings(
         self, 
         bbox: Tuple[float, float, float, float],
-        year: int = 2024
+        year: int = 2024,
+        progress_callback: Optional[callable] = None
     ) -> List[Tuple[float, float, np.ndarray]]:
         """Fetch all embedding tiles within a bounding box as numpy arrays.
         
         Args:
             bbox: Bounding box as (min_lon, min_lat, max_lon, max_lat)
             year: Year of embeddings to download
+            progress_callback: Optional callback function(current, total) for progress tracking
             
         Returns:
             List of (tile_lat, tile_lon, embedding_array) tuples
             Each embedding_array is shape (H, W, 128) with dequantized values
         """
-        min_lon, min_lat, max_lon, max_lat = bbox
+        # Load registry blocks for this region and get available tiles directly
+        tiles_to_download = self.registry.load_blocks_for_region(bbox, year)
         
-        # Load registry blocks for this region
-        self.registry.load_blocks_for_region(bbox, year)
-        
-        # Find all tiles in the bounding box
-        tiles_to_download = []
-        for emb_year, lat, lon in self.registry.available_embeddings:
-            if emb_year != year:
-                continue
-                
-            # Check if tile intersects with bbox
-            tile_min_lon, tile_min_lat = lon - 0.05, lat - 0.05
-            tile_max_lon, tile_max_lat = lon + 0.05, lat + 0.05
-            
-            if (tile_min_lon < max_lon and tile_max_lon > min_lon and
-                tile_min_lat < max_lat and tile_max_lat > min_lat):
-                tiles_to_download.append((lat, lon))
-        
-        # Download each tile
+        # Download each tile with progress tracking
         results = []
-        for tile_lat, tile_lon in tiles_to_download:
+        total_tiles = len(tiles_to_download)
+        
+        for i, (tile_lat, tile_lon) in enumerate(tiles_to_download):
             try:
                 embedding = self.fetch_embedding(tile_lat, tile_lon, year)
                 results.append((tile_lat, tile_lon, embedding))
+                
+                # Update progress if callback provided
+                if progress_callback:
+                    progress_callback(i + 1, total_tiles)
+                    
             except Exception as e:
                 print(f"Warning: Failed to download tile ({tile_lat:.2f}, {tile_lon:.2f}): {e}")
                 continue
@@ -268,7 +272,7 @@ class GeoTessera:
                 TESSERA_TILE_LAT=f"{lat:.2f}",
                 TESSERA_TILE_LON=f"{lon:.2f}",
                 TESSERA_DESCRIPTION="GeoTessera satellite embedding tile",
-                GEOTESSERA_VERSION=self.__class__.__module__.split('.')[0] + ' library'
+                GEOTESSERA_VERSION=__version__
             )
                     
         return str(output_path)
@@ -279,7 +283,8 @@ class GeoTessera:
         output_dir: Union[str, Path],
         year: int = 2024,
         bands: Optional[List[int]] = None,
-        compress: str = "lzw"
+        compress: str = "lzw",
+        progress_callback: Optional[callable] = None
     ) -> List[str]:
         """Export all embedding tiles in bounding box as individual GeoTIFF files with native UTM projections.
         
@@ -289,6 +294,7 @@ class GeoTessera:
             year: Year of embeddings to export
             bands: List of band indices to export (None = all 128 bands)
             compress: Compression method for GeoTIFF
+            progress_callback: Optional callback function(current, total) for progress tracking
             
         Returns:
             List of paths to created GeoTIFF files
@@ -307,16 +313,39 @@ class GeoTessera:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Fetch tiles
-        tiles = self.fetch_embeddings(bbox, year)
+        # Create a wrapper callback to handle two-phase progress
+        def fetch_progress_callback(current: int, total: int):
+            if progress_callback:
+                # Phase 1: Fetching tiles (0-50% of total progress)
+                overall_progress = int((current / total) * 50)
+                progress_callback(overall_progress, 100, f"Fetching tile {current}/{total}")
+        
+        # Fetch tiles with progress tracking
+        if progress_callback:
+            progress_callback(0, 100, "Loading registry blocks...")
+        
+        tiles = self.fetch_embeddings(bbox, year, fetch_progress_callback)
         
         if not tiles:
             print("No tiles found in bounding box")
             return []
+        
+        if progress_callback:
+            progress_callback(50, 100, f"Fetched {len(tiles)} tiles, starting GeoTIFF export...")
             
         created_files = []
+        total_tiles = len(tiles)
         
-        for tile_lat, tile_lon, embedding in tiles:
+        for i, (tile_lat, tile_lon, embedding) in enumerate(tiles):
+            # Create filename first for progress reporting
+            filename = f"tessera_{year}_lat{tile_lat:.2f}_lon{tile_lon:.2f}.tif"
+            output_path = output_dir / filename
+            
+            # Update progress to show we're starting this file
+            if progress_callback:
+                export_progress = int(50 + (i / total_tiles) * 50)
+                progress_callback(export_progress, 100, f"Creating {filename}...")
+            
             # Select bands
             if bands is not None:
                 data = embedding[:, :, bands].copy()
@@ -324,10 +353,6 @@ class GeoTessera:
             else:
                 data = embedding.copy()
                 band_count = 128
-                
-            # Create filename
-            filename = f"tessera_{year}_lat{tile_lat:.2f}_lon{tile_lon:.2f}.tif"
-            output_path = output_dir / filename
             
             # Get dimensions for GeoTIFF
             height, width = data.shape[:2]
@@ -370,10 +395,20 @@ class GeoTessera:
                     TESSERA_TILE_LAT=f"{tile_lat:.2f}",
                     TESSERA_TILE_LON=f"{tile_lon:.2f}",
                     TESSERA_DESCRIPTION="GeoTessera satellite embedding tile",
-                    GEOTESSERA_VERSION=self.__class__.__module__.split('.')[0] + ' library'
+                    GEOTESSERA_VERSION=__version__
                 )
                         
             created_files.append(str(output_path))
+            
+            # Update progress for GeoTIFF export phase
+            if progress_callback:
+                # Phase 2: Exporting GeoTIFFs (50-100% of total progress)
+                export_progress = int(50 + ((i + 1) / total_tiles) * 50)
+                filename = f"tessera_{year}_lat{tile_lat:.2f}_lon{tile_lon:.2f}.tif"
+                progress_callback(export_progress, 100, f"Exported {filename} ({i + 1}/{total_tiles})")
+            
+        if progress_callback:
+            progress_callback(100, 100, f"Completed! Exported {len(created_files)} GeoTIFF files")
             
         print(f"Exported {len(created_files)} GeoTIFF files to {output_dir}")
         return created_files

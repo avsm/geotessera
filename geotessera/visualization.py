@@ -6,7 +6,7 @@ and web map generation for CLI display.
 """
 
 from pathlib import Path
-from typing import Union, List, Tuple, Optional, Dict
+from typing import Union, List, Tuple, Optional, Dict, Callable
 import tempfile
 import shutil
 import json
@@ -63,7 +63,8 @@ def create_rgb_mosaic_from_geotiffs(
     geotiff_paths: List[str],
     output_path: str,
     bands: Tuple[int, int, int] = (0, 1, 2),
-    normalize: bool = True
+    normalize: bool = True,
+    progress_callback: Optional[Callable] = None
 ) -> str:
     """Create an RGB visualization mosaic from multiple GeoTIFF files.
     
@@ -72,6 +73,7 @@ def create_rgb_mosaic_from_geotiffs(
         output_path: Output path for RGB mosaic
         bands: Three band indices to map to RGB channels
         normalize: Whether to normalize each band to 0-255 range
+        progress_callback: Optional callback function(current, total, status) for progress tracking
         
     Returns:
         Path to created RGB mosaic file
@@ -85,13 +87,22 @@ def create_rgb_mosaic_from_geotiffs(
         
     if not geotiff_paths:
         raise ValueError("No GeoTIFF files provided")
+    
+    if progress_callback:
+        progress_callback(10, 100, f"Opening {len(geotiff_paths)} GeoTIFF files...")
         
     # Open all files
     src_files = [rasterio.open(path) for path in geotiff_paths]
     
     try:
+        if progress_callback:
+            progress_callback(20, 100, "Merging GeoTIFF files...")
+            
         # Merge the files
         merged_array, merged_transform = merge(src_files, method='first')
+        
+        if progress_callback:
+            progress_callback(40, 100, f"Extracting RGB bands {bands}...")
         
         # Extract the three bands for RGB
         if merged_array.shape[0] < max(bands) + 1:
@@ -101,6 +112,9 @@ def create_rgb_mosaic_from_geotiffs(
         
         # Normalize if requested
         if normalize:
+            if progress_callback:
+                progress_callback(60, 100, "Normalizing RGB bands...")
+                
             for i in range(3):
                 band = rgb_data[i]
                 band_min, band_max = np.nanmin(band), np.nanmax(band)
@@ -108,9 +122,18 @@ def create_rgb_mosaic_from_geotiffs(
                     rgb_data[i] = (band - band_min) / (band_max - band_min)
                 else:
                     rgb_data[i] = 0
+        else:
+            if progress_callback:
+                progress_callback(60, 100, "Processing RGB bands...")
                     
+        if progress_callback:
+            progress_callback(80, 100, "Converting to RGB format...")
+            
         # Convert to uint8
         rgb_uint8 = (np.clip(rgb_data, 0, 1) * 255).astype(np.uint8)
+        
+        if progress_callback:
+            progress_callback(90, 100, f"Writing RGB mosaic to {Path(output_path).name}...")
         
         # Write RGB GeoTIFF
         with rasterio.open(
@@ -132,12 +155,15 @@ def create_rgb_mosaic_from_geotiffs(
                 TIFFTAG_ARTIST="GeoTessera",
                 TIFFTAG_IMAGEDESCRIPTION=f"RGB visualization using bands {bands}"
             )
-            
+    
     finally:
         # Close all source files
         for src in src_files:
             src.close()
-            
+    
+    if progress_callback:
+        progress_callback(100, 100, f"Completed RGB mosaic: {Path(output_path).name}")
+        
     return output_path
 
 
