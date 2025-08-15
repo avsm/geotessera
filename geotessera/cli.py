@@ -63,7 +63,7 @@ def download_command(args):
     
     try:
         # Export tiles as GeoTIFFs
-        files = gt.export_tiles_to_geotiffs(
+        files = gt.export_embedding_geotiffs(
             bbox=bbox,
             output_dir=args.output,
             year=args.year,

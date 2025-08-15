@@ -16,15 +16,21 @@ Simplified Usage:
     >>> from geotessera import GeoTessera
     >>> gt = GeoTessera()
     >>>
-    >>> # Download tiles in a bounding box
+    >>> # Fetch embedding tiles in a bounding box
     >>> bbox = (-0.2, 51.4, 0.1, 51.6)  # London area
-    >>> tiles = gt.download_bbox_tiles(bbox, year=2024)
+    >>> tiles = gt.fetch_embeddings(bbox, year=2024)
     >>>
     >>> # Export as individual GeoTIFF files
-    >>> files = gt.export_tiles_to_geotiffs(
+    >>> files = gt.export_embedding_geotiffs(
     ...     bbox=bbox, 
     ...     output_dir="tiles/",
     ...     bands=[0, 1, 2]  # Select specific bands
+    ... )
+    >>>
+    >>> # Or export a single tile
+    >>> file = gt.export_embedding_geotiff(
+    ...     lat=51.55, lon=-0.05,
+    ...     output_path="single_tile.tif"
     ... )
 
 The exported GeoTIFF files contain:

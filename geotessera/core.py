@@ -53,12 +53,12 @@ class GeoTessera:
         """Get list of available years."""
         return self.registry.get_available_years()
 
-    def download_bbox_tiles(
+    def fetch_embeddings(
         self, 
         bbox: Tuple[float, float, float, float],
         year: int = 2024
     ) -> List[Tuple[float, float, np.ndarray]]:
-        """Download all tiles within a bounding box as numpy arrays.
+        """Fetch all embedding tiles within a bounding box as numpy arrays.
         
         Args:
             bbox: Bounding box as (min_lon, min_lat, max_lon, max_lat)
@@ -91,7 +91,7 @@ class GeoTessera:
         results = []
         for tile_lat, tile_lon in tiles_to_download:
             try:
-                embedding = self._fetch_embedding(tile_lat, tile_lon, year)
+                embedding = self.fetch_embedding(tile_lat, tile_lon, year)
                 results.append((tile_lat, tile_lon, embedding))
             except Exception as e:
                 print(f"Warning: Failed to download tile ({tile_lat:.2f}, {tile_lon:.2f}): {e}")
@@ -99,7 +99,7 @@ class GeoTessera:
                 
         return results
 
-    def _fetch_embedding(self, lat: float, lon: float, year: int) -> np.ndarray:
+    def fetch_embedding(self, lat: float, lon: float, year: int) -> np.ndarray:
         """Fetch and dequantize a single embedding tile.
         
         Args:
@@ -131,7 +131,97 @@ class GeoTessera:
         
         return dequantized
 
-    def export_tiles_to_geotiffs(
+    def export_embedding_geotiff(
+        self,
+        lat: float,
+        lon: float,
+        output_path: Union[str, Path],
+        year: int = 2024,
+        bands: Optional[List[int]] = None,
+        compress: str = "lzw"
+    ) -> str:
+        """Export a single embedding tile as a GeoTIFF file.
+        
+        Args:
+            lat: Tile center latitude
+            lon: Tile center longitude
+            output_path: Output path for GeoTIFF file
+            year: Year of embeddings to export
+            bands: List of band indices to export (None = all 128 bands)
+            compress: Compression method for GeoTIFF
+            
+        Returns:
+            Path to created GeoTIFF file
+        """
+        try:
+            import rasterio
+            from rasterio.transform import from_bounds
+        except ImportError:
+            raise ImportError("rasterio required for GeoTIFF export: pip install rasterio")
+            
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Fetch single tile
+        embedding = self.fetch_embedding(lat, lon, year)
+        
+        # Select bands
+        if bands is not None:
+            data = embedding[:, :, bands].copy()
+            band_count = len(bands)
+        else:
+            data = embedding.copy()
+            band_count = 128
+            
+        # Get tile bounds
+        from .registry import get_tile_bounds
+        west, south, east, north = get_tile_bounds(lat, lon)
+        
+        # Create georeferencing transform
+        height, width = data.shape[:2]
+        transform = from_bounds(west, south, east, north, width, height)
+        
+        # Write GeoTIFF
+        with rasterio.open(
+            output_path,
+            'w',
+            driver='GTiff',
+            height=height,
+            width=width,
+            count=band_count,
+            dtype='float32',
+            crs='EPSG:4326',
+            transform=transform,
+            compress=compress,
+            tiled=True,
+            blockxsize=256,
+            blockysize=256
+        ) as dst:
+            # Write bands
+            for i in range(band_count):
+                dst.write(data[:, :, i], i + 1)
+                
+            # Add band descriptions
+            if bands is not None:
+                for i, band_idx in enumerate(bands):
+                    dst.set_band_description(i + 1, f"Tessera_Band_{band_idx}")
+            else:
+                for i in range(128):
+                    dst.set_band_description(i + 1, f"Tessera_Band_{i}")
+                    
+            # Add metadata
+            dst.update_tags(
+                TESSERA_DATASET_VERSION=self.dataset_version,
+                TESSERA_YEAR=str(year),
+                TESSERA_TILE_LAT=f"{lat:.2f}",
+                TESSERA_TILE_LON=f"{lon:.2f}",
+                TESSERA_DESCRIPTION="GeoTessera satellite embedding tile",
+                GEOTESSERA_VERSION=self.__class__.__module__.split('.')[0] + ' library'
+            )
+                    
+        return str(output_path)
+
+    def export_embedding_geotiffs(
         self,
         bbox: Tuple[float, float, float, float],
         output_dir: Union[str, Path],
@@ -139,7 +229,7 @@ class GeoTessera:
         bands: Optional[List[int]] = None,
         compress: str = "lzw"
     ) -> List[str]:
-        """Export all tiles in bounding box as individual GeoTIFF files.
+        """Export all embedding tiles in bounding box as individual GeoTIFF files.
         
         Args:
             bbox: Bounding box as (min_lon, min_lat, max_lon, max_lat)
@@ -160,8 +250,8 @@ class GeoTessera:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Download tiles
-        tiles = self.download_bbox_tiles(bbox, year)
+        # Fetch tiles
+        tiles = self.fetch_embeddings(bbox, year)
         
         if not tiles:
             print("No tiles found in bounding box")

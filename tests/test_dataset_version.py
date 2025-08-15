@@ -103,7 +103,7 @@ class TestGeoTIFFMetadataTags:
                         gt = GeoTessera(dataset_version="v2")
                         
                         # Export tiles
-                        files = gt.export_tiles_to_geotiffs(
+                        files = gt.export_embedding_geotiffs(
                             bbox=(-0.1, 51.5, 0.0, 51.6),
                             output_dir=temp_dir,
                             year=2024
@@ -163,7 +163,7 @@ class TestCLIDatasetVersion:
         
         # Mock GeoTessera instance
         mock_gt_instance = Mock()
-        mock_gt_instance.export_tiles_to_geotiffs.return_value = ["test.tif"]
+        mock_gt_instance.export_embedding_geotiffs.return_value = ["test.tif"]
         mock_geotessera_class.return_value = mock_gt_instance
         
         # Create mock args
