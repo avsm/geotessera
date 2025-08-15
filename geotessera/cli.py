@@ -23,7 +23,7 @@ from .visualization import (
 def download_command(args):
     """Download tiles for a bounding box and export as GeoTIFFs."""
     gt = GeoTessera(
-        version=args.version,
+        dataset_version=args.dataset_version,
         cache_dir=args.cache_dir,
         registry_dir=args.registry_dir
     )
@@ -243,7 +243,7 @@ def info_command(args):
                 
     else:
         # Show library info
-        gt = GeoTessera()
+        gt = GeoTessera(dataset_version=getattr(args, 'dataset_version', 'v1'))
         years = gt.get_available_years()
         
         print("=== GeoTessera Library Info ===")
@@ -260,7 +260,7 @@ def main():
     )
     
     # Global options
-    parser.add_argument('--version', default='v0.4.0', help='Dataset version')
+    parser.add_argument('--dataset-version', default='v1', help='Tessera dataset version (e.g., v1, v2)')
     parser.add_argument('--cache-dir', help='Cache directory')
     parser.add_argument('--registry-dir', help='Registry directory')
     parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')

@@ -25,7 +25,7 @@ class GeoTessera:
 
     def __init__(
         self,
-        version: str = "v0.4.0", 
+        dataset_version: str = "v1", 
         cache_dir: Optional[Union[str, Path]] = None,
         registry_dir: Optional[Union[str, Path]] = None,
         auto_update: bool = True,
@@ -34,15 +34,15 @@ class GeoTessera:
         """Initialize GeoTessera with registry management.
         
         Args:
-            version: Dataset version
+            dataset_version: Tessera dataset version (e.g., 'v1', 'v2')
             cache_dir: Directory for caching downloaded files
             registry_dir: Directory containing registry files
             auto_update: Whether to auto-update registry
             manifests_repo_url: Git repository URL for registry manifests
         """
-        self.version = version
+        self.dataset_version = dataset_version
         self.registry = Registry(
-            version=version,
+            version=dataset_version,
             cache_dir=cache_dir,
             registry_dir=registry_dir,
             auto_update=auto_update,
@@ -220,11 +220,12 @@ class GeoTessera:
                         
                 # Add metadata
                 dst.update_tags(
-                    TESSERA_VERSION=self.version,
+                    TESSERA_DATASET_VERSION=self.dataset_version,
                     TESSERA_YEAR=str(year),
                     TESSERA_TILE_LAT=f"{tile_lat:.2f}",
                     TESSERA_TILE_LON=f"{tile_lon:.2f}",
-                    TESSERA_DESCRIPTION="GeoTessera satellite embedding tile"
+                    TESSERA_DESCRIPTION="GeoTessera satellite embedding tile",
+                    GEOTESSERA_VERSION=self.__class__.__module__.split('.')[0] + ' library'
                 )
                         
             created_files.append(str(output_path))
