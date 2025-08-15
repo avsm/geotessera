@@ -265,6 +265,8 @@ def geotiff_to_web_tiles(
         'gdal2tiles.py',
         '-z', f'{min_zoom}-{max_zoom}',
         '-w', 'leaflet',
+        '-p', 'mercator',  # Explicitly use mercator projection
+        '--resampling', 'bilinear',
         geotiff_path,
         str(output_dir)
     ]
@@ -309,10 +311,43 @@ def create_simple_web_viewer(
     <style>
         html, body {{ height: 100%; margin: 0; padding: 0; }}
         #map {{ height: 100%; }}
+        .opacity-control {{
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: white;
+            border-radius: 5px;
+            padding: 10px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+            z-index: 1000;
+            font-family: Arial, sans-serif;
+            font-size: 12px;
+        }}
+        .opacity-control label {{
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }}
+        .opacity-control input[type="range"] {{
+            width: 150px;
+        }}
+        .opacity-value {{
+            font-size: 11px;
+            color: #666;
+            margin-top: 2px;
+        }}
     </style>
 </head>
 <body>
     <div id="map"></div>
+    
+    <!-- Opacity Control -->
+    <div class="opacity-control">
+        <label for="opacity-slider">GeoTessera Opacity</label>
+        <input type="range" id="opacity-slider" min="0" max="100" value="80" step="5">
+        <div class="opacity-value" id="opacity-value">80%</div>
+    </div>
+    
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script>
         var map = L.map('map').setView([{center_lat}, {center_lon}], {zoom});
@@ -323,9 +358,10 @@ def create_simple_web_viewer(
         }}).addTo(map);
         
         // Add GeoTessera layer
-        var tesseraLayer = L.tileLayer('./{{z}}/{{x}}/{{y}}.png', {{
+        var tesseraLayer = L.tileLayer('./tiles/{{z}}/{{x}}/{{y}}.png', {{
             attribution: 'GeoTessera data',
-            opacity: 0.8
+            opacity: 0.8,
+            tms: true
         }}).addTo(map);
         
         // Layer control
@@ -338,6 +374,16 @@ def create_simple_web_viewer(
         }};
         
         L.control.layers(baseMaps, overlayMaps).addTo(map);
+        
+        // Opacity slider functionality
+        var opacitySlider = document.getElementById('opacity-slider');
+        var opacityValue = document.getElementById('opacity-value');
+        
+        opacitySlider.addEventListener('input', function() {{
+            var opacity = this.value / 100;
+            tesseraLayer.setOpacity(opacity);
+            opacityValue.textContent = this.value + '%';
+        }});
     </script>
 </body>
 </html>"""
@@ -380,11 +426,22 @@ def analyze_geotiff_coverage(geotiff_paths: List[str]) -> Dict:
             with rasterio.open(path) as src:
                 bounds = src.bounds
                 
+                # Convert bounds to lat/lon if needed
+                if src.crs and src.crs != 'EPSG:4326':
+                    from rasterio.warp import transform_bounds
+                    # Transform bounds to WGS84 (lat/lon)
+                    lon_min, lat_min, lon_max, lat_max = transform_bounds(
+                        src.crs, 'EPSG:4326', bounds.left, bounds.bottom, bounds.right, bounds.top
+                    )
+                else:
+                    # Already in lat/lon
+                    lon_min, lat_min, lon_max, lat_max = bounds.left, bounds.bottom, bounds.right, bounds.top
+                
                 # Update overall bounds
-                coverage_info["bounds"]["min_lon"] = min(coverage_info["bounds"]["min_lon"], bounds.left)
-                coverage_info["bounds"]["min_lat"] = min(coverage_info["bounds"]["min_lat"], bounds.bottom)
-                coverage_info["bounds"]["max_lon"] = max(coverage_info["bounds"]["max_lon"], bounds.right)
-                coverage_info["bounds"]["max_lat"] = max(coverage_info["bounds"]["max_lat"], bounds.top)
+                coverage_info["bounds"]["min_lon"] = min(coverage_info["bounds"]["min_lon"], lon_min)
+                coverage_info["bounds"]["min_lat"] = min(coverage_info["bounds"]["min_lat"], lat_min)
+                coverage_info["bounds"]["max_lon"] = max(coverage_info["bounds"]["max_lon"], lon_max)
+                coverage_info["bounds"]["max_lat"] = max(coverage_info["bounds"]["max_lat"], lat_max)
                 
                 # Track band counts
                 band_count = src.count
@@ -397,10 +454,10 @@ def analyze_geotiff_coverage(geotiff_paths: List[str]) -> Dict:
                     
                 coverage_info["crs"].add(str(src.crs))
                 
-                # Tile info
+                # Tile info (use lat/lon bounds)
                 coverage_info["tiles"].append({
                     "path": path,
-                    "bounds": [bounds.left, bounds.bottom, bounds.right, bounds.top],
+                    "bounds": [lon_min, lat_min, lon_max, lat_max],
                     "bands": band_count,
                     "year": tags.get("TESSERA_YEAR", "unknown"),
                     "tile_lat": tags.get("TESSERA_TILE_LAT", "unknown"),

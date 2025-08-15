@@ -4,6 +4,11 @@ Focused on downloading tiles and creating visualizations from the generated GeoT
 """
 
 import sys
+import webbrowser
+import threading
+import time
+import http.server
+import socketserver
 from pathlib import Path
 from typing import Optional, List, Callable
 from typing_extensions import Annotated
@@ -26,6 +31,28 @@ from .visualization import (
     create_coverage_summary_map,
     analyze_geotiff_coverage
 )
+
+
+def format_bbox(bbox_coords) -> str:
+    """Format bounding box coordinates for pretty display.
+    
+    Args:
+        bbox_coords: Tuple of (min_lon, min_lat, max_lon, max_lat)
+        
+    Returns:
+        Compact human-readable string representation of bbox with degree symbols
+    """
+    min_lon, min_lat, max_lon, max_lat = bbox_coords
+    
+    # Format longitude with E/W direction
+    min_lon_str = f"{abs(min_lon):.6f}°{'W' if min_lon < 0 else 'E'}"
+    max_lon_str = f"{abs(max_lon):.6f}°{'W' if max_lon < 0 else 'E'}"
+    
+    # Format latitude with N/S direction  
+    min_lat_str = f"{abs(min_lat):.6f}°{'S' if min_lat < 0 else 'N'}"
+    max_lat_str = f"{abs(max_lat):.6f}°{'S' if max_lat < 0 else 'N'}"
+    
+    return f"[{min_lon_str}, {min_lat_str}] - [{max_lon_str}, {max_lat_str}]"
 
 app = typer.Typer(
     name="geotessera",
@@ -116,16 +143,14 @@ def download(
             if len(bbox_coords) != 4:
                 rprint("[red]Error: bbox must be 'min_lon,min_lat,max_lon,max_lat'[/red]")
                 raise typer.Exit(1)
-            rprint(f"[green]Using bounding box:[/green] {bbox_coords}")
+            rprint(f"[green]Using bounding box:[/green] {format_bbox(bbox_coords)}")
         except ValueError:
             rprint("[red]Error: Invalid bbox format. Use: 'min_lon,min_lat,max_lon,max_lat'[/red]")
             raise typer.Exit(1)
     elif region_file:
         try:
             bbox_coords = calculate_bbox_from_file(region_file)
-            rprint(f"[green]Calculated bbox from {region_file}:[/green] {bbox_coords}")
-            rprint(f"  • Longitude range: {bbox_coords[0]:.6f} to {bbox_coords[2]:.6f}")
-            rprint(f"  • Latitude range: {bbox_coords[1]:.6f} to {bbox_coords[3]:.6f}")
+            rprint(f"[green]Calculated bbox from {region_file}:[/green] {format_bbox(bbox_coords)}")
         except Exception as e:
             rprint(f"[red]Error reading region file: {e}[/red]")
             rprint("Supported formats: GeoJSON, Shapefile, etc.")
@@ -277,7 +302,11 @@ def visualize(
     initial_zoom: Annotated[int, typer.Option(
         "--initial-zoom",
         help="Initial zoom level"
-    )] = 10
+    )] = 10,
+    force_regenerate: Annotated[bool, typer.Option(
+        "--force/--no-force",
+        help="Force regeneration of tiles even if they exist"
+    )] = False
 ):
     """Create visualizations from GeoTIFF files."""
     
@@ -374,43 +403,54 @@ def visualize(
             # Generate web tiles
             tiles_dir = output / "tiles"
             
-            task2 = progress.add_task("Generating web tiles...", total=100, status="Starting...")
-            
-            try:
-                geotiff_to_web_tiles(
-                    geotiff_path=source_file,
-                    output_dir=str(tiles_dir),
-                    zoom_levels=(min_zoom, max_zoom)
-                )
+            # Check if tiles already exist and we're not forcing regeneration
+            if not force_regenerate and tiles_dir.exists() and any(tiles_dir.iterdir()):
+                task2 = progress.add_task("Using existing web tiles...", total=100, status="Found existing tiles")
                 progress.update(task2, completed=80)
+                rprint(f"[green]Found existing tiles in: {tiles_dir}[/green]")
+                rprint("[blue]Skipping tile generation (use --force to regenerate)[/blue]")
+            else:
+                if force_regenerate and tiles_dir.exists():
+                    import shutil
+                    rprint(f"[yellow]Removing existing tiles directory: {tiles_dir}[/yellow]")
+                    shutil.rmtree(tiles_dir)
+                task2 = progress.add_task("Generating web tiles...", total=100, status="Starting...")
                 
-                # Create HTML viewer
-                html_path = output / "viewer.html"
-                
-                # Calculate center from coverage
-                coverage = analyze_geotiff_coverage(geotiff_paths)
-                bounds = coverage["bounds"]
-                center_lat = (bounds["min_lat"] + bounds["max_lat"]) / 2
-                center_lon = (bounds["min_lon"] + bounds["max_lon"]) / 2
-                
-                create_simple_web_viewer(
-                    tiles_dir=str(tiles_dir),
-                    output_html=str(html_path),
-                    center_lat=center_lat,
-                    center_lon=center_lon,
-                    zoom=initial_zoom,
-                    title=f"GeoTessera - {input_path}"
-                )
-                
-                progress.update(task2, completed=100)
-                
-                rprint(f"[green]Created web tiles in: {tiles_dir}[/green]")
-                rprint(f"[green]Created viewer: {html_path}[/green]")
-                rprint(f"[blue]Open {html_path} in a web browser to view[/blue]")
-                
-            except Exception as e:
-                rprint(f"[red]Error creating web visualization: {e}[/red]")
-                raise typer.Exit(1)
+                try:
+                    geotiff_to_web_tiles(
+                        geotiff_path=source_file,
+                        output_dir=str(tiles_dir),
+                        zoom_levels=(min_zoom, max_zoom)
+                    )
+                    progress.update(task2, completed=80)
+                except Exception as e:
+                    rprint(f"[red]Error generating web tiles: {e}[/red]")
+                    raise typer.Exit(1)
+            
+            # Create HTML viewer (always run this part)
+            html_path = output / "viewer.html"
+            
+            # Calculate center from coverage
+            coverage = analyze_geotiff_coverage(geotiff_paths)
+            bounds = coverage["bounds"]
+            center_lat = (bounds["min_lat"] + bounds["max_lat"]) / 2
+            center_lon = (bounds["min_lon"] + bounds["max_lon"]) / 2
+            
+            create_simple_web_viewer(
+                tiles_dir=str(tiles_dir),
+                output_html=str(html_path),
+                center_lat=center_lat,
+                center_lon=center_lon,
+                zoom=initial_zoom,
+                title=f"GeoTessera - {input_path}"
+            )
+            
+            progress.update(task2, completed=100)
+            
+            rprint(f"[green]Created web tiles in: {tiles_dir}[/green]")
+            rprint(f"[green]Created viewer: {html_path}[/green]")
+            rprint(f"[blue]To view the map, start a web server:[/blue]")
+            rprint(f"[cyan]  geotessera serve {output}[/cyan]")
                 
         elif vis_type == 'coverage':
             # Create coverage map
@@ -428,11 +468,136 @@ def visualize(
                 progress.update(task, completed=100)
                 
                 rprint(f"[green]Created coverage map: {html_path}[/green]")
-                rprint(f"[blue]Open {html_path} in a web browser to view[/blue]")
+                rprint(f"[blue]To view the map, start a web server:[/blue]")
+                rprint(f"[cyan]  geotessera serve {output}[/cyan]")
                 
             except Exception as e:
                 rprint(f"[red]Error creating coverage map: {e}[/red]")
                 raise typer.Exit(1)
+
+
+@app.command()
+def serve(
+    directory: Annotated[Path, typer.Argument(help="Directory containing web visualization files")],
+    port: Annotated[int, typer.Option(
+        "--port", "-p",
+        help="Port number for web server"
+    )] = 8000,
+    open_browser: Annotated[bool, typer.Option(
+        "--open/--no-open",
+        help="Automatically open browser"
+    )] = True,
+    html_file: Annotated[Optional[str], typer.Option(
+        "--html",
+        help="Specific HTML file to serve (relative to directory)"
+    )] = None
+):
+    """Start a web server to serve visualization files.
+    
+    This is needed for leaflet-based web visualizations to work properly
+    since they require HTTP access to load tiles and other resources.
+    """
+    if not directory.exists():
+        rprint(f"[red]Error: Directory {directory} does not exist[/red]")
+        raise typer.Exit(1)
+        
+    if not directory.is_dir():
+        rprint(f"[red]Error: {directory} is not a directory[/red]")
+        raise typer.Exit(1)
+    
+    # Change to the directory to serve
+    original_dir = Path.cwd()
+    
+    class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, format, *args):
+            # Only log errors, not every request
+            if args[1] != '200':
+                super().log_message(format, *args)
+    
+    try:
+        # Find available port
+        while True:
+            try:
+                with socketserver.TCPServer(("", port), QuietHTTPRequestHandler) as httpd:
+                    break
+            except OSError:
+                port += 1
+                if port > 9000:
+                    rprint("[red]Error: Could not find available port[/red]")
+                    raise typer.Exit(1)
+        
+        rprint(f"[green]Starting web server on port {port}[/green]")
+        rprint(f"[blue]Serving directory: {directory.absolute()}[/blue]")
+        
+        # Debug: Show directory contents
+        try:
+            contents = list(directory.iterdir())
+            rprint(f"[yellow]Directory contains: {[p.name for p in contents[:10]]}{'...' if len(contents) > 10 else ''}[/yellow]")
+        except Exception as e:
+            rprint(f"[yellow]Could not list directory contents: {e}[/yellow]")
+        
+        # Determine what to open in browser
+        if html_file:
+            html_path = directory / html_file
+            if not html_path.exists():
+                rprint(f"[yellow]Warning: HTML file {html_file} not found[/yellow]")
+                browser_url = f"http://localhost:{port}/"
+            else:
+                browser_url = f"http://localhost:{port}/{html_file}"
+        else:
+            # Look for common HTML files
+            common_names = ["index.html", "viewer.html", "map.html", "coverage.html"]
+            found_html = None
+            for name in common_names:
+                if (directory / name).exists():
+                    found_html = name
+                    break
+            
+            if found_html:
+                browser_url = f"http://localhost:{port}/{found_html}"
+                rprint(f"[blue]Found HTML file: {found_html}[/blue]")
+            else:
+                browser_url = f"http://localhost:{port}/"
+        
+        # Start server in background thread
+        def start_server():
+            import os
+            os.chdir(directory)
+            try:
+                with socketserver.TCPServer(("", port), QuietHTTPRequestHandler) as httpd:
+                    httpd.serve_forever()
+            except KeyboardInterrupt:
+                pass
+            finally:
+                os.chdir(original_dir)
+        
+        server_thread = threading.Thread(target=start_server, daemon=True)
+        server_thread.start()
+        
+        # Give server a moment to start
+        time.sleep(0.5)
+        
+        rprint(f"[green]✅ Web server running at: http://localhost:{port}/[/green]")
+        
+        if open_browser:
+            rprint(f"[blue]Opening browser: {browser_url}[/blue]")
+            webbrowser.open(browser_url)
+        else:
+            rprint(f"[blue]Open in browser: {browser_url}[/blue]")
+        
+        rprint("\n[yellow]Press Ctrl+C to stop the server[/yellow]")
+        
+        try:
+            # Keep main thread alive
+            while server_thread.is_alive():
+                time.sleep(1)
+        except KeyboardInterrupt:
+            rprint("\n[green]Stopping web server...[/green]")
+            raise typer.Exit(0)
+            
+    except Exception as e:
+        rprint(f"[red]Error starting web server: {e}[/red]")
+        raise typer.Exit(1)
 
 
 @app.command()
