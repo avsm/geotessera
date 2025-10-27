@@ -2,8 +2,8 @@
 
 from typing import Tuple, Optional, List, Dict, Callable
 import geopandas as gpd
-import pooch
 import zipfile
+import os
 from pathlib import Path
 import difflib
 
@@ -22,7 +22,17 @@ class CountryLookup:
             cache_dir: Optional cache directory path
             progress_callback: Optional callback(current, total, status) for progress updates
         """
-        self._cache_dir = cache_dir or Path(pooch.os_cache("geotessera"))
+        if cache_dir:
+            self._cache_dir = Path(cache_dir)
+        else:
+            # Use platform-appropriate cache directory
+            if os.name == 'nt':
+                base = Path(os.environ.get('LOCALAPPDATA', '~')).expanduser()
+            else:
+                base = Path(os.environ.get('XDG_CACHE_HOME', '~/.cache')).expanduser()
+            self._cache_dir = base / 'geotessera'
+
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
         self._countries_gdf: Optional[gpd.GeoDataFrame] = None
         self._name_lookup: Optional[Dict[str, str]] = None
         self._progress_callback = progress_callback

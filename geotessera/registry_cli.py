@@ -316,13 +316,156 @@ def generate_master_registry(registry_dir):
     pass
 
 
+def create_landmasks_parquet_database(base_dir, output_path, console):
+    """Create a Parquet database for landmasks by reading from SHA256SUM file.
+
+    Args:
+        base_dir: Base directory containing global_0.1_degree_tiff_all
+        output_path: Output path for the Parquet file
+        console: Rich console for output
+
+    Returns:
+        True on success, False on failure
+    """
+    console.print(Panel.fit(
+        f"[bold blue]🗺️ Creating Landmasks Parquet Database[/bold blue]\n"
+        f"📁 {base_dir}\n"
+        f"📄 {output_path}",
+        style="blue"
+    ))
+
+    sha256sum_file = os.path.join(base_dir, "SHA256SUM")
+    if not os.path.exists(sha256sum_file):
+        console.print(f"[red]SHA256SUM file not found:[/red] {sha256sum_file}")
+        return False
+
+    records = []
+
+    # Progress tracking
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TextColumn("•"),
+        TextColumn("[dim]{task.fields[status]}", justify="left"),
+        console=console,
+    ) as progress:
+
+        read_task = progress.add_task(
+            "Reading SHA256SUM file...", total=100, status="Starting..."
+        )
+
+        try:
+            with open(sha256sum_file, "r") as f:
+                lines = f.readlines()
+
+            progress.update(read_task, completed=50, status="Parsing entries...")
+
+            for line in lines:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        checksum = parts[0]
+                        filename = parts[-1]
+
+                        if filename.endswith(".tiff") or filename.endswith(".tif"):
+                            if filename.startswith("grid_"):
+                                try:
+                                    # Remove 'grid_' prefix and '.tiff' suffix
+                                    coords_str = (
+                                        filename[5:]
+                                        .replace(".tiff", "")
+                                        .replace(".tif", "")
+                                    )
+                                    lon_str, lat_str = coords_str.split("_")
+                                    lon = float(lon_str)
+                                    lat = float(lat_str)
+
+                                    records.append({
+                                        'lat': lat,
+                                        'lon': lon,
+                                        'hash': checksum,
+                                        'file_path': filename
+                                    })
+                                except (ValueError, IndexError):
+                                    continue
+
+            progress.update(read_task, completed=100, status="Complete")
+
+        except Exception as e:
+            console.print(f"[red]Error reading SHA256SUM file: {e}[/red]")
+            return False
+
+        if not records:
+            console.print("[red]No landmask tiles found in SHA256SUM file[/red]")
+            return False
+
+        # Convert to Parquet
+        parquet_task = progress.add_task(
+            "Creating Parquet database...", total=100, status="Converting to DataFrame..."
+        )
+
+        progress.update(parquet_task, completed=25, status="Sorting records...")
+        df = pd.DataFrame(records)
+        df = df.sort_values(['lat', 'lon'])
+
+        progress.update(parquet_task, completed=75, status="Writing Parquet file...")
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
+        # Write to temporary file first for atomic operation
+        import tempfile
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode='wb',
+                dir=Path(output_path).parent,
+                prefix=f'.{Path(output_path).name}_tmp_',
+                suffix='.parquet',
+                delete=False
+            ) as temp_file:
+                temp_path = temp_file.name
+
+            # Write to temporary file
+            df.to_parquet(temp_path, compression='snappy', index=False)
+
+            # Atomic rename to final location
+            os.rename(temp_path, output_path)
+            temp_path = None
+
+        except Exception:
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise
+
+        progress.update(parquet_task, completed=100, status="Complete")
+
+    # Get file size and show results
+    file_size = Path(output_path).stat().st_size
+
+    # Summary table
+    summary_table = Table(show_header=False, box=None)
+    summary_table.add_row("📊 Records:", f"{len(records):,}")
+    summary_table.add_row("💾 File size:", f"{file_size:,} bytes")
+    summary_table.add_row("🌍 Coordinates:", f"{len(df[['lat', 'lon']].drop_duplicates()):,} unique tiles")
+
+    console.print(Panel(
+        summary_table,
+        title="[bold green]✅ Landmasks Parquet Database Created[/bold green]",
+        border_style="green"
+    ))
+
+    return True
+
+
 def create_parquet_database_from_filesystem(base_dir, output_path, console):
     """Create a Parquet database by reading from existing SHA256 files.
-    
-    Fast implementation that reads hashes from SHA256 files instead of 
+
+    Fast implementation that reads hashes from SHA256 files instead of
     recalculating them, making database creation much faster.
     Uses temporary file for atomic writing to ensure cron-safe operation.
-    
+
     Args:
         base_dir: Base directory containing global_0.1_degree_representation
         output_path: Output path for the Parquet file
@@ -330,7 +473,7 @@ def create_parquet_database_from_filesystem(base_dir, output_path, console):
     """
     # Show initial header
     console.print(Panel.fit(
-        f"[bold blue]🗄️ Creating Parquet Database[/bold blue]\n"
+        f"[bold blue]🗄️ Creating Embeddings Parquet Database[/bold blue]\n"
         f"📁 {base_dir}\n"
         f"📄 {output_path}",
         style="blue"
@@ -597,19 +740,35 @@ def list_command(args):
 
 
 def process_grid_checksum(args):
-    """Process a single grid directory to generate SHA256 checksums."""
+    """Process a single grid directory to generate SHA256 checksums.
+
+    Only recalculates checksums if:
+    - SHA256 file doesn't exist, OR
+    - force=True, OR
+    - Any .npy file has mtime newer than the SHA256 file
+    """
     year_dir, grid_name, force = args
     grid_dir = os.path.join(year_dir, grid_name)
     sha256_file = os.path.join(grid_dir, "SHA256")
 
-    # Skip if SHA256 file already exists and force is not enabled
-    if not force and os.path.exists(sha256_file):
-        # Count .npy files to report in progress
-        npy_files = [f for f in os.listdir(grid_dir) if f.endswith(".npy")]
-        return (grid_name, len(npy_files), True, "skipped")
-
     # Find all .npy files in this grid directory
     npy_files = [f for f in os.listdir(grid_dir) if f.endswith(".npy")]
+
+    # If SHA256 file exists and force is not enabled, check mtimes
+    if not force and os.path.exists(sha256_file):
+        sha256_mtime = os.path.getmtime(sha256_file)
+
+        # Check if any .npy file is newer than the SHA256 file
+        needs_update = False
+        for npy_file in npy_files:
+            npy_path = os.path.join(grid_dir, npy_file)
+            if os.path.getmtime(npy_path) > sha256_mtime:
+                needs_update = True
+                break
+
+        if not needs_update:
+            # All files are older than SHA256 file, skip
+            return (grid_name, len(npy_files), True, "skipped")
 
     if npy_files:
         try:
@@ -636,12 +795,23 @@ def process_grid_checksum(args):
 
 
 def generate_embeddings_checksums(base_dir, force=False):
-    """Generate SHA256 checksums for .npy files in each embeddings subdirectory."""
+    """Generate SHA256 checksums for .npy files in each embeddings subdirectory.
+
+    Only recalculates checksums for grid directories where:
+    - SHA256 file doesn't exist, OR
+    - force=True, OR
+    - Any .npy file has mtime newer than the SHA256 file
+
+    This optimization makes subsequent runs much faster by only updating
+    checksums when files have actually changed.
+    """
     from tqdm import tqdm
 
     print("Generating SHA256 checksums for embeddings...")
     if force:
         print("Force mode enabled - regenerating all checksums")
+    else:
+        print("Using smart update: only recalculating for modified files")
 
     # Get number of CPU cores
     num_cores = multiprocessing.cpu_count()
@@ -747,22 +917,24 @@ def process_tiff_chunk(args):
 
 
 def generate_tiff_checksums(base_dir, force=False):
-    """Generate SHA256 checksums for TIFF files using chunked parallel processing."""
+    """Generate SHA256 checksums for TIFF files using chunked parallel processing.
+
+    Only recalculates checksums if:
+    - SHA256SUM file doesn't exist, OR
+    - force=True, OR
+    - Any .tiff file has mtime newer than the SHA256SUM file
+    """
     from tqdm import tqdm
 
     print("Generating SHA256 checksums for TIFF files...")
     if force:
         print("Force mode enabled - regenerating all checksums")
+    else:
+        print("Using smart update: only recalculating if files have been modified")
 
     # Get number of CPU cores
     num_cores = multiprocessing.cpu_count()
     print(f"Using {num_cores} CPU cores for parallel processing")
-
-    # Check if SHA256SUM already exists and force is not enabled
-    sha256sum_file = os.path.join(base_dir, "SHA256SUM")
-    if not force and os.path.exists(sha256sum_file):
-        print("SHA256SUM file already exists. Skipping (use --force to regenerate)")
-        return 0
 
     # Find all .tiff files
     tiff_files = []
@@ -773,6 +945,25 @@ def generate_tiff_checksums(base_dir, force=False):
     if not tiff_files:
         print("No TIFF files found")
         return 1
+
+    # Check if SHA256SUM already exists and force is not enabled
+    sha256sum_file = os.path.join(base_dir, "SHA256SUM")
+    if not force and os.path.exists(sha256sum_file):
+        sha256sum_mtime = os.path.getmtime(sha256sum_file)
+
+        # Check if any TIFF file is newer than the SHA256SUM file
+        needs_update = False
+        for tiff_file in tiff_files:
+            tiff_path = os.path.join(base_dir, tiff_file)
+            if os.path.getmtime(tiff_path) > sha256sum_mtime:
+                needs_update = True
+                print(f"Found updated file: {tiff_file}")
+                break
+
+        if not needs_update:
+            print("SHA256SUM file is up to date (all TIFF files are older). Skipping.")
+            print("Use --force to regenerate anyway.")
+            return 0
 
     # Sort files for consistent ordering
     tiff_files.sort()
@@ -1143,21 +1334,28 @@ def scan_command(args):
     else:
         output_dir = base_dir
 
-    # Create parquet database first
-    parquet_path = os.path.join(output_dir, "registry.parquet")
-    
     # Look for expected directories
     repr_dir = os.path.join(base_dir, "global_0.1_degree_representation")
     tiles_dir = os.path.join(base_dir, "global_0.1_degree_tiff_all")
-    
-    if not os.path.exists(repr_dir):
+
+    # Create embeddings Parquet database
+    embeddings_parquet_path = os.path.join(output_dir, "registry.parquet")
+    if os.path.exists(repr_dir):
+        if not create_parquet_database_from_filesystem(base_dir, embeddings_parquet_path, console):
+            console.print("[red]Failed to create embeddings parquet database[/red]")
+            return 1
+    else:
         console.print(f"[red]Error: Embeddings directory not found: {repr_dir}[/red]")
         return 1
 
-    # Create parquet database
-    if not create_parquet_database_from_filesystem(base_dir, parquet_path, console):
-        console.print("[red]Failed to create parquet database[/red]")
-        return 1
+    # Create landmasks Parquet database
+    landmasks_parquet_path = os.path.join(output_dir, "landmasks.parquet")
+    if os.path.exists(tiles_dir):
+        if not create_landmasks_parquet_database(tiles_dir, landmasks_parquet_path, console):
+            console.print("[yellow]Warning: Failed to create landmasks parquet database[/yellow]")
+            # Don't return error, landmasks are optional
+    else:
+        console.print(f"[yellow]Warning: Landmasks directory not found: {tiles_dir}[/yellow]")
 
     # Create text-based registry files
     registry_dir = os.path.join(output_dir, "registry")
@@ -1198,7 +1396,10 @@ def scan_command(args):
     # Show final summary
     summary_lines = ["[green]✅ Registry Generation Complete[/green]\n"]
     summary_lines.append("📊 Generated outputs:")
-    summary_lines.append(f"• Parquet database: {parquet_path}")
+    summary_lines.append("• Parquet databases:")
+    summary_lines.append(f"  → {embeddings_parquet_path} (embeddings)")
+    if os.path.exists(landmasks_parquet_path):
+        summary_lines.append(f"  → {landmasks_parquet_path} (landmasks)")
     summary_lines.append("• Text registry files:")
     if os.path.exists(repr_dir):
         summary_lines.append(f"  → registry/embeddings/ (from {repr_dir})")

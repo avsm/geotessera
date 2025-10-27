@@ -32,26 +32,23 @@ class GeoTessera:
         self,
         dataset_version: str = "v1",
         cache_dir: Optional[Union[str, Path]] = None,
-        registry_dir: Optional[Union[str, Path]] = None,
-        auto_update: bool = True,
-        manifests_repo_url: str = "https://github.com/ucam-eo/tessera-manifests.git",
+        registry_url: Optional[str] = None,
+        registry_path: Optional[Union[str, Path]] = None,
     ):
-        """Initialize GeoTessera with registry management.
+        """Initialize GeoTessera with Parquet registry.
 
         Args:
             dataset_version: Tessera dataset version (e.g., 'v1', 'v2')
             cache_dir: Directory for caching downloaded files
-            registry_dir: Directory containing registry files
-            auto_update: Whether to auto-update registry
-            manifests_repo_url: Git repository URL for registry manifests
+            registry_url: URL to download Parquet registry from (default: remote)
+            registry_path: Local path to existing Parquet registry file
         """
         self.dataset_version = dataset_version
         self.registry = Registry(
             version=dataset_version,
             cache_dir=cache_dir,
-            registry_dir=registry_dir,
-            auto_update=auto_update,
-            manifests_repo_url=manifests_repo_url,
+            registry_url=registry_url,
+            registry_path=registry_path,
         )
 
     @property
@@ -169,6 +166,7 @@ class GeoTessera:
             - transform: Affine transform from rasterio
         """
         from .registry import tile_to_embedding_paths
+        from pathlib import Path
 
         # Ensure the block is loaded
         self.registry.ensure_block_loaded(year, lon, lat)
@@ -176,7 +174,7 @@ class GeoTessera:
         # Get file paths
         embedding_path, scales_path = tile_to_embedding_paths(lon, lat, year)
 
-        # Fetch the files
+        # Fetch the files to temporary locations
         embedding_file = self.registry.fetch(
             embedding_path, progressbar=False, progress_callback=progress_callback
         )
@@ -184,22 +182,28 @@ class GeoTessera:
             scales_path, progressbar=False, progress_callback=progress_callback
         )
 
-        # Load and dequantize
-        quantized_embedding = np.load(embedding_file)
-        scales = np.load(scales_file)
+        try:
+            # Load and dequantize
+            quantized_embedding = np.load(embedding_file)
+            scales = np.load(scales_file)
 
-        # Dequantize using scales
-        # Handle both 2D scales (H, W) and 3D scales (H, W, 128)
-        if scales.ndim == 2 and quantized_embedding.ndim == 3:
-            # Broadcast 2D scales to match 3D embedding shape
-            scales = scales[..., np.newaxis]  # Add channel dimension
+            # Dequantize using scales
+            # Handle both 2D scales (H, W) and 3D scales (H, W, 128)
+            if scales.ndim == 2 and quantized_embedding.ndim == 3:
+                # Broadcast 2D scales to match 3D embedding shape
+                scales = scales[..., np.newaxis]  # Add channel dimension
 
-        dequantized = quantized_embedding.astype(np.float32) * scales
+            dequantized = quantized_embedding.astype(np.float32) * scales
 
-        # Get CRS and transform from landmask
-        crs, transform = self._get_utm_projection_from_landmask(lon, lat)
+            # Get CRS and transform from landmask
+            crs, transform = self._get_utm_projection_from_landmask(lon, lat)
 
-        return dequantized, crs, transform
+            return dequantized, crs, transform
+
+        finally:
+            # Clean up temporary files
+            Path(embedding_file).unlink(missing_ok=True)
+            Path(scales_file).unlink(missing_ok=True)
 
     def _reproject_geotiff_file(self, args):
         """Helper function to reproject a single GeoTIFF file.
@@ -288,6 +292,7 @@ class GeoTessera:
 
         try:
             from .registry import tile_to_landmask_filename
+            from pathlib import Path
 
             # Get landmask filename
             landmask_filename = tile_to_landmask_filename(lon, lat)
@@ -295,22 +300,27 @@ class GeoTessera:
             # Ensure registry block is loaded
             self.registry.ensure_tile_block_loaded(lon, lat)
 
-            # Fetch landmask file
+            # Fetch landmask file to temporary location
             landmask_path = self.registry.fetch_landmask(
                 landmask_filename, progressbar=False
             )
 
-            # Extract CRS and transform
-            with rasterio.open(landmask_path) as src:
-                if src.crs is None:
-                    raise RuntimeError(
-                        f"Landmask tile {landmask_filename} has no CRS information"
-                    )
-                if src.transform is None:
-                    raise RuntimeError(
-                        f"Landmask tile {landmask_filename} has no transform information"
-                    )
-                return src.crs, src.transform
+            try:
+                # Extract CRS and transform
+                with rasterio.open(landmask_path) as src:
+                    if src.crs is None:
+                        raise RuntimeError(
+                            f"Landmask tile {landmask_filename} has no CRS information"
+                        )
+                    if src.transform is None:
+                        raise RuntimeError(
+                            f"Landmask tile {landmask_filename} has no transform information"
+                        )
+                    return src.crs, src.transform
+
+            finally:
+                # Clean up temporary landmask file
+                Path(landmask_path).unlink(missing_ok=True)
 
         except Exception as e:
             if isinstance(e, (ImportError, RuntimeError)):
