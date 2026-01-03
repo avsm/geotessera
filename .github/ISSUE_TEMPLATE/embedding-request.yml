@@ -1,5 +1,5 @@
 name: Embedding Request
-description: Request precomputed embeddings for a specific region/years (2017–2024). Please fill out all required fields.
+description: Request precomputed embeddings for a specific region/years (2017–2025). Please fill out all required fields.
 title: "[Embedding Request] ORG / YEARS / ROI summary"
 labels:
   - embedding-request
@@ -79,7 +79,7 @@ body:
     id: years
     attributes:
       label: 4) Years (multi-select)
-      description: Choose one or more years between 2017–2024.
+      description: Choose one or more years between 2017–2025.
       multiple: true
       options:
         - "2017"
@@ -90,6 +90,7 @@ body:
         - "2022"
         - "2023"
         - "2024"
+        - "2025"
     validations:
       required: true
 
