@@ -26,6 +26,7 @@ from geotessera import __version__
 from geotessera.registry import (
     EMBEDDINGS_DIR_NAME,
     LANDMASKS_DIR_NAME,
+    tile_from_world,
     tile_to_landmask_filename,
     tile_to_embedding_paths,
 )
@@ -116,6 +117,23 @@ def format_bbox(bbox_coords) -> str:
     max_lat_str = f"{abs(max_lat):.6f}°{'S' if max_lat < 0 else 'N'}"
 
     return f"[{min_lon_str}, {min_lat_str}] - [{max_lon_str}, {max_lat_str}]"
+
+
+def point_to_tile_bbox(lon: float, lat: float) -> tuple:
+    """Convert a point to the bounding box of its containing tile.
+
+    Tiles are 0.1x0.1 degree squares centered at 0.05-degree offsets.
+
+    Args:
+        lon: Longitude in decimal degrees
+        lat: Latitude in decimal degrees
+
+    Returns:
+        Tuple of (min_lon, min_lat, max_lon, max_lat) for the containing tile
+    """
+    tile_lon, tile_lat = tile_from_world(lon, lat)
+    # Tile center ± 0.05 degrees
+    return (tile_lon - 0.05, tile_lat - 0.05, tile_lon + 0.05, tile_lat + 0.05)
 
 
 app = typer.Typer(
@@ -533,6 +551,17 @@ def coverage(
             help="Country name to focus coverage map on (e.g., 'United Kingdom', 'UK', 'GB')",
         ),
     ] = None,
+    bbox: Annotated[
+        Optional[str],
+        typer.Option(
+            "--bbox",
+            help="Bounding box: 'lon,lat' (single tile) or 'min_lon,min_lat,max_lon,max_lat'",
+        ),
+    ] = None,
+    tile: Annotated[
+        Optional[str],
+        typer.Option("--tile", help="Single tile by any point within it: 'lon,lat'"),
+    ] = None,
     tile_color: Annotated[
         str,
         typer.Option(
@@ -611,13 +640,60 @@ def coverage(
     country_geojson_file = None
     region_file_temp = None  # Track if we created a temporary file
 
-    if region_file and country:
+    # Check mutual exclusivity of region options
+    region_sources = sum(1 for x in [bbox, tile, region_file, country] if x)
+    if region_sources > 1:
         rprint(
-            "[red]Error: Cannot specify both --region-file and --country. Choose one.[/red]"
+            "[red]Error: Cannot specify multiple region options. "
+            "Choose one of: --bbox, --tile, --region-file, --country[/red]"
         )
         raise typer.Exit(1)
 
-    if region_file:
+    if tile:
+        try:
+            tile_coords = tuple(map(float, tile.split(",")))
+            if len(tile_coords) != 2:
+                rprint("[red]Error: --tile must be 'lon,lat'[/red]")
+                raise typer.Exit(1)
+            lon, lat = tile_coords
+            tile_center = tile_from_world(lon, lat)
+            region_bbox = point_to_tile_bbox(lon, lat)
+            rprint(
+                f"[green]Point ({lon}, {lat}) → tile "
+                f"grid_{tile_center[0]:.2f}_{tile_center[1]:.2f}[/green]"
+            )
+            rprint(f"[green]Region bounding box:[/green] {format_bbox(region_bbox)}")
+        except ValueError as e:
+            rprint(f"[red]Error: Invalid --tile format. Use 'lon,lat': {e}[/red]")
+            raise typer.Exit(1)
+    elif bbox:
+        try:
+            bbox_coords = tuple(map(float, bbox.split(",")))
+            if len(bbox_coords) == 2:
+                # Two coordinates = single tile
+                lon, lat = bbox_coords
+                tile_center = tile_from_world(lon, lat)
+                region_bbox = point_to_tile_bbox(lon, lat)
+                rprint(
+                    f"[green]Point ({lon}, {lat}) → tile "
+                    f"grid_{tile_center[0]:.2f}_{tile_center[1]:.2f}[/green]"
+                )
+            elif len(bbox_coords) == 4:
+                region_bbox = bbox_coords
+            else:
+                rprint(
+                    "[red]Error: bbox must be 'lon,lat' (single tile) "
+                    "or 'min_lon,min_lat,max_lon,max_lat'[/red]"
+                )
+                raise typer.Exit(1)
+            rprint(f"[green]Region bounding box:[/green] {format_bbox(region_bbox)}")
+        except ValueError:
+            rprint(
+                "[red]Error: Invalid bbox format. Use: 'lon,lat' or "
+                "'min_lon,min_lat,max_lon,max_lat'[/red]"
+            )
+            raise typer.Exit(1)
+    elif region_file:
         try:
             from .visualization import calculate_bbox_from_file
 
@@ -892,7 +968,14 @@ def download(
     ] = None,
     bbox: Annotated[
         Optional[str],
-        typer.Option("--bbox", help="Bounding box: 'min_lon,min_lat,max_lon,max_lat'"),
+        typer.Option(
+            "--bbox",
+            help="Bounding box: 'lon,lat' (single tile) or 'min_lon,min_lat,max_lon,max_lat'",
+        ),
+    ] = None,
+    tile: Annotated[
+        Optional[str],
+        typer.Option("--tile", help="Single tile by any point within it: 'lon,lat'"),
     ] = None,
     region_file: Annotated[
         Optional[str],
@@ -1006,19 +1089,58 @@ def download(
         verify_hashes=not skip_hash,
     )
 
-    # Parse bounding box
-    if bbox:
+    # Check mutual exclusivity of region options
+    region_sources = sum(1 for x in [bbox, tile, region_file, country] if x)
+    if region_sources > 1:
+        rprint(
+            "[red]Error: Cannot specify multiple region options. "
+            "Choose one of: --bbox, --tile, --region-file, --country[/red]"
+        )
+        raise typer.Exit(1)
+
+    # Parse bounding box or tile
+    if tile:
+        try:
+            tile_coords = tuple(map(float, tile.split(",")))
+            if len(tile_coords) != 2:
+                rprint("[red]Error: --tile must be 'lon,lat'[/red]")
+                raise typer.Exit(1)
+            lon, lat = tile_coords
+            tile_center = tile_from_world(lon, lat)
+            bbox_coords = point_to_tile_bbox(lon, lat)
+            rprint(
+                f"[green]Point ({lon}, {lat}) → tile "
+                f"grid_{tile_center[0]:.2f}_{tile_center[1]:.2f}[/green]"
+            )
+            rprint(f"[green]Using bounding box:[/green] {format_bbox(bbox_coords)}")
+        except ValueError as e:
+            rprint(f"[red]Error: Invalid --tile format. Use 'lon,lat': {e}[/red]")
+            raise typer.Exit(1)
+    elif bbox:
         try:
             bbox_coords = tuple(map(float, bbox.split(",")))
-            if len(bbox_coords) != 4:
+            if len(bbox_coords) == 2:
+                # Two coordinates = single tile
+                lon, lat = bbox_coords
+                tile_center = tile_from_world(lon, lat)
+                bbox_coords = point_to_tile_bbox(lon, lat)
                 rprint(
-                    "[red]Error: bbox must be 'min_lon,min_lat,max_lon,max_lat'[/red]"
+                    f"[green]Point ({lon}, {lat}) → tile "
+                    f"grid_{tile_center[0]:.2f}_{tile_center[1]:.2f}[/green]"
+                )
+                rprint(f"[green]Using bounding box:[/green] {format_bbox(bbox_coords)}")
+            elif len(bbox_coords) == 4:
+                rprint(f"[green]Using bounding box:[/green] {format_bbox(bbox_coords)}")
+            else:
+                rprint(
+                    "[red]Error: bbox must be 'lon,lat' (single tile) "
+                    "or 'min_lon,min_lat,max_lon,max_lat'[/red]"
                 )
                 raise typer.Exit(1)
-            rprint(f"[green]Using bounding box:[/green] {format_bbox(bbox_coords)}")
         except ValueError:
             rprint(
-                "[red]Error: Invalid bbox format. Use: 'min_lon,min_lat,max_lon,max_lat'[/red]"
+                "[red]Error: Invalid bbox format. Use: 'lon,lat' or "
+                "'min_lon,min_lat,max_lon,max_lat'[/red]"
             )
             raise typer.Exit(1)
     elif region_file:
@@ -1098,10 +1220,14 @@ def download(
         rprint(f"[green]Using country '{country}':[/green] {format_bbox(bbox_coords)}")
     else:
         rprint(
-            "[red]Error: Must specify either --bbox, --region-file, or --country[/red]"
+            "[red]Error: Must specify either --bbox, --tile, --region-file, or --country[/red]"
         )
         rprint("Examples:")
-        rprint("  --bbox '-0.2,51.4,0.1,51.6'  # London area")
+        rprint("  --tile '0.17,52.23'          # Single tile containing point")
+        rprint(
+            "  --bbox '0.17,52.23'          # Same as above (2 coords = single tile)"
+        )
+        rprint("  --bbox '-0.2,51.4,0.1,51.6'  # London area (4 coords = region)")
         rprint("  --region-file london.geojson  # From GeoJSON file")
         rprint("  --country 'United Kingdom'    # Country by name")
         raise typer.Exit(1)
