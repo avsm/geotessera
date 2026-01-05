@@ -123,6 +123,8 @@ def point_to_tile_bbox(lon: float, lat: float) -> tuple:
     """Convert a point to the bounding box of its containing tile.
 
     Tiles are 0.1x0.1 degree squares centered at 0.05-degree offsets.
+    Returns a point bbox at the tile center, which the registry query
+    will expand by 0.05 degrees to match exactly one tile.
 
     Args:
         lon: Longitude in decimal degrees
@@ -132,8 +134,9 @@ def point_to_tile_bbox(lon: float, lat: float) -> tuple:
         Tuple of (min_lon, min_lat, max_lon, max_lat) for the containing tile
     """
     tile_lon, tile_lat = tile_from_world(lon, lat)
-    # Tile center ± 0.05 degrees
-    return (tile_lon - 0.05, tile_lat - 0.05, tile_lon + 0.05, tile_lat + 0.05)
+    # Return point bbox at tile center - registry expands by 0.05 degrees
+    # which will match exactly this one tile
+    return (tile_lon, tile_lat, tile_lon, tile_lat)
 
 
 app = typer.Typer(
@@ -659,7 +662,7 @@ def coverage(
             tile_center = tile_from_world(lon, lat)
             region_bbox = point_to_tile_bbox(lon, lat)
             rprint(
-                f"[green]Point ({lon}, {lat}) → tile "
+                f"[green]Point ({lon}, {lat}) -> tile "
                 f"grid_{tile_center[0]:.2f}_{tile_center[1]:.2f}[/green]"
             )
             rprint(f"[green]Region bounding box:[/green] {format_bbox(region_bbox)}")
@@ -675,7 +678,7 @@ def coverage(
                 tile_center = tile_from_world(lon, lat)
                 region_bbox = point_to_tile_bbox(lon, lat)
                 rprint(
-                    f"[green]Point ({lon}, {lat}) → tile "
+                    f"[green]Point ({lon}, {lat}) -> tile "
                     f"grid_{tile_center[0]:.2f}_{tile_center[1]:.2f}[/green]"
                 )
             elif len(bbox_coords) == 4:
@@ -1109,7 +1112,7 @@ def download(
             tile_center = tile_from_world(lon, lat)
             bbox_coords = point_to_tile_bbox(lon, lat)
             rprint(
-                f"[green]Point ({lon}, {lat}) → tile "
+                f"[green]Point ({lon}, {lat}) -> tile "
                 f"grid_{tile_center[0]:.2f}_{tile_center[1]:.2f}[/green]"
             )
             rprint(f"[green]Using bounding box:[/green] {format_bbox(bbox_coords)}")
@@ -1125,7 +1128,7 @@ def download(
                 tile_center = tile_from_world(lon, lat)
                 bbox_coords = point_to_tile_bbox(lon, lat)
                 rprint(
-                    f"[green]Point ({lon}, {lat}) → tile "
+                    f"[green]Point ({lon}, {lat}) -> tile "
                     f"grid_{tile_center[0]:.2f}_{tile_center[1]:.2f}[/green]"
                 )
                 rprint(f"[green]Using bounding box:[/green] {format_bbox(bbox_coords)}")
