@@ -25,9 +25,6 @@ If some **years (2017–2024) / areas** are still missing for your use case, ple
 
 After you submit the request, we will **prioritize your ROI** and notify you via a comment in the issue once the embeddings are ready. 
 
-**A request for support**
-Due to limited compute resources, we're unable to fulfill embedding requests covering large geographic areas or requiring substantial processing time. To help us serve the community better, we kindly ask requesters—especially those from commercial organizations or those requiring large-scale processing—to sponsor their requests by providing us with Azure credits. Importantly, the resulting outputs will be contributed to our global embeddings database, making them freely available for the entire research and user community. This approach allows us to scale our service while building a shared resource that benefits everyone.  If you are in a position to support us in this way, please contact Prof. S.Keshav at sk818@cam.ac.uk. We greatly appreciate your understanding and support in making Tessera more accessible to all.
-
 ### Important Notice ⚠️
 On 20th August 2025, we updated the data processing pipeline of GeoTessera to resolve the issue of tiling artifacts, as shown below. We have retained the embeddings generated before August 20, as they remain effective for use in small-scale areas. After the 2024 embedding generation is completed, we will reprocess the tiles affected by tiling artifacts. If you observe such artifacts during use and they significantly impact performance, please raise the issue **[here](../../issues/new?template=embedding-request.yml&labels=embedding-request)**, and we will prioritize reprocessing your request.
 
