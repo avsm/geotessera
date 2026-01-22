@@ -122,7 +122,7 @@ Test: Info Command on Downloaded TIFF Tiles
 Test the info command on the downloaded TIFF tiles.
 Both TIFF and NPY formats should be present (NPY files are retained for efficient reprocessing):
 
-  $ geotessera info --tiles "$TESTDIR/uk_tiles_tiff"
+  $ geotessera info --year 2024 --tiles "$TESTDIR/uk_tiles_tiff"
    Total tiles: 16                             
    Format:      GEOTIFF, NPY, ZARR (USING NPY) 
    Years:       2024                           
@@ -132,7 +132,7 @@ Both TIFF and NPY formats should be present (NPY files are retained for efficien
    Band Count Files 
    128 bands     16 
 
-  $ geotessera info --tiles "$TESTDIR/uk_tiles_tiff"
+  $ geotessera info --year 2024 --tiles "$TESTDIR/uk_tiles_tiff"
    Total tiles: 16                             
    Format:      GEOTIFF, NPY, ZARR (USING NPY) 
    Years:       2024                           
@@ -147,7 +147,7 @@ Test: Info Command on Downloaded NPY Tiles
 
 Test the info command on the downloaded NPY tiles:
 
-  $ geotessera info --tiles "$TESTDIR/uk_tiles_npy"
+  $ geotessera info --year 2024 --tiles "$TESTDIR/uk_tiles_npy"
    Total tiles: 16                     
    Format:      NPY                    
    Years:       2024                   
@@ -157,7 +157,7 @@ Test the info command on the downloaded NPY tiles:
    Band Count Files 
    128 bands     16 
 
-  $ geotessera info --tiles "$TESTDIR/uk_tiles_npy"
+  $ geotessera info --year 2024 --tiles "$TESTDIR/uk_tiles_npy"
    Total tiles: 16                     
    Format:      NPY                    
    Years:       2024                   
