@@ -322,14 +322,25 @@ geotessera download [OPTIONS]
 
 Options:
   -o, --output PATH         Output directory [required]
-  --bbox TEXT              Bounding box: 'min_lon,min_lat,max_lon,max_lat'
+  --bbox TEXT              Bounding box: 'lon,lat' (single tile) or 'min_lon,min_lat,max_lon,max_lat'
+  --tile TEXT              Single tile by any point within it: 'lon,lat'
   --region-file PATH       GeoJSON/Shapefile to define region
+  --country TEXT           Country name (e.g., 'United Kingdom', 'UK', 'GB')
   -f, --format TEXT        Output format: 'tiff' or 'npy' (default: tiff)
   --year INT               Year of embeddings (default: 2024)
   --bands TEXT             Comma-separated band indices (default: all 128)
   --compress TEXT          Compression for TIFF format (default: lzw)
   --list-files             List all created files with details
   -v, --verbose            Verbose output
+```
+
+Single tile examples:
+```bash
+# Download a single tile containing a specific point
+geotessera download --tile "0.17,52.23" --year 2024 -o ./single_tile
+
+# Same result using --bbox with 2 coordinates
+geotessera download --bbox "0.17,52.23" --year 2024 -o ./single_tile
 ```
 
 Output formats:
@@ -363,12 +374,14 @@ geotessera coverage [OPTIONS]
 Options:
   -o, --output PATH        Output PNG file (default: tessera_coverage.png)
   --year INT               Specific year to visualize
+  --bbox TEXT              Bounding box: 'lon,lat' (single tile) or 'min_lon,min_lat,max_lon,max_lat'
+  --tile TEXT              Single tile by any point within it: 'lon,lat'
+  --region-file PATH       GeoJSON/Shapefile to focus on specific region
+  --country TEXT           Country name to focus on (e.g., 'United Kingdom')
   --tile-color TEXT        Color for tiles (default: red)
   --tile-alpha FLOAT       Transparency 0-1 (default: 0.6)
   --tile-size FLOAT        Size multiplier (default: 1.0)
-  --dpi INT                Output resolution (default: 100)
-  --width INT              Figure width in inches (default: 20)
-  --height INT             Figure height in inches (default: 10)
+  --width INT              Output image width in pixels (default: 2000)
   --no-countries           Don't show country boundaries
 ```
 

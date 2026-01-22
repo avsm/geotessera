@@ -761,6 +761,7 @@ def create_parquet_database_from_filesystem(base_dir, output_path, console):
 
         # Group warnings by reason for better readability
         from collections import defaultdict
+
         warnings_by_reason = defaultdict(list)
         for reason, path in warnings:
             warnings_by_reason[reason].append(path)
@@ -780,7 +781,9 @@ def create_parquet_database_from_filesystem(base_dir, output_path, console):
             with open(missing_embeddings_file, "w") as f:
                 for path in sorted(missing_embeddings):
                     f.write(f"{path}\n")
-            console.print(f"\n[dim]Written {len(missing_embeddings)} paths to {missing_embeddings_file}[/dim]")
+            console.print(
+                f"\n[dim]Written {len(missing_embeddings)} paths to {missing_embeddings_file}[/dim]"
+            )
 
         # Write missing scales
         missing_scales = warnings_by_reason.get("missing scales", [])
@@ -789,7 +792,9 @@ def create_parquet_database_from_filesystem(base_dir, output_path, console):
             with open(missing_scales_file, "w") as f:
                 for path in sorted(missing_scales):
                     f.write(f"{path}\n")
-            console.print(f"[dim]Written {len(missing_scales)} paths to {missing_scales_file}[/dim]")
+            console.print(
+                f"[dim]Written {len(missing_scales)} paths to {missing_scales_file}[/dim]"
+            )
 
     return True
 
@@ -901,6 +906,7 @@ def check_command(args):
 
         # Group warnings by reason for better readability
         from collections import defaultdict
+
         warnings_by_reason = defaultdict(list)
         for reason, path in warnings:
             warnings_by_reason[reason].append(path)
@@ -920,7 +926,9 @@ def check_command(args):
             with open(missing_embeddings_file, "w") as f:
                 for path in sorted(missing_embeddings):
                     f.write(f"{path}\n")
-            console.print(f"\n[dim]Written {len(missing_embeddings)} paths to {missing_embeddings_file}[/dim]")
+            console.print(
+                f"\n[dim]Written {len(missing_embeddings)} paths to {missing_embeddings_file}[/dim]"
+            )
 
         # Write missing scales
         missing_scales = warnings_by_reason.get("missing scales", [])
@@ -929,7 +937,9 @@ def check_command(args):
             with open(missing_scales_file, "w") as f:
                 for path in sorted(missing_scales):
                     f.write(f"{path}\n")
-            console.print(f"[dim]Written {len(missing_scales)} paths to {missing_scales_file}[/dim]")
+            console.print(
+                f"[dim]Written {len(missing_scales)} paths to {missing_scales_file}[/dim]"
+            )
 
     return 0
 
