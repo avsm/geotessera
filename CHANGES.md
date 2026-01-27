@@ -1,3 +1,14 @@
+## v0.7.4 (2026-01-27)
+
+This release adds convenience options for querying single tiles.
+
+- New `--tile` option added to `download` and `coverage` commands for single-tile queries by any point within the tile (@avsm)
+- Enhanced `--bbox` option to support both single-tile and bounding box formats (@avsm)
+
+Licensing and docs clarifications as well:
+- License clarification to fix mismatch between README and LICENSE and clarify MIT license (reported @adamjstewart in torchgeo/torchgeo#3243, fix by @avsm)
+- Removed support request section due to resource limitations (@sk818)
+
 ## v0.7.3 (2025-12-17)
 
 This release contains registry tooling improvements.
