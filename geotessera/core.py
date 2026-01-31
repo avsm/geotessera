@@ -17,6 +17,7 @@ from .registry import (
     EMBEDDINGS_DIR_NAME,
     tile_to_geotiff_path,
     tile_to_zarr_path,
+    tile_from_world,
 )
 
 try:
@@ -1109,9 +1110,13 @@ class GeoTessera:
     ) -> Tuple[np.ndarray, object, object]:
         """Fetch and dequantize a single embedding tile with CRS information.
 
+        Coordinates are automatically snapped to valid tile centers. Tiles are
+        0.1×0.1 degree squares centered at 0.05-degree offsets (e.g., 0.05, 0.15).
+        For example, coordinates (-120, 36) will be snapped to (-119.95, 36.05).
+
         Args:
-            lon: Tile center longitude
-            lat: Tile center latitude
+            lon: Longitude (will be snapped to nearest tile center)
+            lat: Latitude (will be snapped to nearest tile center)
             year: Year of embeddings
             progress_callback: Optional callback for download progress
             refresh: If True, force re-download even if local files exist in embeddings_dir
@@ -1122,6 +1127,13 @@ class GeoTessera:
             - crs: CRS object from rasterio (coordinate reference system)
             - transform: Affine transform from rasterio
         """
+        # Snap coordinates to valid tile centers
+        tile_lon, tile_lat = tile_from_world(lon, lat)
+        if tile_lon != lon or tile_lat != lat:
+            self.logger.debug(
+                f"Snapped coordinates ({lon}, {lat}) to tile center ({tile_lon}, {tile_lat})"
+            )
+        lon, lat = tile_lon, tile_lat
 
         # Fetch the files using coordinates
         embedding_file = self.registry.fetch(
@@ -1164,9 +1176,12 @@ class GeoTessera:
     ) -> bool:
         """Download a single tile and save it to embeddings_dir.
 
+        Coordinates are automatically snapped to valid tile centers. Tiles are
+        0.1×0.1 degree squares centered at 0.05-degree offsets (e.g., 0.05, 0.15).
+
         Args:
-            lon: Tile center longitude
-            lat: Tile center latitude
+            lon: Longitude (will be snapped to nearest tile center)
+            lat: Latitude (will be snapped to nearest tile center)
             year: Year of embeddings
             progress_callback: Optional callback for download progress
 
@@ -1177,7 +1192,18 @@ class GeoTessera:
             >>> gt = GeoTessera(embeddings_dir="./embeddings")
             >>> gt.download_tile(lon=0.15, lat=52.05, year=2024)
             True
+            >>> # Arbitrary coordinates are snapped to tile center
+            >>> gt.download_tile(lon=-120, lat=36, year=2024)  # snaps to (-119.95, 36.05)
+            True
         """
+        # Snap coordinates to valid tile centers
+        tile_lon, tile_lat = tile_from_world(lon, lat)
+        if tile_lon != lon or tile_lat != lat:
+            self.logger.debug(
+                f"Snapped coordinates ({lon}, {lat}) to tile center ({tile_lon}, {tile_lat})"
+            )
+        lon, lat = tile_lon, tile_lat
+
         try:
             # Download files directly to embeddings_dir (using refresh=True to force download)
             # fetch() handles creating directory structure and saving to correct locations
