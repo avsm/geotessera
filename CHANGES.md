@@ -1,3 +1,13 @@
+## v0.7.5 (2026-02-15)
+
+This release reduces startup time for the library, improved coordinate clamping
+and reduces the size of coverage data for the globe viewer.
+
+- Auto-snap coordinates to valid tile centers in `fetch_embedding` and `download_tile`, so callers no longer need to compute exact 0.05-offset grid centers themselves (#166 #164 @avsm, reported by @tonyboston-au)
+- Replaced tile/landmask dictionary caches with direct pandas MultiIndex lookups on `(year, lon_i, lat_i)` and `(lon_i, lat_i)`, simplifying the registry internals (#176 @avsm, reported by @sk818 in #175)
+- Coverage JSON output split into per-year files (`coverage_YYYY.json`) to reduce payload size for the globe viewer (@avsm)
+- Globe viewer now detects land vs ocean from the coverage texture pixels instead of storing `no_coverage`/`landmasks` lists in JSON (@avsm)
+
 ## v0.7.4 (2026-01-27)
 
 This release adds convenience options for querying single tiles.
