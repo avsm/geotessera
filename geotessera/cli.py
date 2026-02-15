@@ -610,10 +610,11 @@ def coverage(
 ):
     """Generate coverage visualizations showing Tessera embedding availability.
 
-    This command generates THREE outputs in one pass:
+    This command generates multiple outputs in one pass:
     1. PNG map - Static visualization with tiles overlaid on world map
-    2. coverage.json - JSON data file with global tile coverage information
-    3. globe.html - Interactive 3D globe visualization
+    2. coverage.json + coverage_YYYY.json - Split JSON data (metadata + per-year tile lists)
+    3. coverage_texture.png - Pre-rendered coverage texture for the globe
+    4. globe.html - Interactive 3D globe visualization
 
     The PNG map supports regional filtering, year selection, and customization.
     The HTML globe shows global multi-year coverage with interactive hover tooltips.
@@ -626,11 +627,11 @@ def coverage(
     Examples:
         # Generate coverage visualizations for a region
         geotessera coverage --region-file study_area.geojson
-        # Creates: tessera_coverage.png, coverage.json, globe.html
+        # Creates: tessera_coverage.png, coverage.json, coverage_YYYY.json, globe.html
 
         # Specify output location
         geotessera coverage --country "Colombia" -o maps/colombia.png
-        # Creates: maps/colombia.png, maps/coverage.json, maps/globe.html
+        # Creates: maps/colombia.png, maps/coverage.json, maps/coverage_YYYY.json, maps/globe.html
 
         # Customize PNG visualization
         geotessera coverage --region-file area.geojson --tile-alpha 0.3 --width 3000
@@ -904,8 +905,10 @@ def coverage(
             with open(globe_html_path, "w", encoding="utf-8") as f:
                 f.write(_get_globe_html_template())
 
+            # List per-year files that were generated
+            year_files = sorted(output_dir.glob("coverage_*.json"))
             rprint(
-                f"[green]{emoji('✅ ')}Coverage data exported to: {json_path}[/green]"
+                f"[green]{emoji('✅ ')}Coverage data exported to: {json_path} + {len(year_files)} per-year files[/green]"
             )
             rprint(
                 f"[green]{emoji('✅ ')}Coverage texture exported to: {texture_path}[/green]"
@@ -2409,12 +2412,13 @@ def _get_globe_html_template() -> str:
         let overlayMaterial = null;
         let overlayMesh = null;
         let coverageData = null; // Coverage data for tooltips
+        let textureImageData = null; // Pixel data from coverage texture for land/ocean detection
         let countriesData = null; // GeoJSON with country boundaries
         let tileCountryCache = new Map(); // Cache tile -> country lookups
         let mouse = { x: 0, y: 0 };
         let raycaster = null;
 
-        // Load coverage data from JSON file (used for tooltips)
+        // Load coverage data from split JSON files (metadata + per-year tile lists)
         async function loadCoverageData(url = 'coverage.json') {
             try {
                 const response = await fetch(url);
@@ -2422,13 +2426,51 @@ def _get_globe_html_template() -> str:
                     console.warn(`Coverage data not found at ${url}`);
                     return null;
                 }
-                const data = await response.json();
-                console.log(`Loaded coverage data: ${data.metadata.total_tiles} tiles`);
-                return data;
+                const main = await response.json();
+                console.log(`Loaded coverage metadata: ${main.metadata.total_tiles} tiles, ${main.years.length} years`);
+
+                // Load per-year tile files in parallel
+                const tiles = {};
+                const yearResults = await Promise.allSettled(
+                    main.years.map(async (year) => {
+                        const yearUrl = url.replace('coverage.json', `coverage_${year}.json`);
+                        const resp = await fetch(yearUrl);
+                        if (!resp.ok) return { year, coords: [] };
+                        const coords = await resp.json();
+                        return { year, coords };
+                    })
+                );
+
+                for (const result of yearResults) {
+                    if (result.status === 'fulfilled') {
+                        const { year, coords } = result.value;
+                        for (const key of coords) {
+                            if (!tiles[key]) tiles[key] = [];
+                            tiles[key].push(year);
+                        }
+                    }
+                }
+
+                return {
+                    tiles,
+                    years: main.years,
+                    metadata: main.metadata,
+                };
             } catch (e) {
                 console.warn(`Failed to load coverage data: ${e.message}`);
                 return null;
             }
+        }
+
+        // Check if a tile coordinate is land using the coverage texture pixel data
+        function isLandFromTexture(lon, lat) {
+            if (!textureImageData) return false;
+            // Convert lon/lat to pixel coordinates (equirectangular, matching texture generation)
+            const x = Math.floor(((lon - TILE_OFFSET + 180) / 360) * 3600);
+            const y = Math.floor(((90 - (lat + TILE_OFFSET)) / 180) * 1800);
+            if (x < 0 || x >= 3600 || y < 0 || y >= 1800) return false;
+            const idx = (y * 3600 + x) * 4;
+            return textureImageData.data[idx + 3] > 0; // alpha > 0 means land
         }
 
         // Load countries GeoJSON
@@ -2567,21 +2609,12 @@ def _get_globe_html_template() -> str:
                 };
             }
 
-            // Check if it's land with no coverage
-            // Use explicit no_coverage field if available, otherwise check landmasks
-            let isLandNoCoverage = false;
-            if (coverageData.no_coverage) {
-                isLandNoCoverage = coverageData.no_coverage.includes(key);
-            } else if (coverageData.landmasks) {
-                // Fallback for old format: check if in landmask but not in tiles
-                isLandNoCoverage = coverageData.landmasks.includes(key);
-            }
-
-            if (isLandNoCoverage) {
+            // Use coverage texture to detect land vs ocean (O(1) pixel lookup)
+            if (isLandFromTexture(lon, lat)) {
                 return { tileName, type: 'no-coverage', message: 'No tiles generated yet' };
             }
 
-            // Otherwise it's ocean (not in tiles, not in landmask/no_coverage)
+            // Otherwise it's ocean (transparent pixel in texture)
             return { tileName, type: 'ocean', message: 'Ocean (outside landmask)' };
         }
 
@@ -2723,6 +2756,15 @@ def _get_globe_html_template() -> str:
                 // Create image element to load texture
                 const img = new Image();
                 img.onload = () => {
+                    // Extract pixel data for land/ocean detection in tooltips
+                    const offscreen = document.createElement('canvas');
+                    offscreen.width = img.width;
+                    offscreen.height = img.height;
+                    const ctx2d = offscreen.getContext('2d');
+                    ctx2d.drawImage(img, 0, 0);
+                    textureImageData = ctx2d.getImageData(0, 0, img.width, img.height);
+                    console.log(`Texture pixel data loaded: ${img.width}x${img.height}`);
+
                     // Access THREE from window (bundled with globe.gl)
                     const THREE = window.THREE;
 

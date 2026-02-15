@@ -183,20 +183,18 @@ class GeoTessera:
         - Which years each tile covers
         - Landmask information (whether a tile location has land)
 
+        When output_file is provided, writes a compact split format:
+        - coverage.json: metadata + years only (small)
+        - coverage_YYYY.json: array of tile coordinate strings per year
+
+        The globe.html viewer uses the coverage texture PNG for land/ocean detection
+        (no need to store no_coverage or landmasks in JSON).
+
         Args:
             output_file: Optional path to write JSON coverage data. If None, returns dict only.
 
         Returns:
-            Dictionary with coverage information:
-            {
-                'tiles': {
-                    'lon,lat': [year1, year2, ...],  # List of years with coverage
-                    ...
-                },
-                'landmasks': ['lon,lat', ...],  # Tiles with landmask data
-                'years': [2017, 2018, ...],  # All available years
-                'metadata': {...}
-            }
+            Dictionary with full coverage information (used in-memory for texture generation).
         """
         self.logger.info("Loading all registry data for global coverage analysis...")
 
@@ -204,8 +202,9 @@ class GeoTessera:
         bbox = (-180, -90, 180, 90)  # Global coverage
         available_years = self.registry.get_available_years()
 
-        # Collect all tiles across all years
+        # Collect tiles per year (for per-year files) and per location (for texture)
         tiles_by_location = {}
+        tiles_by_year = {year: [] for year in available_years}
 
         for year in available_years:
             self.logger.info(f"Loading embeddings for {year}...")
@@ -222,6 +221,7 @@ class GeoTessera:
                 if key not in tiles_by_location:
                     tiles_by_location[key] = []
                 tiles_by_location[key].append(year)
+                tiles_by_year[year].append(key)
 
         # Get landmask information
         self.logger.info("Loading landmask data...")
@@ -235,11 +235,10 @@ class GeoTessera:
         # Land tiles without coverage: in landmask but not in tiles
         no_coverage_tiles = sorted(landmask_set - tiles_with_data)
 
-        # Create coverage map
+        # Full in-memory coverage map (used for texture generation)
         coverage_map = {
             "tiles": tiles_by_location,
-            "landmasks": landmask_keys,
-            "no_coverage": no_coverage_tiles,  # Explicit list of land tiles without data
+            "no_coverage": no_coverage_tiles,
             "years": available_years,
             "metadata": {
                 "total_tiles": len(tiles_by_location),
@@ -249,11 +248,28 @@ class GeoTessera:
             },
         }
 
-        # Write to file if requested
+        # Write split files if requested
         if output_file:
+            output_path = Path(output_file)
+            output_dir = output_path.parent
+
+            # Main coverage.json: just metadata + years (compact, no indent)
+            main_data = {
+                "years": available_years,
+                "metadata": coverage_map["metadata"],
+            }
             with open(output_file, "w", encoding="utf-8") as f:
-                json.dump(coverage_map, f, indent=2)
-            self.logger.info(f"Coverage map written to {output_file}")
+                json.dump(main_data, f, separators=(",", ":"))
+            self.logger.info(f"Coverage metadata written to {output_file}")
+
+            # Per-year files: coverage_YYYY.json with tile coordinate arrays
+            for year in available_years:
+                year_file = output_dir / f"coverage_{year}.json"
+                with open(year_file, "w", encoding="utf-8") as f:
+                    json.dump(sorted(tiles_by_year[year]), f, separators=(",", ":"))
+                self.logger.info(
+                    f"  {year}: {len(tiles_by_year[year]):,} tiles -> {year_file.name}"
+                )
 
         return coverage_map
 
