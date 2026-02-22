@@ -529,7 +529,22 @@ def gather_tile_infos(
 
     zones_dict: Dict[int, List[TileInfo]] = {}
     skipped = 0
+    all_warnings: List[str] = []
     n_missing = len(tiles) - len(scan_args)
+
+    def _handle_result(result):
+        nonlocal skipped
+        if result is None:
+            skipped += 1
+            return
+        ti, warnings = _tile_info_from_scan_result(result)
+        all_warnings.extend(warnings)
+        zone = epsg_to_utm_zone(ti.epsg)
+        if zone_set is not None and zone not in zone_set:
+            skipped += 1
+            return
+        zones_dict.setdefault(zone, []).append(ti)
+        return ti, zone
 
     if console is not None:
         from rich.progress import (
@@ -557,21 +572,14 @@ def gather_tile_infos(
                     for args in scan_args
                 }
                 for future in as_completed(futures):
-                    result = future.result()
+                    ret = _handle_result(future.result())
                     progress.advance(task)
-                    if result is None:
-                        skipped += 1
-                        continue
-                    ti = _tile_info_from_scan_result(result)
-                    zone = epsg_to_utm_zone(ti.epsg)
-                    if zone_set is not None and zone not in zone_set:
-                        skipped += 1
-                        continue
-                    zones_dict.setdefault(zone, []).append(ti)
-                    progress.update(
-                        task,
-                        status=f"({ti.lon:.2f}, {ti.lat:.2f}) zone {zone}",
-                    )
+                    if ret is not None:
+                        ti, zone = ret
+                        progress.update(
+                            task,
+                            status=f"({ti.lon:.2f}, {ti.lat:.2f}) zone {zone}",
+                        )
 
             progress.update(task, status="Done")
     else:
@@ -581,16 +589,7 @@ def gather_tile_infos(
                 for args in scan_args
             }
             for future in as_completed(futures):
-                result = future.result()
-                if result is None:
-                    skipped += 1
-                    continue
-                ti = _tile_info_from_scan_result(result)
-                zone = epsg_to_utm_zone(ti.epsg)
-                if zone_set is not None and zone not in zone_set:
-                    skipped += 1
-                    continue
-                zones_dict.setdefault(zone, []).append(ti)
+                _handle_result(future.result())
 
     if console is not None:
         total_matched = sum(len(t) for t in zones_dict.values())
@@ -601,19 +600,86 @@ def gather_tile_infos(
         total_skipped = skipped + n_missing
         if total_skipped:
             console.print(f"  [dim]{total_skipped} tiles skipped (missing files or non-UTM)[/dim]")
+        if all_warnings:
+            console.print(
+                f"  [yellow]{len(all_warnings)} grid mismatch warning(s) "
+                f"(computed vs landmask):[/yellow]"
+            )
+            for w in all_warnings:
+                console.print(f"    [yellow]{w}[/yellow]")
+    else:
+        for w in all_warnings:
+            logger.warning(w)
 
     return zones_dict
 
 
+def compute_tile_grid(lon: float, lat: float, pixel_size: float = 10.0):
+    """Compute expected UTM EPSG, transform, and pixel dimensions for a tile.
+
+    Derives the UTM zone from longitude, projects the tile's WGS84 corners
+    to UTM, snaps to the pixel grid, and returns the expected grid parameters.
+    This avoids needing to open the landmask TIFF for basic metadata.
+
+    Args:
+        lon: Tile centre longitude (on 0.05-degree grid)
+        lat: Tile centre latitude (on 0.05-degree grid)
+        pixel_size: Pixel size in metres (default 10)
+
+    Returns:
+        Tuple of (epsg, transform_tuple, height, width) where
+        transform_tuple is (a, b, c, d, e, f) for an Affine transform.
+    """
+    import math
+    from pyproj import Transformer
+
+    # Compute UTM zone from longitude
+    zone = int(math.floor((lon + 180) / 6)) + 1
+    zone = max(1, min(60, zone))
+    is_south = lat < 0
+    epsg = 32700 + zone if is_south else 32600 + zone
+
+    # Tile corners in WGS84 (0.1-degree tile centred on lon, lat)
+    west = lon - 0.05
+    east = lon + 0.05
+    south = lat - 0.05
+    north = lat + 0.05
+
+    # Project corners to UTM
+    transformer = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True)
+    ul_e, ul_n = transformer.transform(west, north)  # upper-left
+    ur_e, ur_n = transformer.transform(east, north)  # upper-right
+    ll_e, ll_n = transformer.transform(west, south)  # lower-left
+    lr_e, lr_n = transformer.transform(east, south)  # lower-right
+
+    # Snap origin to pixel grid (upper-left corner)
+    origin_e = math.floor(min(ul_e, ll_e) / pixel_size) * pixel_size
+    origin_n = math.ceil(max(ul_n, ur_n) / pixel_size) * pixel_size
+
+    # Compute extent
+    max_e = math.ceil(max(ur_e, lr_e) / pixel_size) * pixel_size
+    min_n = math.floor(min(ll_n, lr_n) / pixel_size) * pixel_size
+
+    width = round((max_e - origin_e) / pixel_size)
+    height = round((origin_n - min_n) / pixel_size)
+
+    transform_tuple = (pixel_size, 0.0, origin_e, 0.0, -pixel_size, origin_n)
+    return epsg, transform_tuple, height, width
+
+
 def _scan_one_tile(args):
     """Scan a single tile's landmask for CRS info. Runs in a worker process.
+
+    Also computes the expected grid from the tile's lon/lat and warns if
+    the landmask disagrees.
 
     Args:
         args: Tuple of (year, lon, lat, emb_path, scales_path, landmask_path)
 
     Returns:
         Tuple of (year, lon, lat, epsg, transform_tuple, height, width,
-                  landmask_path, emb_path, scales_path) or None if invalid.
+                  landmask_path, emb_path, scales_path, warnings_list)
+        or None if invalid.
         The affine transform is serialised as a 6-element tuple so it can
         cross the process boundary without pickling rasterio objects.
     """
@@ -641,25 +707,60 @@ def _scan_one_tile(args):
     if abs(t.a - 10.0) > 0.01 or abs(t.e - (-10.0)) > 0.01:
         return None
 
+    # Compare with computed grid
+    warnings = []
+    try:
+        comp_epsg, comp_tf, comp_h, comp_w = compute_tile_grid(tile_lon, tile_lat)
+
+        if comp_epsg != epsg:
+            warnings.append(
+                f"({tile_lon:.2f}, {tile_lat:.2f}): "
+                f"EPSG mismatch: computed {comp_epsg}, landmask {epsg}"
+            )
+        if comp_h != height or comp_w != width:
+            warnings.append(
+                f"({tile_lon:.2f}, {tile_lat:.2f}): "
+                f"size mismatch: computed {comp_w}x{comp_h}, "
+                f"landmask {width}x{height}"
+            )
+        # Check transform origin (easting, northing)
+        if abs(comp_tf[2] - t.c) > 0.5 or abs(comp_tf[5] - t.f) > 0.5:
+            warnings.append(
+                f"({tile_lon:.2f}, {tile_lat:.2f}): "
+                f"origin mismatch: computed ({comp_tf[2]:.1f}, {comp_tf[5]:.1f}), "
+                f"landmask ({t.c:.1f}, {t.f:.1f})"
+            )
+    except Exception as e:
+        warnings.append(
+            f"({tile_lon:.2f}, {tile_lat:.2f}): "
+            f"grid computation failed: {e}"
+        )
+
     # Serialise the affine transform as a plain tuple
     return (
         tile_year, tile_lon, tile_lat, epsg,
         (t.a, t.b, t.c, t.d, t.e, t.f),
         height, width, landmask_path, emb_path, scales_path,
+        warnings,
     )
 
 
-def _tile_info_from_scan_result(result) -> TileInfo:
-    """Reconstruct a TileInfo from the serialised scan result."""
+def _tile_info_from_scan_result(result):
+    """Reconstruct a TileInfo and warnings from the serialised scan result.
+
+    Returns:
+        Tuple of (TileInfo, list_of_warning_strings)
+    """
     from rasterio.transform import Affine
 
     (
         tile_year, tile_lon, tile_lat, epsg,
         transform_tuple, height, width,
         landmask_path, emb_path, scales_path,
+        warnings,
     ) = result
 
-    return TileInfo(
+    ti = TileInfo(
         lon=tile_lon,
         lat=tile_lat,
         year=tile_year,
@@ -671,6 +772,7 @@ def _tile_info_from_scan_result(result) -> TileInfo:
         embedding_path=emb_path,
         scales_path=scales_path,
     )
+    return ti, warnings
 
 
 # =============================================================================
