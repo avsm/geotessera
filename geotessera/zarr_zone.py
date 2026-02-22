@@ -304,6 +304,7 @@ def create_zone_store(
         dtype=np.int8,
         fill_value=np.int8(0),
         compressors=zstd,
+        dimension_names=["northing", "easting", "band"],
     )
 
     # Create scales array: float32 (northing, easting)
@@ -314,6 +315,7 @@ def create_zone_store(
         dtype=np.float32,
         fill_value=np.float32("nan"),
         compressors=zstd,
+        dimension_names=["northing", "easting"],
     )
 
     # Create coordinate arrays
@@ -333,6 +335,7 @@ def create_zone_store(
         dtype=np.float64,
         fill_value=0.0,
         compressors=zstd,
+        dimension_names=["easting"],
     )
     store["easting"][:] = easting_coords
 
@@ -342,6 +345,7 @@ def create_zone_store(
         dtype=np.float64,
         fill_value=0.0,
         compressors=zstd,
+        dimension_names=["northing"],
     )
     store["northing"][:] = northing_coords
 
@@ -351,6 +355,7 @@ def create_zone_store(
         dtype=np.int32,
         fill_value=0,
         compressors=zstd,
+        dimension_names=["band"],
     )
     store["band"][:] = band_coords
 
