@@ -465,29 +465,36 @@ def gather_tile_infos(
     year: int,
     zones: Optional[List[int]] = None,
     console: Optional["rich.console.Console"] = None,
+    workers: Optional[int] = None,
 ) -> Dict[int, List[TileInfo]]:
     """Gather tile metadata from local files and group by UTM zone.
 
     Iterates all available tiles for the given year in the registry,
     checks that the corresponding files exist locally, reads CRS info
-    from each landmask, and groups tiles by UTM zone.
+    from each landmask (in parallel), and groups tiles by UTM zone.
 
     Args:
         registry: Registry instance for tile/landmask access
         year: Year of embeddings
         zones: Optional list of zone numbers to include. If None, all zones.
         console: Optional Rich Console for progress display
+        workers: Number of parallel workers for scanning landmasks.
+                 Defaults to min(cpu_count, 8). Set to 1 to disable.
 
     Returns:
         Dict mapping zone number to list of TileInfo
     """
-    import rasterio
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    import multiprocessing
     from .registry import (
         EMBEDDINGS_DIR_NAME,
         LANDMASKS_DIR_NAME,
         tile_to_embedding_paths,
         tile_to_landmask_filename,
     )
+
+    if workers is None:
+        workers = min(multiprocessing.cpu_count(), 8)
 
     # Get all tiles for this year
     tiles = [
@@ -496,14 +503,38 @@ def gather_tile_infos(
         if y == year
     ]
 
+    # Pre-compute file paths and filter to tiles that exist on disk
+    scan_args = []
+    base_emb = str(registry._embeddings_dir / EMBEDDINGS_DIR_NAME)
+    base_lm = str(registry._embeddings_dir / LANDMASKS_DIR_NAME)
+    zone_set = set(zones) if zones is not None else None
+
+    for tile_year, tile_lon, tile_lat in tiles:
+        emb_rel, scales_rel = tile_to_embedding_paths(tile_lon, tile_lat, tile_year)
+        emb_path = str(Path(base_emb) / emb_rel)
+        scales_path = str(Path(base_emb) / scales_rel)
+        landmask_path = str(
+            Path(base_lm) / tile_to_landmask_filename(tile_lon, tile_lat)
+        )
+
+        # Quick existence check before submitting to workers
+        if (
+            Path(emb_path).exists()
+            and Path(scales_path).exists()
+            and Path(landmask_path).exists()
+        ):
+            scan_args.append(
+                (tile_year, tile_lon, tile_lat, emb_path, scales_path, landmask_path)
+            )
+
     zones_dict: Dict[int, List[TileInfo]] = {}
     skipped = 0
+    n_missing = len(tiles) - len(scan_args)
 
-    # Use Rich Progress for scanning if console provided
     if console is not None:
         from rich.progress import (
             Progress, SpinnerColumn, BarColumn, TextColumn,
-            TaskProgressColumn, MofNCompleteColumn,
+            MofNCompleteColumn,
         )
 
         with Progress(
@@ -516,37 +547,50 @@ def gather_tile_infos(
             console=console,
         ) as progress:
             task = progress.add_task(
-                "Scanning tiles", total=len(tiles),
-                status=f"{len(tiles)} tiles for year {year}",
+                "Scanning tiles", total=len(scan_args),
+                status=f"{len(scan_args)} tiles, {workers} workers",
             )
 
-            for tile_year, tile_lon, tile_lat in tiles:
-                progress.update(task, advance=1, status=f"({tile_lon:.2f}, {tile_lat:.2f})")
-
-                ti = _process_tile_info(
-                    registry, tile_year, tile_lon, tile_lat,
-                    zones, EMBEDDINGS_DIR_NAME, LANDMASKS_DIR_NAME,
-                    tile_to_embedding_paths, tile_to_landmask_filename,
-                    rasterio,
-                )
-                if ti is not None:
-                    zones_dict.setdefault(epsg_to_utm_zone(ti.epsg), []).append(ti)
-                else:
-                    skipped += 1
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(_scan_one_tile, args): args
+                    for args in scan_args
+                }
+                for future in as_completed(futures):
+                    result = future.result()
+                    progress.advance(task)
+                    if result is None:
+                        skipped += 1
+                        continue
+                    ti = _tile_info_from_scan_result(result)
+                    zone = epsg_to_utm_zone(ti.epsg)
+                    if zone_set is not None and zone not in zone_set:
+                        skipped += 1
+                        continue
+                    zones_dict.setdefault(zone, []).append(ti)
+                    progress.update(
+                        task,
+                        status=f"({ti.lon:.2f}, {ti.lat:.2f}) zone {zone}",
+                    )
 
             progress.update(task, status="Done")
     else:
-        for tile_year, tile_lon, tile_lat in tiles:
-            ti = _process_tile_info(
-                registry, tile_year, tile_lon, tile_lat,
-                zones, EMBEDDINGS_DIR_NAME, LANDMASKS_DIR_NAME,
-                tile_to_embedding_paths, tile_to_landmask_filename,
-                rasterio,
-            )
-            if ti is not None:
-                zones_dict.setdefault(epsg_to_utm_zone(ti.epsg), []).append(ti)
-            else:
-                skipped += 1
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(_scan_one_tile, args): args
+                for args in scan_args
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                if result is None:
+                    skipped += 1
+                    continue
+                ti = _tile_info_from_scan_result(result)
+                zone = epsg_to_utm_zone(ti.epsg)
+                if zone_set is not None and zone not in zone_set:
+                    skipped += 1
+                    continue
+                zones_dict.setdefault(zone, []).append(ti)
 
     if console is not None:
         total_matched = sum(len(t) for t in zones_dict.values())
@@ -554,38 +598,33 @@ def gather_tile_infos(
             f"zone {z}: {len(t)}" for z, t in sorted(zones_dict.items())
         )
         console.print(f"  {total_matched} tiles in {len(zones_dict)} zone(s): {zone_summary}")
-        if skipped:
-            console.print(f"  [dim]{skipped} tiles skipped (missing files or non-UTM)[/dim]")
+        total_skipped = skipped + n_missing
+        if total_skipped:
+            console.print(f"  [dim]{total_skipped} tiles skipped (missing files or non-UTM)[/dim]")
 
     return zones_dict
 
 
-def _process_tile_info(
-    registry, tile_year, tile_lon, tile_lat,
-    zones, EMBEDDINGS_DIR_NAME, LANDMASKS_DIR_NAME,
-    tile_to_embedding_paths, tile_to_landmask_filename,
-    rasterio,
-) -> Optional[TileInfo]:
-    """Process a single tile and return TileInfo or None if skipped."""
-    emb_rel, scales_rel = tile_to_embedding_paths(tile_lon, tile_lat, tile_year)
-    emb_path = str(registry._embeddings_dir / EMBEDDINGS_DIR_NAME / emb_rel)
-    scales_path = str(registry._embeddings_dir / EMBEDDINGS_DIR_NAME / scales_rel)
-    landmask_filename = tile_to_landmask_filename(tile_lon, tile_lat)
-    landmask_path = str(registry._embeddings_dir / LANDMASKS_DIR_NAME / landmask_filename)
+def _scan_one_tile(args):
+    """Scan a single tile's landmask for CRS info. Runs in a worker process.
 
-    # Check files exist
-    if not Path(emb_path).exists():
-        return None
-    if not Path(scales_path).exists():
-        return None
-    if not Path(landmask_path).exists():
-        return None
+    Args:
+        args: Tuple of (year, lon, lat, emb_path, scales_path, landmask_path)
 
-    # Read landmask to get CRS, transform, dimensions
+    Returns:
+        Tuple of (year, lon, lat, epsg, transform_tuple, height, width,
+                  landmask_path, emb_path, scales_path) or None if invalid.
+        The affine transform is serialised as a 6-element tuple so it can
+        cross the process boundary without pickling rasterio objects.
+    """
+    import rasterio
+
+    tile_year, tile_lon, tile_lat, emb_path, scales_path, landmask_path = args
+
     try:
         with rasterio.open(landmask_path) as src:
             epsg = src.crs.to_epsg()
-            transform = src.transform
+            t = src.transform
             height = src.height
             width = src.width
     except Exception:
@@ -594,30 +633,38 @@ def _process_tile_info(
     if epsg is None:
         return None
 
-    # Extract zone
     try:
-        zone = epsg_to_utm_zone(epsg)
+        epsg_to_utm_zone(epsg)
     except ValueError:
         return None
 
-    # Filter by requested zones
-    if zones is not None and zone not in zones:
+    if abs(t.a - 10.0) > 0.01 or abs(t.e - (-10.0)) > 0.01:
         return None
 
-    # Verify grid alignment
-    if abs(transform.a - 10.0) > 0.01 or abs(transform.e - (-10.0)) > 0.01:
-        logger.warning(
-            f"Tile ({tile_lon}, {tile_lat}) has non-standard pixel size "
-            f"({transform.a}, {transform.e}), skipping"
-        )
-        return None
+    # Serialise the affine transform as a plain tuple
+    return (
+        tile_year, tile_lon, tile_lat, epsg,
+        (t.a, t.b, t.c, t.d, t.e, t.f),
+        height, width, landmask_path, emb_path, scales_path,
+    )
+
+
+def _tile_info_from_scan_result(result) -> TileInfo:
+    """Reconstruct a TileInfo from the serialised scan result."""
+    from rasterio.transform import Affine
+
+    (
+        tile_year, tile_lon, tile_lat, epsg,
+        transform_tuple, height, width,
+        landmask_path, emb_path, scales_path,
+    ) = result
 
     return TileInfo(
         lon=tile_lon,
         lat=tile_lat,
         year=tile_year,
         epsg=epsg,
-        transform=transform,
+        transform=Affine(*transform_tuple),
         height=height,
         width=width,
         landmask_path=landmask_path,
