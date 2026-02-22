@@ -2566,9 +2566,6 @@ def zarr_build_command(args):
     except Exception:
         gt_version = "unknown"
 
-    def progress_cb(msg):
-        console.print(f"  {msg}")
-
     created = build_zone_stores(
         registry=registry,
         output_dir=Path(output_dir),
@@ -2577,7 +2574,7 @@ def zarr_build_command(args):
         dry_run=args.dry_run,
         geotessera_version=gt_version,
         dataset_version=args.dataset_version,
-        progress_callback=progress_cb,
+        console=console,
     )
 
     if not args.dry_run and created:

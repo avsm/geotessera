@@ -16,7 +16,7 @@ import logging
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Callable
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -464,7 +464,7 @@ def gather_tile_infos(
     registry: "Registry",
     year: int,
     zones: Optional[List[int]] = None,
-    progress_callback: Optional[Callable[[str], None]] = None,
+    console: Optional["rich.console.Console"] = None,
 ) -> Dict[int, List[TileInfo]]:
     """Gather tile metadata from local files and group by UTM zone.
 
@@ -476,7 +476,7 @@ def gather_tile_infos(
         registry: Registry instance for tile/landmask access
         year: Year of embeddings
         zones: Optional list of zone numbers to include. If None, all zones.
-        progress_callback: Optional callback for status updates
+        console: Optional Rich Console for progress display
 
     Returns:
         Dict mapping zone number to list of TileInfo
@@ -496,92 +496,134 @@ def gather_tile_infos(
         if y == year
     ]
 
-    if progress_callback:
-        progress_callback(f"Found {len(tiles)} tiles for year {year}")
-
     zones_dict: Dict[int, List[TileInfo]] = {}
+    skipped = 0
 
-    for tile_year, tile_lon, tile_lat in tiles:
-        # Build file paths
-        emb_rel, scales_rel = tile_to_embedding_paths(tile_lon, tile_lat, tile_year)
-        emb_path = str(registry._embeddings_dir / EMBEDDINGS_DIR_NAME / emb_rel)
-        scales_path = str(registry._embeddings_dir / EMBEDDINGS_DIR_NAME / scales_rel)
-        landmask_filename = tile_to_landmask_filename(tile_lon, tile_lat)
-        landmask_path = str(registry._embeddings_dir / LANDMASKS_DIR_NAME / landmask_filename)
-
-        # Check files exist
-        if not Path(emb_path).exists():
-            logger.warning(f"Embedding not found: {emb_path}")
-            continue
-        if not Path(scales_path).exists():
-            logger.warning(f"Scales not found: {scales_path}")
-            continue
-        if not Path(landmask_path).exists():
-            logger.warning(f"Landmask not found: {landmask_path}")
-            continue
-
-        # Read landmask to get CRS, transform, dimensions
-        try:
-            with rasterio.open(landmask_path) as src:
-                epsg = src.crs.to_epsg()
-                transform = src.transform
-                height = src.height
-                width = src.width
-        except Exception as e:
-            logger.warning(
-                f"Failed to read landmask for ({tile_lon}, {tile_lat}): {e}"
-            )
-            continue
-
-        if epsg is None:
-            logger.warning(
-                f"No EPSG code for landmask ({tile_lon}, {tile_lat}), skipping"
-            )
-            continue
-
-        # Extract zone
-        try:
-            zone = epsg_to_utm_zone(epsg)
-        except ValueError:
-            logger.warning(
-                f"Non-UTM EPSG {epsg} for tile ({tile_lon}, {tile_lat}), skipping"
-            )
-            continue
-
-        # Filter by requested zones
-        if zones is not None and zone not in zones:
-            continue
-
-        # Verify grid alignment
-        if abs(transform.a - 10.0) > 0.01 or abs(transform.e - (-10.0)) > 0.01:
-            logger.warning(
-                f"Tile ({tile_lon}, {tile_lat}) has non-standard pixel size "
-                f"({transform.a}, {transform.e}), skipping"
-            )
-            continue
-
-        ti = TileInfo(
-            lon=tile_lon,
-            lat=tile_lat,
-            year=tile_year,
-            epsg=epsg,
-            transform=transform,
-            height=height,
-            width=width,
-            landmask_path=landmask_path,
-            embedding_path=emb_path,
-            scales_path=scales_path,
+    # Use Rich Progress for scanning if console provided
+    if console is not None:
+        from rich.progress import (
+            Progress, SpinnerColumn, BarColumn, TextColumn,
+            TaskProgressColumn, MofNCompleteColumn,
         )
 
-        zones_dict.setdefault(zone, []).append(ti)
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TextColumn("•"),
+            TextColumn("[dim]{task.fields[status]}", justify="left"),
+            console=console,
+        ) as progress:
+            task = progress.add_task(
+                "Scanning tiles", total=len(tiles),
+                status=f"{len(tiles)} tiles for year {year}",
+            )
 
-    if progress_callback:
+            for tile_year, tile_lon, tile_lat in tiles:
+                progress.update(task, advance=1, status=f"({tile_lon:.2f}, {tile_lat:.2f})")
+
+                ti = _process_tile_info(
+                    registry, tile_year, tile_lon, tile_lat,
+                    zones, EMBEDDINGS_DIR_NAME, LANDMASKS_DIR_NAME,
+                    tile_to_embedding_paths, tile_to_landmask_filename,
+                    rasterio,
+                )
+                if ti is not None:
+                    zones_dict.setdefault(epsg_to_utm_zone(ti.epsg), []).append(ti)
+                else:
+                    skipped += 1
+
+            progress.update(task, status="Done")
+    else:
+        for tile_year, tile_lon, tile_lat in tiles:
+            ti = _process_tile_info(
+                registry, tile_year, tile_lon, tile_lat,
+                zones, EMBEDDINGS_DIR_NAME, LANDMASKS_DIR_NAME,
+                tile_to_embedding_paths, tile_to_landmask_filename,
+                rasterio,
+            )
+            if ti is not None:
+                zones_dict.setdefault(epsg_to_utm_zone(ti.epsg), []).append(ti)
+            else:
+                skipped += 1
+
+    if console is not None:
+        total_matched = sum(len(t) for t in zones_dict.values())
         zone_summary = ", ".join(
-            f"zone {z}: {len(t)} tiles" for z, t in sorted(zones_dict.items())
+            f"zone {z}: {len(t)}" for z, t in sorted(zones_dict.items())
         )
-        progress_callback(f"Grouped into zones: {zone_summary}")
+        console.print(f"  {total_matched} tiles in {len(zones_dict)} zone(s): {zone_summary}")
+        if skipped:
+            console.print(f"  [dim]{skipped} tiles skipped (missing files or non-UTM)[/dim]")
 
     return zones_dict
+
+
+def _process_tile_info(
+    registry, tile_year, tile_lon, tile_lat,
+    zones, EMBEDDINGS_DIR_NAME, LANDMASKS_DIR_NAME,
+    tile_to_embedding_paths, tile_to_landmask_filename,
+    rasterio,
+) -> Optional[TileInfo]:
+    """Process a single tile and return TileInfo or None if skipped."""
+    emb_rel, scales_rel = tile_to_embedding_paths(tile_lon, tile_lat, tile_year)
+    emb_path = str(registry._embeddings_dir / EMBEDDINGS_DIR_NAME / emb_rel)
+    scales_path = str(registry._embeddings_dir / EMBEDDINGS_DIR_NAME / scales_rel)
+    landmask_filename = tile_to_landmask_filename(tile_lon, tile_lat)
+    landmask_path = str(registry._embeddings_dir / LANDMASKS_DIR_NAME / landmask_filename)
+
+    # Check files exist
+    if not Path(emb_path).exists():
+        return None
+    if not Path(scales_path).exists():
+        return None
+    if not Path(landmask_path).exists():
+        return None
+
+    # Read landmask to get CRS, transform, dimensions
+    try:
+        with rasterio.open(landmask_path) as src:
+            epsg = src.crs.to_epsg()
+            transform = src.transform
+            height = src.height
+            width = src.width
+    except Exception:
+        return None
+
+    if epsg is None:
+        return None
+
+    # Extract zone
+    try:
+        zone = epsg_to_utm_zone(epsg)
+    except ValueError:
+        return None
+
+    # Filter by requested zones
+    if zones is not None and zone not in zones:
+        return None
+
+    # Verify grid alignment
+    if abs(transform.a - 10.0) > 0.01 or abs(transform.e - (-10.0)) > 0.01:
+        logger.warning(
+            f"Tile ({tile_lon}, {tile_lat}) has non-standard pixel size "
+            f"({transform.a}, {transform.e}), skipping"
+        )
+        return None
+
+    return TileInfo(
+        lon=tile_lon,
+        lat=tile_lat,
+        year=tile_year,
+        epsg=epsg,
+        transform=transform,
+        height=height,
+        width=width,
+        landmask_path=landmask_path,
+        embedding_path=emb_path,
+        scales_path=scales_path,
+    )
 
 
 # =============================================================================
@@ -597,7 +639,7 @@ def build_zone_stores(
     dry_run: bool = False,
     geotessera_version: str = "unknown",
     dataset_version: str = "v1",
-    progress_callback: Optional[Callable[[str], None]] = None,
+    console: Optional["rich.console.Console"] = None,
 ) -> List[Path]:
     """Build zone-wide Zarr stores from local tile data.
 
@@ -613,7 +655,7 @@ def build_zone_stores(
         dry_run: If True, only compute zone breakdown without writing
         geotessera_version: Version string for metadata
         dataset_version: Tessera dataset version
-        progress_callback: Optional callback for status messages
+        console: Optional Rich Console for progress display
 
     Returns:
         List of paths to created Zarr stores
@@ -625,40 +667,56 @@ def build_zone_stores(
         registry,
         year,
         zones=zones,
-        progress_callback=progress_callback,
+        console=console,
     )
 
     if not zones_dict:
-        if progress_callback:
-            progress_callback("No tiles found matching criteria")
+        if console is not None:
+            console.print("  [yellow]No tiles found matching criteria[/yellow]")
         return []
 
     if dry_run:
-        for zone_num, tile_infos in sorted(zones_dict.items()):
-            if progress_callback:
-                progress_callback(
-                    f"Zone {zone_num} (EPSG:{zone_canonical_epsg(zone_num)}): "
-                    f"{len(tile_infos)} tiles"
+        if console is not None:
+            from rich.table import Table
+
+            table = Table(show_header=True)
+            table.add_column("Zone", style="cyan", justify="right")
+            table.add_column("EPSG", style="dim")
+            table.add_column("Tiles", justify="right")
+            for zone_num, tile_infos in sorted(zones_dict.items()):
+                table.add_row(
+                    str(zone_num),
+                    str(zone_canonical_epsg(zone_num)),
+                    str(len(tile_infos)),
                 )
+            console.print(table)
         return []
 
     output_dir.mkdir(parents=True, exist_ok=True)
     created_stores: List[Path] = []
 
-    for zone_num, tile_infos in sorted(zones_dict.items()):
-        if progress_callback:
-            progress_callback(
-                f"Building zone {zone_num} ({len(tile_infos)} tiles)..."
-            )
+    from rich.progress import (
+        Progress, SpinnerColumn, BarColumn, TextColumn,
+        MofNCompleteColumn, TimeElapsedColumn,
+    )
 
+    sorted_zones = sorted(zones_dict.items())
+    total_tiles = sum(len(t) for t in zones_dict.values())
+
+    for zone_idx, (zone_num, tile_infos) in enumerate(sorted_zones):
         # Compute grid
         zone_grid = compute_zone_grid(tile_infos, year)
+        store_name = _store_name(zone_grid.zone, zone_grid.year)
 
-        if progress_callback:
-            progress_callback(
-                f"  Grid: {zone_grid.width_px}x{zone_grid.height_px} pixels "
-                f"({zone_grid.width_px * zone_grid.pixel_size / 1000:.1f} x "
-                f"{zone_grid.height_px * zone_grid.pixel_size / 1000:.1f} km)"
+        if console is not None:
+            grid_w_km = zone_grid.width_px * zone_grid.pixel_size / 1000
+            grid_h_km = zone_grid.height_px * zone_grid.pixel_size / 1000
+            console.print(
+                f"  Zone {zone_num} "
+                f"[dim]EPSG:{zone_grid.canonical_epsg}[/dim] "
+                f"[dim]{zone_grid.width_px}x{zone_grid.height_px}px "
+                f"({grid_w_km:.0f}x{grid_h_km:.0f}km)[/dim] "
+                f"-> {store_name}"
             )
 
         # Create store
@@ -669,29 +727,55 @@ def build_zone_stores(
             dataset_version=dataset_version,
         )
 
-        # Write tiles
-        for i, ti in enumerate(tile_infos):
-            if progress_callback:
-                progress_callback(
-                    f"  Writing tile {i + 1}/{len(tile_infos)}: "
-                    f"({ti.lon:.2f}, {ti.lat:.2f})"
+        # Write tiles with progress bar
+        errors = 0
+        if console is not None:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                TextColumn("•"),
+                TextColumn("[dim]{task.fields[status]}", justify="left"),
+                console=console,
+            ) as progress:
+                task = progress.add_task(
+                    f"Writing zone {zone_num}",
+                    total=len(tile_infos),
+                    status="starting...",
                 )
 
-            try:
-                _write_single_tile(store, ti, zone_grid)
-            except Exception as e:
-                logger.warning(
-                    f"Failed to write tile ({ti.lon}, {ti.lat}): {e}"
-                )
-                continue
+                for ti in tile_infos:
+                    progress.update(
+                        task,
+                        status=f"({ti.lon:.2f}, {ti.lat:.2f})",
+                    )
+                    try:
+                        _write_single_tile(store, ti, zone_grid)
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to write tile ({ti.lon}, {ti.lat}): {e}"
+                        )
+                        errors += 1
+                    progress.advance(task)
 
-        store_path = output_dir / _store_name(zone_grid.zone, zone_grid.year)
+                status = "done"
+                if errors:
+                    status = f"done ({errors} errors)"
+                progress.update(task, status=status)
+        else:
+            for ti in tile_infos:
+                try:
+                    _write_single_tile(store, ti, zone_grid)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to write tile ({ti.lon}, {ti.lat}): {e}"
+                    )
+                    errors += 1
+
+        store_path = output_dir / store_name
         created_stores.append(store_path)
-
-        if progress_callback:
-            progress_callback(
-                f"  Wrote {store_path.name}"
-            )
 
     return created_stores
 
