@@ -678,11 +678,25 @@ def compute_tile_grid(lon: float, lat: float, pixel_size: float = 10.0):
     return epsg, transform_tuple, height, width
 
 
+def _lon_to_utm_zone(lon: float) -> int:
+    """Compute the UTM zone number for a longitude.
+
+    Args:
+        lon: Longitude in decimal degrees
+
+    Returns:
+        UTM zone number (1-60)
+    """
+    zone = int(math.floor((lon + 180) / 6)) + 1
+    return max(1, min(60, zone))
+
+
 def _scan_one_tile(args):
     """Scan a single tile's landmask for CRS info. Runs in a worker process.
 
     Also computes the expected grid from the tile's lon/lat and warns if
-    the landmask disagrees.
+    the landmask disagrees, and checks whether the tile straddles a UTM
+    zone boundary.
 
     Args:
         args: Tuple of (year, lon, lat, emb_path, scales_path, landmask_path)
@@ -720,6 +734,21 @@ def _scan_one_tile(args):
 
     # Compare with computed grid
     warnings = []
+
+    # Check if tile straddles a UTM zone boundary
+    west_lon = tile_lon - 0.05
+    east_lon = tile_lon + 0.05
+    west_zone = _lon_to_utm_zone(west_lon)
+    east_zone = _lon_to_utm_zone(east_lon)
+    landmask_zone = epsg_to_utm_zone(epsg)
+
+    if west_zone != east_zone:
+        warnings.append(
+            f"({tile_lon:.2f}, {tile_lat:.2f}): "
+            f"straddles zone boundary: west edge zone {west_zone}, "
+            f"east edge zone {east_zone}, landmask zone {landmask_zone}"
+        )
+
     try:
         comp_epsg, comp_tf, comp_h, comp_w = compute_tile_grid(tile_lon, tile_lat)
 
