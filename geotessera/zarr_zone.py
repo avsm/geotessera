@@ -282,7 +282,9 @@ def create_zone_store(
         zarr.Group root of the created store
     """
     import zarr
-    from zarr.codecs import BytesCodec, ZstdCodec
+    from zarr.codecs import ZstdCodec
+
+    zstd = ZstdCodec(level=3)
 
     store_path = output_dir / _store_name(zone_grid.zone, zone_grid.year)
 
@@ -301,7 +303,7 @@ def create_zone_store(
         chunks=(1024, 1024, N_BANDS),
         dtype=np.int8,
         fill_value=np.int8(0),
-        codecs=[BytesCodec(), ZstdCodec(level=3)],
+        compressors=zstd,
     )
 
     # Create scales array: float32 (northing, easting)
@@ -311,7 +313,7 @@ def create_zone_store(
         chunks=(1024, 1024),
         dtype=np.float32,
         fill_value=np.float32("nan"),
-        codecs=[BytesCodec(), ZstdCodec(level=3)],
+        compressors=zstd,
     )
 
     # Create coordinate arrays
@@ -330,7 +332,7 @@ def create_zone_store(
         shape=(zone_grid.width_px,),
         dtype=np.float64,
         fill_value=0.0,
-        codecs=[BytesCodec(), ZstdCodec(level=3)],
+        compressors=zstd,
     )
     store["easting"][:] = easting_coords
 
@@ -339,7 +341,7 @@ def create_zone_store(
         shape=(zone_grid.height_px,),
         dtype=np.float64,
         fill_value=0.0,
-        codecs=[BytesCodec(), ZstdCodec(level=3)],
+        compressors=zstd,
     )
     store["northing"][:] = northing_coords
 
@@ -348,7 +350,7 @@ def create_zone_store(
         shape=(N_BANDS,),
         dtype=np.int32,
         fill_value=0,
-        codecs=[BytesCodec(), ZstdCodec(level=3)],
+        compressors=zstd,
     )
     store["band"][:] = band_coords
 
