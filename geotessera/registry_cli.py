@@ -2523,6 +2523,73 @@ def file_check_command(args):
     return 0
 
 
+def zarr_build_command(args):
+    """Build zone-wide Zarr stores from local tile data."""
+    from .zarr_zone import build_zone_stores
+    from .registry import Registry
+
+    base_dir = args.base_dir
+    output_dir = args.output_dir or os.path.join(base_dir, "zarr")
+    year = args.year
+
+    # Parse zone filter
+    zone_list = None
+    if args.zones:
+        try:
+            zone_list = [int(z.strip()) for z in args.zones.split(",")]
+        except ValueError:
+            console.print("[red]Error: --zones must be comma-separated integers[/red]")
+            return 1
+
+    console.print(
+        f"[bold]Building zone Zarr stores[/bold]\n"
+        f"  Base dir: {base_dir}\n"
+        f"  Output: {output_dir}\n"
+        f"  Year: {year}"
+    )
+    if zone_list:
+        console.print(f"  Zones: {', '.join(str(z) for z in zone_list)}")
+    if args.dry_run:
+        console.print("  [dim](dry run)[/dim]")
+
+    # Create registry pointing at local data
+    registry = Registry(
+        version=args.dataset_version,
+        embeddings_dir=base_dir,
+        registry_dir=args.registry_dir or base_dir,
+    )
+
+    try:
+        import importlib.metadata
+
+        gt_version = importlib.metadata.version("geotessera")
+    except Exception:
+        gt_version = "unknown"
+
+    def progress_cb(msg):
+        console.print(f"  {msg}")
+
+    created = build_zone_stores(
+        registry=registry,
+        output_dir=Path(output_dir),
+        year=year,
+        zones=zone_list,
+        dry_run=args.dry_run,
+        geotessera_version=gt_version,
+        dataset_version=args.dataset_version,
+        progress_callback=progress_cb,
+    )
+
+    if not args.dry_run and created:
+        console.print(f"\n[bold green]Created {len(created)} Zarr store(s):[/bold green]")
+        for p in created:
+            console.print(f"  {p}")
+    elif not args.dry_run and not created:
+        console.print("[yellow]No stores created (no matching tiles found)[/yellow]")
+
+    return 0
+
+
 def main():
     """Main entry point for the geotessera-registry CLI tool."""
     # Configure logging with rich handler
@@ -2753,6 +2820,55 @@ Directory Structure:
         help="Output parquet file path (default: INPUT_DIR/embedding_inventory.parquet)",
     )
     file_scan_parser.set_defaults(func=file_scan_command)
+
+    # Zarr-build command
+    zarr_build_parser = subparsers.add_parser(
+        "zarr-build",
+        help="Build zone-wide Zarr stores from local tile data",
+    )
+    zarr_build_parser.add_argument(
+        "base_dir",
+        help="Base directory containing downloaded tile data "
+        "(global_0.1_degree_representation/ and global_0.1_degree_tiff_all/)",
+    )
+    zarr_build_parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Output directory for Zarr stores (default: BASE_DIR/zarr)",
+    )
+    zarr_build_parser.add_argument(
+        "--year",
+        type=int,
+        default=2024,
+        help="Year of embeddings to build (default: 2024)",
+    )
+    zarr_build_parser.add_argument(
+        "--zones",
+        type=str,
+        default=None,
+        help="Comma-separated UTM zone numbers to build (e.g., '30' or '30,31'). "
+        "Useful for testing a single zone.",
+    )
+    zarr_build_parser.add_argument(
+        "--dataset-version",
+        type=str,
+        default="v1",
+        help="Tessera dataset version (default: v1)",
+    )
+    zarr_build_parser.add_argument(
+        "--registry-dir",
+        type=str,
+        default=None,
+        help="Directory containing registry.parquet and landmasks.parquet "
+        "(default: same as base_dir)",
+    )
+    zarr_build_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show zone breakdown without building stores",
+    )
+    zarr_build_parser.set_defaults(func=zarr_build_command)
 
     # File-check command
     file_check_parser = subparsers.add_parser(

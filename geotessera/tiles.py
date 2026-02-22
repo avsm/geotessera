@@ -68,6 +68,8 @@ class Tile:
             return self._load_from_geotiff()
         elif self._format == "zarr":
             return self._load_from_zarr()
+        elif self._format == "zone_zarr":
+            return self._load_from_zone_zarr()
         else:
             raise ValueError(f"Unknown format: {self._format}")
 
@@ -232,6 +234,101 @@ class Tile:
         self.bounds = da.rio.bounds
         self.height = da.rio.height
         self.width = da.rio.width
+
+    @classmethod
+    def from_zone_zarr(
+        cls,
+        zone_store_path: Path,
+        lon: float,
+        lat: float,
+        year: int,
+    ) -> "Tile":
+        """Create a Tile by reading from a zone-wide Zarr store.
+
+        Extracts the tile-equivalent region from a zone store by looking up
+        the tile's landmask to determine its CRS, transform, and dimensions,
+        then reading the corresponding pixel region from the zone arrays.
+
+        Args:
+            zone_store_path: Path to utm{zone}_{year}.zarr directory
+            lon: Tile center longitude
+            lat: Tile center latitude
+            year: Year of embeddings
+
+        Returns:
+            Tile instance with data loaded from zone store
+        """
+        import zarr
+        import math
+
+        store = zarr.open_group(str(zone_store_path), mode="r")
+        attrs = dict(store.attrs)
+
+        transform_list = attrs["transform"]
+        pixel_size = transform_list[0]
+        origin_easting = transform_list[2]
+        origin_northing = transform_list[5]
+
+        # We need the tile's UTM coordinates to find its pixel region
+        # Read these from the landmask TIFF
+        import rasterio
+        from .registry import LANDMASKS_DIR_NAME, tile_to_landmask_filename
+
+        # Try to find landmask in the parent directory structure
+        # The zone store is in output_dir/, landmasks are elsewhere
+        # For now, the caller must ensure the tile has spatial metadata set
+        # This factory constructs a Tile that loads data from the zone store
+
+        tile = cls(lon, lat, year)
+        tile._format = "zone_zarr"
+        tile._zarr_path = Path(zone_store_path)
+
+        # Store zone metadata for lazy loading
+        tile._zone_attrs = attrs
+        tile._zone_store_path = zone_store_path
+
+        return tile
+
+    def _load_from_zone_zarr(self) -> np.ndarray:
+        """Load dequantized embedding from a zone-wide Zarr store.
+
+        Uses the tile's spatial metadata (set via landmask) to compute
+        the pixel region, then reads and dequantizes.
+        """
+        import zarr
+        import math
+        from geotessera.core import dequantize_embedding
+
+        store = zarr.open_group(str(self._zone_store_path), mode="r")
+        attrs = dict(store.attrs)
+
+        transform_list = attrs["transform"]
+        pixel_size = transform_list[0]
+        origin_easting = transform_list[2]
+        origin_northing = transform_list[5]
+
+        # Use tile spatial metadata to compute region
+        if self.transform is None:
+            raise ValueError(
+                "Tile spatial metadata not loaded. "
+                "Call _load_spatial_metadata_from_landmask() first."
+            )
+
+        tile_easting = self.transform.c
+        tile_northing = self.transform.f
+
+        col_start = round((tile_easting - origin_easting) / pixel_size)
+        row_start = round((origin_northing - tile_northing) / pixel_size)
+
+        h, w = self.height, self.width
+        embedding_int8 = np.asarray(
+            store["embeddings"][row_start : row_start + h, col_start : col_start + w, :]
+        )
+        scales = np.asarray(
+            store["scales"][row_start : row_start + h, col_start : col_start + w]
+        )
+
+        return dequantize_embedding(embedding_int8, scales)
 
     # -------------------------------------------------------------------------
     # Convenience methods
