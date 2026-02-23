@@ -2662,7 +2662,7 @@ def serve_command(args):
     if not args.no_open:
         webbrowser.open(viewer_url)
 
-    server = http.server.HTTPServer(("", port), CORSHandler)
+    server = http.server.HTTPServer(("0.0.0.0", port), CORSHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
