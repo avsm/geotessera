@@ -637,15 +637,17 @@
 
   // ─── Store loading ────────────────────────────────────────────
 
-  function getBaseUrl() {
-    return window.location.origin + window.location.pathname.replace(/[^/]*$/, '');
+  function resolveStoreUrl(name) {
+    // Use relative URL so all fetches are same-origin
+    const base = window.location.pathname.replace(/[^/]*$/, '');
+    return base + name;
   }
 
   async function doLoadStore() {
     // Prefer manual URL if filled in, otherwise use dropdown selection
     const manual = $storeUrl.value.trim().replace(/\/+$/, '');
     const selected = $storeSelect.value;
-    const url = manual || (selected ? getBaseUrl() + selected : '');
+    const url = manual || (selected ? resolveStoreUrl(selected) : '');
     if (!url) return;
 
     setStatus('Connecting...', 'text-term-cyan');
@@ -847,10 +849,10 @@
       const params = new URLSearchParams(window.location.search);
       const storeParam = params.get('store');
 
-      // Try to fetch store manifest from the server
+      // Try to fetch store manifest from the server (relative URL = same-origin)
       try {
-        const baseUrl = getBaseUrl();
-        const resp = await fetch(baseUrl + '_stores.json');
+        const base = window.location.pathname.replace(/[^/]*$/, '');
+        const resp = await fetch(base + '_stores.json');
         if (resp.ok) {
           const stores = await resp.json();
           $storeSelect.innerHTML = '';
