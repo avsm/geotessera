@@ -58,6 +58,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["geotessera*"]
 
+[tool.setuptools.package-data]
+"geotessera.viewer" = ["*.html"]
+
 [dependency-groups]
 dev = [
     "pytest>=8.4.1",

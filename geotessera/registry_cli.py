@@ -2587,6 +2587,96 @@ def zarr_build_command(args):
     return 0
 
 
+def serve_command(args):
+    """Serve Zarr stores with a browser-based embedding viewer."""
+    import http.server
+    import webbrowser
+    import importlib.resources
+    import shutil
+    import functools
+
+    zarr_dir = os.path.abspath(args.zarr_dir)
+    port = args.port
+
+    if not os.path.isdir(zarr_dir):
+        console.print(f"[red]Error: directory not found: {zarr_dir}[/red]")
+        return 1
+
+    # Find .zarr stores in the directory
+    zarr_stores = sorted(
+        p.name for p in Path(zarr_dir).iterdir()
+        if p.is_dir() and p.name.endswith(".zarr")
+    )
+
+    if zarr_stores:
+        console.print(f"[bold]Serving Zarr stores from[/bold] {zarr_dir}")
+        for name in zarr_stores:
+            console.print(f"  [cyan]{name}[/cyan]")
+    else:
+        console.print(
+            f"[yellow]Warning: no .zarr directories found in {zarr_dir}[/yellow]\n"
+            f"  Serving anyway - you can point the viewer at any URL."
+        )
+
+    # Copy viewer HTML into the serving directory so it's accessible
+    viewer_html = importlib.resources.files("geotessera.viewer").joinpath("index.html")
+    viewer_dest = Path(zarr_dir) / "_viewer.html"
+    with importlib.resources.as_file(viewer_html) as src_path:
+        shutil.copy2(src_path, viewer_dest)
+
+    class CORSHandler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, directory=zarr_dir, **kw)
+
+        def end_headers(self):
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Range")
+            self.send_header(
+                "Access-Control-Expose-Headers", "Content-Length, Content-Range"
+            )
+            super().end_headers()
+
+        def do_OPTIONS(self):
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, format, *a):
+            # Only log errors and chunk fetches, not every request
+            msg = format % a
+            if " 404 " in msg or " 500 " in msg:
+                console.print(f"  [red]{msg}[/red]")
+            elif "/c/" in msg:
+                # Chunk fetch - show in dim
+                pass  # suppress chunk-level noise
+
+    # Build viewer URL
+    store_param = ""
+    if zarr_stores:
+        store_param = f"?store=http://localhost:{port}/{zarr_stores[0]}"
+    viewer_url = f"http://localhost:{port}/_viewer.html{store_param}"
+
+    console.print(f"\n[bold green]Viewer:[/bold green] {viewer_url}")
+    console.print(f"[dim]Press Ctrl+C to stop[/dim]\n")
+
+    if not args.no_open:
+        webbrowser.open(viewer_url)
+
+    server = http.server.HTTPServer(("", port), CORSHandler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        console.print("\n[dim]Stopped.[/dim]")
+    finally:
+        # Clean up the copied viewer file
+        try:
+            viewer_dest.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    return 0
+
+
 def main():
     """Main entry point for the geotessera-registry CLI tool."""
     # Configure logging with rich handler
@@ -2691,6 +2781,15 @@ Examples:
   # - Display duplicates with their year, source files, full paths, directories, and modification times
   # - Show summary statistics by parquet file
   # - Useful for identifying duplicate embeddings across generation machines
+
+  # Serve Zarr stores with interactive browser viewer
+  geotessera-registry serve /path/to/zarr/
+
+  # This will:
+  # - Start a local HTTP server with CORS headers
+  # - Open a browser with the false-colour embedding viewer
+  # - Auto-detect .zarr stores in the directory
+  # - Use a different port: geotessera-registry serve /path/to/zarr -p 9000
 
 This tool is intended for GeoTessera data maintainers to generate the registry
 files that are distributed with the package. End users typically don't need
@@ -2866,6 +2965,29 @@ Directory Structure:
         help="Show zone breakdown without building stores",
     )
     zarr_build_parser.set_defaults(func=zarr_build_command)
+
+    # Serve command
+    serve_parser = subparsers.add_parser(
+        "serve",
+        help="Serve Zarr stores with a browser-based false-colour embedding viewer",
+    )
+    serve_parser.add_argument(
+        "zarr_dir",
+        help="Directory containing .zarr stores (e.g., the zarr/ output from zarr-build)",
+    )
+    serve_parser.add_argument(
+        "--port",
+        "-p",
+        type=int,
+        default=8000,
+        help="Port number (default: 8000)",
+    )
+    serve_parser.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Don't automatically open the browser",
+    )
+    serve_parser.set_defaults(func=serve_command)
 
     # File-check command
     file_check_parser = subparsers.add_parser(
