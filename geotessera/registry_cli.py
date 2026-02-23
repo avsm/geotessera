@@ -2630,6 +2630,34 @@ def serve_command(args):
     stores_manifest = Path(zarr_dir) / "_stores.json"
     stores_manifest.write_text(json.dumps(zarr_stores))
 
+    # Generate chunk manifests so the viewer knows which chunks exist
+    # (avoids 404s for sparse stores where not all grid positions have data)
+    for store_name in zarr_stores:
+        store_path = Path(zarr_dir) / store_name
+        emb_chunks_dir = store_path / "embeddings" / "c"
+        if not emb_chunks_dir.is_dir():
+            continue
+        chunks = []
+        for row_dir in sorted(emb_chunks_dir.iterdir()):
+            if not row_dir.is_dir():
+                continue
+            try:
+                row = int(row_dir.name)
+            except ValueError:
+                continue
+            for col_dir in sorted(row_dir.iterdir()):
+                if not col_dir.is_dir():
+                    continue
+                try:
+                    col = int(col_dir.name)
+                except ValueError:
+                    continue
+                if (col_dir / "0").exists():
+                    chunks.append([row, col])
+        manifest_path = store_path / "_chunk_manifest.json"
+        manifest_path.write_text(json.dumps({"chunks": chunks}))
+        console.print(f"  [dim]{store_name}: {len(chunks)} chunks indexed[/dim]")
+
     class CORSHandler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *a, **kw):
             super().__init__(*a, directory=zarr_dir, **kw)
@@ -2648,13 +2676,11 @@ def serve_command(args):
             self.end_headers()
 
         def log_message(self, format, *a):
-            # Only log errors and chunk fetches, not every request
             msg = format % a
             if " 404 " in msg or " 500 " in msg:
                 console.print(f"  [red]{msg}[/red]")
-            elif "/c/" in msg:
-                # Chunk fetch - show in dim
-                pass  # suppress chunk-level noise
+            else:
+                console.print(f"  [dim]{msg}[/dim]")
 
     viewer_url = f"http://localhost:{port}/_viewer.html"
 
