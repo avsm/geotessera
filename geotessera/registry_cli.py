@@ -2539,9 +2539,29 @@ def zarr_build_command(args):
             console.print(f"[red]Error: directory not found: {zarr_dir}[/red]")
             return 1
 
+        # Parse zone filter for --rgb-only mode too
+        zone_filter = None
+        if args.zones:
+            try:
+                zone_filter = {int(z.strip()) for z in args.zones.split(",")}
+            except ValueError:
+                console.print("[red]Error: --zones must be comma-separated integers[/red]")
+                return 1
+
+        def _store_matches(p):
+            """Check if a .zarr store name matches the zone filter."""
+            if zone_filter is None:
+                return True
+            # Store names are like utm30_2025.zarr
+            try:
+                zone_num = int(p.name.split("_")[0].replace("utm", ""))
+                return zone_num in zone_filter
+            except (ValueError, IndexError):
+                return True  # include unrecognised names
+
         zarr_stores = sorted(
             p for p in zarr_dir.iterdir()
-            if p.is_dir() and p.name.endswith(".zarr")
+            if p.is_dir() and p.name.endswith(".zarr") and _store_matches(p)
         )
 
         if not zarr_stores:
@@ -2553,6 +2573,8 @@ def zarr_build_command(args):
             f"  Directory: {zarr_dir}\n"
             f"  Stores: {len(zarr_stores)}"
         )
+        if zone_filter:
+            console.print(f"  Zones: {', '.join(str(z) for z in sorted(zone_filter))}")
 
         for store_path in zarr_stores:
             console.print(f"\n  [cyan]{store_path.name}[/cyan]")
