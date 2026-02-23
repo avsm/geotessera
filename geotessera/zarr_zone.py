@@ -14,6 +14,7 @@ NaN in scales indicates no-data (water or no coverage).
 
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -718,41 +719,104 @@ def gather_tile_infos(
     if workers is None:
         workers = min(multiprocessing.cpu_count(), 8)
 
-    # Get all tiles for this year
-    tiles = [
-        (y, lon, lat)
-        for y, lon, lat in registry.get_available_embeddings()
-        if y == year
-    ]
+    # Get tiles for this year directly from MultiIndex (avoids iterating all years)
+    gdf = registry._registry_gdf
+    try:
+        year_slice = gdf.loc[year]  # selects all (lon_i, lat_i) for this year
+        tiles = [
+            (year, lon_i / 100.0, lat_i / 100.0)
+            for lon_i, lat_i in year_slice.index.unique()
+        ]
+    except KeyError:
+        tiles = []
+
+    if console is not None:
+        console.print(f"  Found {len(tiles):,} tiles for year {year}")
+
+    zone_set = set(zones) if zones is not None else None
+
+    # Pre-filter by UTM zone (zone is deterministic from longitude)
+    if zone_set is not None:
+        before = len(tiles)
+        tiles = [
+            (y, lon, lat) for y, lon, lat in tiles
+            if int(math.floor((lon + 180.0) / 6.0)) + 1 in zone_set
+        ]
+        if console is not None:
+            console.print(
+                f"  Filtered to {len(tiles):,} tiles in zone(s) "
+                f"{','.join(str(z) for z in sorted(zone_set))} "
+                f"(skipped {before - len(tiles):,})"
+            )
 
     # Pre-compute file paths and filter to tiles that exist on disk
     scan_args = []
     base_emb = str(registry._embeddings_dir / EMBEDDINGS_DIR_NAME)
     base_lm = str(registry._embeddings_dir / LANDMASKS_DIR_NAME)
-    zone_set = set(zones) if zones is not None else None
+    n_missing = 0
 
-    for tile_year, tile_lon, tile_lat in tiles:
-        emb_rel, scales_rel = tile_to_embedding_paths(tile_lon, tile_lat, tile_year)
-        emb_path = str(Path(base_emb) / emb_rel)
-        scales_path = str(Path(base_emb) / scales_rel)
-        landmask_path = str(
-            Path(base_lm) / tile_to_landmask_filename(tile_lon, tile_lat)
+    if console is not None:
+        from rich.progress import (
+            Progress, SpinnerColumn, BarColumn, TextColumn,
+            MofNCompleteColumn,
         )
-
-        # Quick existence check before submitting to workers
-        if (
-            Path(emb_path).exists()
-            and Path(scales_path).exists()
-            and Path(landmask_path).exists()
-        ):
-            scan_args.append(
-                (tile_year, tile_lon, tile_lat, emb_path, scales_path, landmask_path)
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            console=console,
+            transient=True,
+        ) as progress:
+            task = progress.add_task("Checking files", total=len(tiles))
+            for tile_year, tile_lon, tile_lat in tiles:
+                emb_rel, scales_rel = tile_to_embedding_paths(
+                    tile_lon, tile_lat, tile_year
+                )
+                emb_path = os.path.join(base_emb, emb_rel)
+                scales_path = os.path.join(base_emb, scales_rel)
+                landmask_path = os.path.join(
+                    base_lm, tile_to_landmask_filename(tile_lon, tile_lat)
+                )
+                if (
+                    os.path.exists(emb_path)
+                    and os.path.exists(scales_path)
+                    and os.path.exists(landmask_path)
+                ):
+                    scan_args.append(
+                        (tile_year, tile_lon, tile_lat, emb_path, scales_path, landmask_path)
+                    )
+                else:
+                    n_missing += 1
+                progress.advance(task)
+        console.print(
+            f"  {len(scan_args):,} tiles with files on disk"
+            + (f" ({n_missing:,} missing)" if n_missing else "")
+        )
+    else:
+        for tile_year, tile_lon, tile_lat in tiles:
+            emb_rel, scales_rel = tile_to_embedding_paths(
+                tile_lon, tile_lat, tile_year
             )
+            emb_path = os.path.join(base_emb, emb_rel)
+            scales_path = os.path.join(base_emb, scales_rel)
+            landmask_path = os.path.join(
+                base_lm, tile_to_landmask_filename(tile_lon, tile_lat)
+            )
+            if (
+                os.path.exists(emb_path)
+                and os.path.exists(scales_path)
+                and os.path.exists(landmask_path)
+            ):
+                scan_args.append(
+                    (tile_year, tile_lon, tile_lat, emb_path, scales_path, landmask_path)
+                )
+            else:
+                n_missing += 1
 
     zones_dict: Dict[int, List[TileInfo]] = {}
     skipped = 0
     all_warnings: List[str] = []
-    n_missing = len(tiles) - len(scan_args)
 
     def _handle_result(result):
         nonlocal skipped
@@ -1087,6 +1151,7 @@ def build_zone_stores(
         year,
         zones=zones,
         console=console,
+        workers=workers,
     )
 
     if not zones_dict:
