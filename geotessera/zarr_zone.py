@@ -65,80 +65,146 @@ class ZoneGrid:
     tiles: List[TileInfo] = field(default_factory=list)
 
 
-@dataclass
-class BandStats:
-    """Reservoir-sampled accumulator for per-band min/max of RGB preview bands.
+def _sample_chunk_stats(
+    emb_arr,
+    scales_arr,
+    ci: int,
+    cj: int,
+    chunk_h: int,
+    chunk_w: int,
+    emb_shape: tuple,
+    max_per_chunk: int = 10_000,
+) -> Optional[np.ndarray]:
+    """Read one chunk and return a subsample of dequantised RGB values.
 
-    Collects dequantised values (int8 * scale) for bands 0, 1, 2 using
-    reservoir sampling, then computes percentile stretch for consistent
-    visualisation across an entire zone store.
+    Runs in a thread — zarr I/O releases the GIL.
+
+    Returns:
+        (N, 3) float32 array of dequantised samples, or None if chunk empty.
     """
+    r0 = ci * chunk_h
+    r1 = min(r0 + chunk_h, emb_shape[0])
+    c0 = cj * chunk_w
+    c1 = min(c0 + chunk_w, emb_shape[1])
 
-    max_samples: int = 2_000_000
-    _samples: List = field(default_factory=lambda: [[], [], []])
-    _count: int = 0
+    scales_chunk = np.asarray(scales_arr[r0:r1, c0:c1])
+    valid = ~np.isnan(scales_chunk) & (scales_chunk != 0)
+    if not np.any(valid):
+        return None
 
-    def accumulate_tile(
-        self, embedding_int8: np.ndarray, scales: np.ndarray
-    ) -> None:
-        """Add dequantised band 0/1/2 values from one tile.
+    # Only read the 3 RGB bands (not all 128)
+    emb_chunk = np.asarray(
+        emb_arr[r0:r1, c0:c1, RGB_PREVIEW_BANDS[0] : RGB_PREVIEW_BANDS[-1] + 1]
+    )
 
-        Args:
-            embedding_int8: int8 array (H, W, 128)
-            scales: float32 array (H, W) with NaN for no-data
-        """
-        valid = ~np.isnan(scales) & (scales != 0)
-        if not np.any(valid):
-            return
+    # Dequantise: int8 * scale for each of 3 bands
+    scales_valid = scales_chunk[valid]
+    rgb_valid = emb_chunk[valid].astype(np.float32) * scales_valid[:, np.newaxis]
 
-        for i, band_idx in enumerate(RGB_PREVIEW_BANDS):
-            raw = embedding_int8[:, :, band_idx][valid].astype(np.float32)
-            vals = raw * scales[valid]
-            # Reservoir sampling: keep up to max_samples per band
-            room = self.max_samples - len(self._samples[i])
-            if room >= len(vals):
-                self._samples[i].append(vals)
-            elif room > 0:
-                self._samples[i].append(vals[:room])
-            else:
-                # Random replacement for overflow
-                rng = np.random.default_rng(self._count)
-                indices = rng.integers(0, self._count + len(vals), size=min(1000, len(vals)))
-                keep = indices[indices < self.max_samples]
-                if len(keep) > 0:
-                    combined = np.concatenate(self._samples[i])
-                    combined[keep[:len(keep)]] = vals[:len(keep)]
-                    self._samples[i] = [combined]
+    # Subsample if too many valid pixels
+    if rgb_valid.shape[0] > max_per_chunk:
+        rng = np.random.default_rng(ci * 10007 + cj)
+        idx = rng.choice(rgb_valid.shape[0], max_per_chunk, replace=False)
+        rgb_valid = rgb_valid[idx]
 
-        self._count += int(np.sum(valid))
+    return rgb_valid
 
-    def compute_stretch(
-        self, p_low: float = 2, p_high: float = 98
-    ) -> dict:
-        """Compute percentile-based stretch for each RGB band.
 
-        Args:
-            p_low: Low percentile (default 2)
-            p_high: High percentile (default 98)
+def compute_stretch_from_store(
+    store: "zarr.Group",
+    p_low: float = 2,
+    p_high: float = 98,
+    workers: int = 8,
+    console: Optional["rich.console.Console"] = None,
+) -> dict:
+    """Compute percentile stretch from an existing store using parallel reads.
 
-        Returns:
-            Dict with 'min' and 'max' lists of 3 floats each.
-        """
-        mins = []
-        maxs = []
-        for i in range(3):
-            if self._samples[i]:
-                all_vals = np.concatenate(self._samples[i])
-                lo = float(np.percentile(all_vals, p_low))
-                hi = float(np.percentile(all_vals, p_high))
-                if hi <= lo:
-                    hi = lo + 1.0
-                mins.append(lo)
-                maxs.append(hi)
-            else:
-                mins.append(0.0)
-                maxs.append(1.0)
-        return {"min": mins, "max": maxs}
+    Reads chunks in parallel via threads (zarr I/O releases the GIL),
+    collects subsampled dequantised values, then computes global percentiles.
+
+    Args:
+        store: Zarr group with embeddings and scales arrays
+        p_low: Low percentile (default 2)
+        p_high: High percentile (default 98)
+        workers: Number of threads (default 8)
+        console: Optional Rich Console for progress
+
+    Returns:
+        Dict with 'min' and 'max' lists of 3 floats each.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    emb_arr = store["embeddings"]
+    scales_arr = store["scales"]
+    emb_shape = emb_arr.shape
+    chunk_h, chunk_w = emb_arr.chunks[:2]
+    n_rows = math.ceil(emb_shape[0] / chunk_h)
+    n_cols = math.ceil(emb_shape[1] / chunk_w)
+    total_chunks = n_rows * n_cols
+
+    samples = []
+
+    if console is not None:
+        from rich.progress import (
+            Progress, SpinnerColumn, BarColumn, TextColumn,
+            MofNCompleteColumn, TimeElapsedColumn,
+        )
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task(
+                f"Computing stretch ({workers} threads)", total=total_chunks,
+            )
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(
+                        _sample_chunk_stats,
+                        emb_arr, scales_arr, ci, cj,
+                        chunk_h, chunk_w, emb_shape,
+                    ): (ci, cj)
+                    for ci in range(n_rows)
+                    for cj in range(n_cols)
+                }
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result is not None:
+                        samples.append(result)
+                    progress.advance(task)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    _sample_chunk_stats,
+                    emb_arr, scales_arr, ci, cj,
+                    chunk_h, chunk_w, emb_shape,
+                ): (ci, cj)
+                for ci in range(n_rows)
+                for cj in range(n_cols)
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                if result is not None:
+                    samples.append(result)
+
+    if not samples:
+        return {"min": [0.0, 0.0, 0.0], "max": [1.0, 1.0, 1.0]}
+
+    all_rgb = np.concatenate(samples, axis=0)  # (N, 3)
+    stretch_min = [float(np.percentile(all_rgb[:, i], p_low)) for i in range(3)]
+    stretch_max = [float(np.percentile(all_rgb[:, i], p_high)) for i in range(3)]
+
+    # Ensure non-zero range
+    for i in range(3):
+        if stretch_max[i] <= stretch_min[i]:
+            stretch_max[i] = stretch_min[i] + 1.0
+
+    return {"min": stretch_min, "max": stretch_max}
 
 
 def compute_rgb_chunk(
@@ -1049,9 +1115,6 @@ def build_zone_stores(
             include_rgb=rgb,
         )
 
-        # Create band stats accumulator if RGB is requested
-        band_stats = BandStats() if rgb else None
-
         # Write tiles with progress bar
         errors = 0
         if console is not None:
@@ -1077,7 +1140,7 @@ def build_zone_stores(
                         status=f"({ti.lon:.2f}, {ti.lat:.2f})",
                     )
                     try:
-                        _write_single_tile(store, ti, zone_grid, band_stats=band_stats)
+                        _write_single_tile(store, ti, zone_grid)
                     except Exception as e:
                         logger.warning(
                             f"Failed to write tile ({ti.lon}, {ti.lat}): {e}"
@@ -1092,16 +1155,16 @@ def build_zone_stores(
         else:
             for ti in tile_infos:
                 try:
-                    _write_single_tile(store, ti, zone_grid, band_stats=band_stats)
+                    _write_single_tile(store, ti, zone_grid)
                 except Exception as e:
                     logger.warning(
                         f"Failed to write tile ({ti.lon}, {ti.lat}): {e}"
                     )
                     errors += 1
 
-        # RGB preview pass (two-pass: stats already accumulated during tile writing)
-        if rgb and band_stats is not None:
-            stretch = band_stats.compute_stretch()
+        # RGB preview pass: compute stretch from the store, then write preview
+        if rgb:
+            stretch = compute_stretch_from_store(store, console=console)
             if console is not None:
                 console.print(
                     f"  RGB stretch: min={[f'{v:.2f}' for v in stretch['min']]}, "
@@ -1126,7 +1189,6 @@ def _write_single_tile(
     store: "zarr.Group",
     tile_info: TileInfo,
     zone_grid: ZoneGrid,
-    band_stats: Optional[BandStats] = None,
 ) -> None:
     """Read a single tile's data and write it into the zone store.
 
@@ -1134,7 +1196,6 @@ def _write_single_tile(
         store: Zarr group (root of zone store)
         tile_info: Tile metadata
         zone_grid: Zone grid specification
-        band_stats: Optional BandStats accumulator for RGB preview
     """
     # Read embedding (int8)
     embedding = np.load(tile_info.embedding_path)
@@ -1172,9 +1233,6 @@ def _write_single_tile(
         )
 
     write_tile_to_store(store, embedding, scales, row_start, col_start)
-
-    if band_stats is not None:
-        band_stats.accumulate_tile(embedding, scales)
 
 
 # =============================================================================
@@ -1282,7 +1340,7 @@ def add_rgb_to_existing_store(
     """Add RGB preview array to an existing Zarr store.
 
     Two-pass process:
-    1. Iterate all chunks, accumulate BandStats from existing embeddings+scales
+    1. Parallel chunk reads to compute percentile stretch
     2. Write RGB preview data
 
     Args:
@@ -1311,66 +1369,9 @@ def add_rgb_to_existing_store(
         )
 
     if console is not None:
-        console.print(f"  Pass 1: Computing band statistics...")
+        console.print(f"  Pass 1: Computing band statistics (parallel)...")
 
-    # Pass 1: accumulate stats
-    band_stats = BandStats()
-    emb_arr = store["embeddings"]
-    scales_arr = store["scales"]
-    emb_shape = emb_arr.shape
-    chunk_h, chunk_w = emb_arr.chunks[:2]
-    n_rows = math.ceil(emb_shape[0] / chunk_h)
-    n_cols = math.ceil(emb_shape[1] / chunk_w)
-
-    if console is not None:
-        from rich.progress import (
-            Progress, SpinnerColumn, BarColumn, TextColumn,
-            MofNCompleteColumn, TimeElapsedColumn,
-        )
-
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task(
-                "Accumulating stats",
-                total=n_rows * n_cols,
-            )
-            for ci in range(n_rows):
-                for cj in range(n_cols):
-                    r0 = ci * chunk_h
-                    r1 = min(r0 + chunk_h, emb_shape[0])
-                    c0 = cj * chunk_w
-                    c1 = min(c0 + chunk_w, emb_shape[1])
-
-                    scales_chunk = np.asarray(scales_arr[r0:r1, c0:c1])
-                    if np.all(np.isnan(scales_chunk) | (scales_chunk == 0)):
-                        progress.advance(task)
-                        continue
-
-                    emb_chunk = np.asarray(emb_arr[r0:r1, c0:c1, :])
-                    band_stats.accumulate_tile(emb_chunk, scales_chunk)
-                    progress.advance(task)
-    else:
-        for ci in range(n_rows):
-            for cj in range(n_cols):
-                r0 = ci * chunk_h
-                r1 = min(r0 + chunk_h, emb_shape[0])
-                c0 = cj * chunk_w
-                c1 = min(c0 + chunk_w, emb_shape[1])
-
-                scales_chunk = np.asarray(scales_arr[r0:r1, c0:c1])
-                if np.all(np.isnan(scales_chunk) | (scales_chunk == 0)):
-                    continue
-
-                emb_chunk = np.asarray(emb_arr[r0:r1, c0:c1, :])
-                band_stats.accumulate_tile(emb_chunk, scales_chunk)
-
-    stretch = band_stats.compute_stretch()
+    stretch = compute_stretch_from_store(store, console=console)
     if console is not None:
         console.print(f"  Stretch: min={stretch['min']}, max={stretch['max']}")
         console.print(f"  Pass 2: Writing RGB preview...")
