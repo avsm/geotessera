@@ -1542,23 +1542,79 @@ def _sample_chunk_pca_stats(
     return all_valid
 
 
+def _randomized_svd(
+    data: np.ndarray,
+    n_components: int,
+    n_oversamples: int = 10,
+    n_power_iter: int = 2,
+    rng: Optional[np.random.Generator] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Randomized SVD for low-rank approximation.
+
+    Much faster than full SVD when n_components << min(n_samples, n_features).
+    Uses the Halko-Martinsson-Tropp algorithm.
+
+    Args:
+        data: (n_samples, n_features) array (should be centred)
+        n_components: Number of components to extract
+        n_oversamples: Extra dimensions for accuracy (default 10)
+        n_power_iter: Power iterations for better accuracy (default 2)
+        rng: Random generator
+
+    Returns:
+        (U, S, Vt) truncated to n_components
+    """
+    if rng is None:
+        rng = np.random.default_rng(42)
+    n_samples, n_features = data.shape
+    k = n_components + n_oversamples
+
+    # Random projection: Omega is (n_features, k)
+    omega = rng.standard_normal((n_features, k)).astype(np.float32)
+
+    # Form Y = data @ Omega  →  (n_samples, k)
+    Y = data @ omega
+
+    # Power iterations for better approximation of top singular space
+    for _ in range(n_power_iter):
+        Y = data @ (data.T @ Y)
+
+    # QR factorisation of Y
+    Q, _ = np.linalg.qr(Y)  # Q is (n_samples, k)
+
+    # Project data into low-rank space: B = Q.T @ data  →  (k, n_features)
+    B = Q.T @ data
+
+    # SVD of the small matrix B
+    U_hat, S, Vt = np.linalg.svd(B, full_matrices=False)
+
+    # Recover U in original space
+    U = Q @ U_hat
+
+    return U[:, :n_components], S[:n_components], Vt[:n_components]
+
+
 def compute_pca_basis(
     store: "zarr.Group",
     n_components: int = 3,
     max_per_chunk: int = 5000,
+    max_total_samples: int = 200_000,
+    chunk_sample_fraction: float = 0.25,
     workers: int = 8,
     console: Optional["rich.console.Console"] = None,
 ) -> dict:
     """Compute PCA basis from an existing store using parallel reads.
 
     Two phases:
-    1. Parallel subsampled reads of all 128 bands (dequantised)
-    2. SVD on centred data to get principal components
+    1. Parallel subsampled reads from a random subset of chunks
+    2. Randomized SVD on centred data (fast for low n_components)
 
     Args:
         store: Zarr group with embeddings and scales arrays
         n_components: Number of PCA components (default 3 for RGB)
         max_per_chunk: Max pixels to sample per chunk
+        max_total_samples: Cap total samples (default 200K — ample for 128-dim PCA)
+        chunk_sample_fraction: Fraction of chunks to read (default 0.25)
         workers: Number of threads
         console: Optional Rich Console for progress
 
@@ -1576,6 +1632,21 @@ def compute_pca_basis(
     n_cols = math.ceil(emb_shape[1] / chunk_w)
     total_chunks = n_rows * n_cols
 
+    # Select a random subset of chunks to read — PCA on 128 dims
+    # converges well with ~50-100K samples, no need to read everything
+    all_chunk_indices = [(ci, cj) for ci in range(n_rows) for cj in range(n_cols)]
+    rng = np.random.default_rng(42)
+
+    n_to_sample = max(4, int(total_chunks * chunk_sample_fraction))
+    if n_to_sample < total_chunks:
+        sampled_indices = rng.choice(
+            len(all_chunk_indices), n_to_sample, replace=False,
+        )
+        chunk_indices = [all_chunk_indices[i] for i in sampled_indices]
+    else:
+        chunk_indices = all_chunk_indices
+
+    n_sampled_chunks = len(chunk_indices)
     samples = []
 
     if console is not None:
@@ -1593,7 +1664,8 @@ def compute_pca_basis(
             console=console,
         ) as progress:
             task = progress.add_task(
-                f"Sampling for PCA ({workers} threads)", total=total_chunks,
+                f"Sampling for PCA ({n_sampled_chunks}/{total_chunks} chunks, {workers} threads)",
+                total=n_sampled_chunks,
             )
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = {
@@ -1603,8 +1675,7 @@ def compute_pca_basis(
                         chunk_h, chunk_w, emb_shape,
                         max_per_chunk,
                     ): (ci, cj)
-                    for ci in range(n_rows)
-                    for cj in range(n_cols)
+                    for ci, cj in chunk_indices
                 }
                 for future in as_completed(futures):
                     result = future.result()
@@ -1620,8 +1691,7 @@ def compute_pca_basis(
                     chunk_h, chunk_w, emb_shape,
                     max_per_chunk,
                 ): (ci, cj)
-                for ci in range(n_rows)
-                for cj in range(n_cols)
+                for ci, cj in chunk_indices
             }
             for future in as_completed(futures):
                 result = future.result()
@@ -1640,23 +1710,33 @@ def compute_pca_basis(
         }
 
     all_data = np.concatenate(samples, axis=0)  # (N, 128)
+
+    # Cap total samples to keep SVD fast
+    if all_data.shape[0] > max_total_samples:
+        idx = rng.choice(all_data.shape[0], max_total_samples, replace=False)
+        all_data = all_data[idx]
+
     n_samples = all_data.shape[0]
     if console is not None:
-        console.print(f"  PCA: {n_samples} samples collected, computing SVD...")
+        console.print(
+            f"  PCA: {n_samples} samples from {n_sampled_chunks} chunks, "
+            f"computing randomized SVD..."
+        )
 
     # Centre the data
     mean = all_data.mean(axis=0)  # (128,)
     centred = all_data - mean  # (N, 128)
 
-    # SVD on centred data: centred = U @ diag(S) @ Vt
-    # Components are the first n_components rows of Vt
-    # Use full_matrices=False for efficiency
-    U, S, Vt = np.linalg.svd(centred, full_matrices=False)
-    components = Vt[:n_components].astype(np.float32)  # (3, 128)
+    # Randomized SVD — O(N * k^2) instead of O(N * d^2) for full SVD
+    # Much faster when n_components (3) << n_features (128)
+    U, S, Vt = _randomized_svd(centred, n_components, rng=rng)
+    components = Vt.astype(np.float32)  # (3, 128)
 
-    # Explained variance ratio
-    total_var = np.sum(S ** 2)
-    explained = (S[:n_components] ** 2) / total_var if total_var > 0 else np.zeros(n_components)
+    # Explained variance ratio (approximate — uses only the top k singular values)
+    # For exact ratio we'd need all singular values, but the approximation
+    # is good enough: use total variance from centred data directly
+    total_var = np.sum(centred ** 2)
+    explained = (S ** 2) / total_var if total_var > 0 else np.zeros(n_components)
     explained = explained.astype(np.float32)
 
     # Project all samples to get stretch percentiles
