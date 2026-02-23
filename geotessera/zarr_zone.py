@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
 # Number of embedding bands in Tessera
 N_BANDS = 128
 
+# Bands used for the RGB preview array (indices into the 128-band embedding)
+RGB_PREVIEW_BANDS = (0, 1, 2)
+
 
 # =============================================================================
 # Data types
@@ -60,6 +63,119 @@ class ZoneGrid:
     height_px: int
     pixel_size: float = 10.0
     tiles: List[TileInfo] = field(default_factory=list)
+
+
+@dataclass
+class BandStats:
+    """Reservoir-sampled accumulator for per-band min/max of RGB preview bands.
+
+    Collects dequantised values (int8 * scale) for bands 0, 1, 2 using
+    reservoir sampling, then computes percentile stretch for consistent
+    visualisation across an entire zone store.
+    """
+
+    max_samples: int = 2_000_000
+    _samples: List = field(default_factory=lambda: [[], [], []])
+    _count: int = 0
+
+    def accumulate_tile(
+        self, embedding_int8: np.ndarray, scales: np.ndarray
+    ) -> None:
+        """Add dequantised band 0/1/2 values from one tile.
+
+        Args:
+            embedding_int8: int8 array (H, W, 128)
+            scales: float32 array (H, W) with NaN for no-data
+        """
+        valid = ~np.isnan(scales) & (scales != 0)
+        if not np.any(valid):
+            return
+
+        for i, band_idx in enumerate(RGB_PREVIEW_BANDS):
+            raw = embedding_int8[:, :, band_idx][valid].astype(np.float32)
+            vals = raw * scales[valid]
+            # Reservoir sampling: keep up to max_samples per band
+            room = self.max_samples - len(self._samples[i])
+            if room >= len(vals):
+                self._samples[i].append(vals)
+            elif room > 0:
+                self._samples[i].append(vals[:room])
+            else:
+                # Random replacement for overflow
+                rng = np.random.default_rng(self._count)
+                indices = rng.integers(0, self._count + len(vals), size=min(1000, len(vals)))
+                keep = indices[indices < self.max_samples]
+                if len(keep) > 0:
+                    combined = np.concatenate(self._samples[i])
+                    combined[keep[:len(keep)]] = vals[:len(keep)]
+                    self._samples[i] = [combined]
+
+        self._count += int(np.sum(valid))
+
+    def compute_stretch(
+        self, p_low: float = 2, p_high: float = 98
+    ) -> dict:
+        """Compute percentile-based stretch for each RGB band.
+
+        Args:
+            p_low: Low percentile (default 2)
+            p_high: High percentile (default 98)
+
+        Returns:
+            Dict with 'min' and 'max' lists of 3 floats each.
+        """
+        mins = []
+        maxs = []
+        for i in range(3):
+            if self._samples[i]:
+                all_vals = np.concatenate(self._samples[i])
+                lo = float(np.percentile(all_vals, p_low))
+                hi = float(np.percentile(all_vals, p_high))
+                if hi <= lo:
+                    hi = lo + 1.0
+                mins.append(lo)
+                maxs.append(hi)
+            else:
+                mins.append(0.0)
+                maxs.append(1.0)
+        return {"min": mins, "max": maxs}
+
+
+def compute_rgb_chunk(
+    embedding_int8: np.ndarray,
+    scales: np.ndarray,
+    band_indices: tuple,
+    stretch_min: List[float],
+    stretch_max: List[float],
+) -> np.ndarray:
+    """Compute an RGBA uint8 preview from embedding + scales.
+
+    Args:
+        embedding_int8: int8 array (H, W, 128) or (H, W, N_BANDS)
+        scales: float32 array (H, W)
+        band_indices: Tuple of 3 band indices for R, G, B
+        stretch_min: Per-band minimum for normalisation (len 3)
+        stretch_max: Per-band maximum for normalisation (len 3)
+
+    Returns:
+        uint8 RGBA array of shape (H, W, 4)
+    """
+    h, w = scales.shape[:2]
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+
+    valid = ~np.isnan(scales) & (scales != 0)
+
+    for i, band_idx in enumerate(band_indices):
+        raw = embedding_int8[:, :, band_idx].astype(np.float32)
+        dequant = raw * scales
+        lo, hi = stretch_min[i], stretch_max[i]
+        normalised = (dequant - lo) / (hi - lo)
+        channel = np.clip(normalised * 255, 0, 255).astype(np.uint8)
+        channel[~valid] = 0
+        rgba[:, :, i] = channel
+
+    rgba[:, :, 3] = np.where(valid, 255, 0).astype(np.uint8)
+    return rgba
 
 
 # =============================================================================
@@ -269,6 +385,7 @@ def create_zone_store(
     output_dir: Path,
     geotessera_version: str = "unknown",
     dataset_version: str = "v1",
+    include_rgb: bool = False,
 ) -> "zarr.Group":
     """Create a new Zarr store for a UTM zone.
 
@@ -277,6 +394,7 @@ def create_zone_store(
         output_dir: Directory to create the store in
         geotessera_version: Version of geotessera
         dataset_version: Tessera dataset version
+        include_rgb: If True, create an additional RGB preview array
 
     Returns:
         zarr.Group root of the created store
@@ -317,6 +435,18 @@ def create_zone_store(
         compressors=zstd,
         dimension_names=["northing", "easting"],
     )
+
+    # Create RGB preview array if requested
+    if include_rgb:
+        store.create_array(
+            "rgb",
+            shape=(zone_grid.height_px, zone_grid.width_px, 4),
+            chunks=(1024, 1024, 4),
+            dtype=np.uint8,
+            fill_value=np.uint8(0),
+            compressors=zstd,
+            dimension_names=["northing", "easting", "rgba"],
+        )
 
     # Create coordinate arrays
     easting_coords = (
@@ -829,6 +959,7 @@ def build_zone_stores(
     geotessera_version: str = "unknown",
     dataset_version: str = "v1",
     console: Optional["rich.console.Console"] = None,
+    rgb: bool = True,
 ) -> List[Path]:
     """Build zone-wide Zarr stores from local tile data.
 
@@ -845,6 +976,7 @@ def build_zone_stores(
         geotessera_version: Version string for metadata
         dataset_version: Tessera dataset version
         console: Optional Rich Console for progress display
+        rgb: If True, generate RGB preview arrays (default: True)
 
     Returns:
         List of paths to created Zarr stores
@@ -914,7 +1046,11 @@ def build_zone_stores(
             output_dir,
             geotessera_version=geotessera_version,
             dataset_version=dataset_version,
+            include_rgb=rgb,
         )
+
+        # Create band stats accumulator if RGB is requested
+        band_stats = BandStats() if rgb else None
 
         # Write tiles with progress bar
         errors = 0
@@ -941,7 +1077,7 @@ def build_zone_stores(
                         status=f"({ti.lon:.2f}, {ti.lat:.2f})",
                     )
                     try:
-                        _write_single_tile(store, ti, zone_grid)
+                        _write_single_tile(store, ti, zone_grid, band_stats=band_stats)
                     except Exception as e:
                         logger.warning(
                             f"Failed to write tile ({ti.lon}, {ti.lat}): {e}"
@@ -956,12 +1092,29 @@ def build_zone_stores(
         else:
             for ti in tile_infos:
                 try:
-                    _write_single_tile(store, ti, zone_grid)
+                    _write_single_tile(store, ti, zone_grid, band_stats=band_stats)
                 except Exception as e:
                     logger.warning(
                         f"Failed to write tile ({ti.lon}, {ti.lat}): {e}"
                     )
                     errors += 1
+
+        # RGB preview pass (two-pass: stats already accumulated during tile writing)
+        if rgb and band_stats is not None:
+            stretch = band_stats.compute_stretch()
+            if console is not None:
+                console.print(
+                    f"  RGB stretch: min={[f'{v:.2f}' for v in stretch['min']]}, "
+                    f"max={[f'{v:.2f}' for v in stretch['max']]}"
+                )
+            written = write_rgb_pass(store, stretch, console=console)
+            store.attrs.update({
+                "has_rgb_preview": True,
+                "rgb_bands": list(RGB_PREVIEW_BANDS),
+                "rgb_stretch": stretch,
+            })
+            if console is not None:
+                console.print(f"  [green]RGB preview: {written} chunks written[/green]")
 
         store_path = output_dir / store_name
         created_stores.append(store_path)
@@ -973,6 +1126,7 @@ def _write_single_tile(
     store: "zarr.Group",
     tile_info: TileInfo,
     zone_grid: ZoneGrid,
+    band_stats: Optional[BandStats] = None,
 ) -> None:
     """Read a single tile's data and write it into the zone store.
 
@@ -980,6 +1134,7 @@ def _write_single_tile(
         store: Zarr group (root of zone store)
         tile_info: Tile metadata
         zone_grid: Zone grid specification
+        band_stats: Optional BandStats accumulator for RGB preview
     """
     # Read embedding (int8)
     embedding = np.load(tile_info.embedding_path)
@@ -1017,6 +1172,223 @@ def _write_single_tile(
         )
 
     write_tile_to_store(store, embedding, scales, row_start, col_start)
+
+    if band_stats is not None:
+        band_stats.accumulate_tile(embedding, scales)
+
+
+# =============================================================================
+# RGB preview pass
+# =============================================================================
+
+
+def write_rgb_pass(
+    store: "zarr.Group",
+    stretch: dict,
+    console: Optional["rich.console.Console"] = None,
+) -> int:
+    """Write RGB preview data into an existing store's rgb array.
+
+    Reads embeddings and scales chunk-by-chunk and writes computed RGBA
+    into the rgb array.
+
+    Args:
+        store: Zarr group with embeddings, scales, and rgb arrays
+        stretch: Dict with 'min' and 'max' lists (3 floats each)
+        console: Optional Rich Console for progress
+
+    Returns:
+        Number of chunks written
+    """
+    emb_arr = store["embeddings"]
+    scales_arr = store["scales"]
+    rgb_arr = store["rgb"]
+
+    emb_shape = emb_arr.shape
+    chunk_h = emb_arr.metadata.chunk_grid.configuration.chunk_shape[0]
+    chunk_w = emb_arr.metadata.chunk_grid.configuration.chunk_shape[1]
+    n_rows = math.ceil(emb_shape[0] / chunk_h)
+    n_cols = math.ceil(emb_shape[1] / chunk_w)
+
+    stretch_min = stretch["min"]
+    stretch_max = stretch["max"]
+    written = 0
+
+    if console is not None:
+        from rich.progress import (
+            Progress, SpinnerColumn, BarColumn, TextColumn,
+            MofNCompleteColumn, TimeElapsedColumn,
+        )
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task(
+                "Writing RGB preview",
+                total=n_rows * n_cols,
+            )
+
+            for ci in range(n_rows):
+                for cj in range(n_cols):
+                    r0 = ci * chunk_h
+                    r1 = min(r0 + chunk_h, emb_shape[0])
+                    c0 = cj * chunk_w
+                    c1 = min(c0 + chunk_w, emb_shape[1])
+
+                    scales_chunk = np.asarray(scales_arr[r0:r1, c0:c1])
+                    if np.all(np.isnan(scales_chunk) | (scales_chunk == 0)):
+                        progress.advance(task)
+                        continue
+
+                    emb_chunk = np.asarray(emb_arr[r0:r1, c0:c1, :])
+                    rgba = compute_rgb_chunk(
+                        emb_chunk, scales_chunk,
+                        RGB_PREVIEW_BANDS, stretch_min, stretch_max,
+                    )
+                    rgb_arr[r0:r1, c0:c1, :] = rgba
+                    written += 1
+                    progress.advance(task)
+    else:
+        for ci in range(n_rows):
+            for cj in range(n_cols):
+                r0 = ci * chunk_h
+                r1 = min(r0 + chunk_h, emb_shape[0])
+                c0 = cj * chunk_w
+                c1 = min(c0 + chunk_w, emb_shape[1])
+
+                scales_chunk = np.asarray(scales_arr[r0:r1, c0:c1])
+                if np.all(np.isnan(scales_chunk) | (scales_chunk == 0)):
+                    continue
+
+                emb_chunk = np.asarray(emb_arr[r0:r1, c0:c1, :])
+                rgba = compute_rgb_chunk(
+                    emb_chunk, scales_chunk,
+                    RGB_PREVIEW_BANDS, stretch_min, stretch_max,
+                )
+                rgb_arr[r0:r1, c0:c1, :] = rgba
+                written += 1
+
+    return written
+
+
+def add_rgb_to_existing_store(
+    store_path: Path,
+    console: Optional["rich.console.Console"] = None,
+) -> None:
+    """Add RGB preview array to an existing Zarr store.
+
+    Two-pass process:
+    1. Iterate all chunks, accumulate BandStats from existing embeddings+scales
+    2. Write RGB preview data
+
+    Args:
+        store_path: Path to existing .zarr directory
+        console: Optional Rich Console for progress
+    """
+    import zarr
+    from zarr.codecs import ZstdCodec
+
+    store = zarr.open_group(str(store_path), mode="r+")
+
+    # Create rgb array if missing
+    try:
+        _ = store["rgb"]
+    except KeyError:
+        zstd = ZstdCodec(level=3)
+        emb_shape = store["embeddings"].shape
+        store.create_array(
+            "rgb",
+            shape=(emb_shape[0], emb_shape[1], 4),
+            chunks=(1024, 1024, 4),
+            dtype=np.uint8,
+            fill_value=np.uint8(0),
+            compressors=zstd,
+            dimension_names=["northing", "easting", "rgba"],
+        )
+
+    if console is not None:
+        console.print(f"  Pass 1: Computing band statistics...")
+
+    # Pass 1: accumulate stats
+    band_stats = BandStats()
+    emb_arr = store["embeddings"]
+    scales_arr = store["scales"]
+    emb_shape = emb_arr.shape
+    chunk_h = emb_arr.metadata.chunk_grid.configuration.chunk_shape[0]
+    chunk_w = emb_arr.metadata.chunk_grid.configuration.chunk_shape[1]
+    n_rows = math.ceil(emb_shape[0] / chunk_h)
+    n_cols = math.ceil(emb_shape[1] / chunk_w)
+
+    if console is not None:
+        from rich.progress import (
+            Progress, SpinnerColumn, BarColumn, TextColumn,
+            MofNCompleteColumn, TimeElapsedColumn,
+        )
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task(
+                "Accumulating stats",
+                total=n_rows * n_cols,
+            )
+            for ci in range(n_rows):
+                for cj in range(n_cols):
+                    r0 = ci * chunk_h
+                    r1 = min(r0 + chunk_h, emb_shape[0])
+                    c0 = cj * chunk_w
+                    c1 = min(c0 + chunk_w, emb_shape[1])
+
+                    scales_chunk = np.asarray(scales_arr[r0:r1, c0:c1])
+                    if np.all(np.isnan(scales_chunk) | (scales_chunk == 0)):
+                        progress.advance(task)
+                        continue
+
+                    emb_chunk = np.asarray(emb_arr[r0:r1, c0:c1, :])
+                    band_stats.accumulate_tile(emb_chunk, scales_chunk)
+                    progress.advance(task)
+    else:
+        for ci in range(n_rows):
+            for cj in range(n_cols):
+                r0 = ci * chunk_h
+                r1 = min(r0 + chunk_h, emb_shape[0])
+                c0 = cj * chunk_w
+                c1 = min(c0 + chunk_w, emb_shape[1])
+
+                scales_chunk = np.asarray(scales_arr[r0:r1, c0:c1])
+                if np.all(np.isnan(scales_chunk) | (scales_chunk == 0)):
+                    continue
+
+                emb_chunk = np.asarray(emb_arr[r0:r1, c0:c1, :])
+                band_stats.accumulate_tile(emb_chunk, scales_chunk)
+
+    stretch = band_stats.compute_stretch()
+    if console is not None:
+        console.print(f"  Stretch: min={stretch['min']}, max={stretch['max']}")
+        console.print(f"  Pass 2: Writing RGB preview...")
+
+    # Pass 2: write RGB
+    written = write_rgb_pass(store, stretch, console=console)
+
+    # Update store attrs
+    store.attrs.update({
+        "has_rgb_preview": True,
+        "rgb_bands": list(RGB_PREVIEW_BANDS),
+        "rgb_stretch": stretch,
+    })
+
+    if console is not None:
+        console.print(f"  [green]RGB preview: {written} chunks written[/green]")
 
 
 # =============================================================================

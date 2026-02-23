@@ -216,13 +216,18 @@
   // ─── State ─────────────────────────────────────────────────────
   let map;
   let store = null;           // { url, groupMeta, embMeta, scalesMeta, utmZone, epsg, transform, shape, chunkShape, chunkManifest }
-  const chunkCache = new Map();  // "ci_cj" -> { embRaw, scalesRaw, canvas, sourceId, layerId }
+  const chunkCache = new Map();  // "ci_cj" -> { embRaw, scalesRaw, canvas, sourceId, layerId, isPreview }
   let bands = [0, 1, 2];
   let opacity = 0.80;
   let loadingChunks = 0;
   let totalLoaded = 0;
   let loadGeneration = 0;      // incremented on each viewport update to cancel stale loads
   let autoZoomNext = true;     // zoom to first successfully rendered chunk
+
+  // RGB preview state
+  let hasRgbPreview = false;    // true if current store has an rgb array
+  let rgbMeta = null;           // metadata for the rgb array
+  const clickedChunks = new Set();  // chunk keys where user has clicked for full-band data
 
   const MAX_CACHED = 50;
   const MAX_LOAD_PER_UPDATE = 80;  // cap chunks loaded per viewport change
@@ -473,6 +478,43 @@
     return canvas;
   }
 
+  // ─── RGB preview rendering ────────────────────────────────────
+
+  function renderRgbChunkToCanvas(rgbRaw, ci, cj) {
+    const { r0, r1, c0, c1 } = getChunkPixelBounds(ci, cj);
+    const h = r1 - r0;
+    const w = c1 - c0;
+
+    // RGB chunks are (chunkH, chunkW, 4) with RGBA bytes.
+    // The decompressed buffer uses full chunk dimensions (stride).
+    const strideCol = rgbMeta.chunkShape[1];
+
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    const img = ctx.createImageData(w, h);
+    const data = img.data;
+
+    let nValid = 0;
+    for (let r = 0; r < h; r++) {
+      for (let c = 0; c < w; c++) {
+        const pi = (r * w + c) * 4;           // canvas pixel (dense)
+        const si = (r * strideCol + c) * 4;   // buffer index (full chunk stride, 4 channels)
+        data[pi + 0] = rgbRaw[si + 0];  // R
+        data[pi + 1] = rgbRaw[si + 1];  // G
+        data[pi + 2] = rgbRaw[si + 2];  // B
+        data[pi + 3] = rgbRaw[si + 3];  // A
+        if (rgbRaw[si + 3] > 0) nValid++;
+      }
+    }
+
+    if (nValid === 0) return null;
+
+    ctx.putImageData(img, 0, 0);
+    return canvas;
+  }
+
   // ─── Map integration ──────────────────────────────────────────
 
   function chunkKey(ci, cj) { return `${ci}_${cj}`; }
@@ -718,6 +760,91 @@
     }
   }
 
+  // ─── RGB preview chunk loading ─────────────────────────────────
+
+  async function loadPreviewChunk(ci, cj) {
+    const key = chunkKey(ci, cj);
+    if (chunkCache.has(key)) return;  // already loaded (preview or full)
+
+    loadingChunks++;
+    showChunkLoading(`Preview (${ci}, ${cj})...`);
+
+    try {
+      const rgbRaw = await fetchChunk(store.url, 'rgb', [ci, cj, 0]);
+      if (!rgbRaw) {
+        chunkCache.set(key, { embRaw: null, scalesRaw: null, canvas: null, sourceId: null, layerId: null, isPreview: true });
+        return;
+      }
+
+      const canvas = renderRgbChunkToCanvas(rgbRaw, ci, cj);
+      let sourceId = null, layerId = null;
+      if (canvas) {
+        ({ sourceId, layerId } = addChunkToMap(ci, cj, canvas));
+        console.log(`[rgb] chunk (${ci},${cj}) → ${canvas.width}x${canvas.height}px preview`);
+
+        if (autoZoomNext) {
+          autoZoomNext = false;
+          const corners = getChunkLngLatCorners(ci, cj);
+          const lngs = corners.map(c => c[0]);
+          const lats = corners.map(c => c[1]);
+          map.fitBounds([
+            [Math.min(...lngs), Math.min(...lats)],
+            [Math.max(...lngs), Math.max(...lats)],
+          ], { padding: 40, duration: 1000 });
+        }
+      }
+
+      chunkCache.set(key, { embRaw: null, scalesRaw: null, canvas, sourceId, layerId, isPreview: true });
+      totalLoaded++;
+      updateInfoPanel();
+    } catch (err) {
+      console.warn(`Failed to load preview chunk (${ci},${cj}):`, err);
+      chunkCache.set(key, { embRaw: null, scalesRaw: null, canvas: null, sourceId: null, layerId: null, isPreview: true });
+    } finally {
+      loadingChunks--;
+      if (loadingChunks <= 0) hideChunkLoading();
+    }
+  }
+
+  async function loadFullChunk(ci, cj) {
+    const key = chunkKey(ci, cj);
+    const existing = chunkCache.get(key);
+    if (existing?.embRaw) return;  // already have full data
+
+    loadingChunks++;
+    showChunkLoading(`Full bands (${ci}, ${cj})...`);
+
+    try {
+      const [embRaw, scalesRaw] = await Promise.all([
+        fetchChunk(store.url, 'embeddings', [ci, cj, 0]),
+        fetchChunk(store.url, 'scales', [ci, cj]),
+      ]);
+
+      if (!embRaw || !scalesRaw) return;
+
+      // Remove old preview from map
+      if (existing?.sourceId) removeChunkFromMap(key);
+
+      const canvas = renderChunkToCanvas(embRaw, scalesRaw, ci, cj);
+      let sourceId = null, layerId = null;
+      if (canvas) {
+        ({ sourceId, layerId } = addChunkToMap(ci, cj, canvas));
+        console.log(`[full] chunk (${ci},${cj}) → ${canvas.width}x${canvas.height}px custom bands`);
+      }
+
+      chunkCache.set(key, { embRaw, scalesRaw, canvas, sourceId, layerId, isPreview: false });
+      clickedChunks.add(key);
+      // Enable band sliders once we have full data to re-render
+      $bandPanel.classList.remove('opacity-40', 'pointer-events-none');
+      updateInfoPanel();
+    } catch (err) {
+      console.warn(`Failed to load full chunk (${ci},${cj}):`, err);
+    } finally {
+      loadingChunks--;
+      if (loadingChunks <= 0) hideChunkLoading();
+    }
+  }
+
   // ─── View update ──────────────────────────────────────────────
 
   async function updateVisibleChunks() {
@@ -736,18 +863,18 @@
       }
     }
 
-    // Load new visible chunks (parallel, up to 3 at a time)
+    // Load new visible chunks (parallel, up to 4 at a time)
     const toLoad = [];
     for (const [ci, cj] of visible) {
       const key = chunkKey(ci, cj);
       const entry = chunkCache.get(key);
 
-      if (entry?.embRaw && entry.canvas && !entry.sourceId) {
-        // Already in cache, just re-add to map
+      if (entry?.canvas && !entry.sourceId) {
+        // Already in cache (preview or full), just re-add to map
         const ids = addChunkToMap(ci, cj, entry.canvas);
         entry.sourceId = ids.sourceId;
         entry.layerId = ids.layerId;
-      } else if (!entry || (!entry.embRaw && entry.embRaw !== null)) {
+      } else if (!entry) {
         toLoad.push([ci, cj]);
       }
     }
@@ -773,8 +900,9 @@
     }
 
     // Load chunks with concurrency limit, aborting if viewport changes
+    // Route to preview or full depending on RGB availability
     if (toLoad.length > 0) {
-      console.log(`[fetch] loading ${toLoad.length} chunks: ${toLoad.slice(0, 20).map(([ci,cj]) => `(${ci},${cj})`).join(' ')}${toLoad.length > 20 ? ' ...' : ''}`);
+      console.log(`[fetch] loading ${toLoad.length} chunks (${hasRgbPreview ? 'rgb preview' : 'full'}): ${toLoad.slice(0, 20).map(([ci,cj]) => `(${ci},${cj})`).join(' ')}${toLoad.length > 20 ? ' ...' : ''}`);
     }
     const CONCURRENCY = 4;
     for (let i = 0; i < toLoad.length; i += CONCURRENCY) {
@@ -783,7 +911,12 @@
         break;
       }
       const batch = toLoad.slice(i, i + CONCURRENCY);
-      await Promise.all(batch.map(([ci, cj]) => loadChunk(ci, cj)));
+      await Promise.all(batch.map(([ci, cj]) => {
+        if (hasRgbPreview && !clickedChunks.has(chunkKey(ci, cj))) {
+          return loadPreviewChunk(ci, cj);
+        }
+        return loadChunk(ci, cj);
+      }));
     }
 
     // Evict oldest cache entries if over limit, but not visible ones
@@ -802,7 +935,7 @@
 
   function reRenderAllChunks() {
     for (const [key, entry] of chunkCache) {
-      if (!entry.embRaw) continue;
+      if (!entry.embRaw) continue;  // skip preview-only chunks
       const [ci, cj] = key.split('_').map(Number);
       const wasOnMap = !!entry.sourceId;
       if (wasOnMap) removeChunkFromMap(key);
@@ -852,6 +985,9 @@
       totalLoaded = 0;
       autoZoomNext = true;
       store = null;
+      hasRgbPreview = false;
+      rgbMeta = null;
+      clickedChunks.clear();
 
       // Read metadata
       setStatus('Reading metadata...', 'text-term-cyan');
@@ -867,6 +1003,16 @@
         throw new Error('Missing required store metadata (utm_zone, transform, shape)');
       }
 
+      // Try to detect RGB preview array
+      try {
+        rgbMeta = await readArrayMeta(url, 'rgb');
+        hasRgbPreview = true;
+        setStatus('RGB preview detected', 'text-term-cyan');
+      } catch {
+        hasRgbPreview = false;
+        rgbMeta = null;
+      }
+
       // Load chunk manifest (generated by serve command) to avoid 404s on sparse stores
       let chunkManifest = null;
       try {
@@ -874,6 +1020,13 @@
         if (manifestData?.chunks) {
           chunkManifest = new Set(manifestData.chunks.map(([ci, cj]) => `${ci}_${cj}`));
           setStatus(`Manifest: ${chunkManifest.size} chunks`, 'text-term-cyan');
+        }
+        // Also check manifest for has_rgb
+        if (manifestData?.has_rgb !== undefined) {
+          hasRgbPreview = manifestData.has_rgb;
+          if (hasRgbPreview && !rgbMeta) {
+            try { rgbMeta = await readArrayMeta(url, 'rgb'); } catch { hasRgbPreview = false; }
+          }
         }
       } catch {
         // No manifest available - will request all grid positions
@@ -899,7 +1052,12 @@
       updateInfoPanel();
 
       // Enable controls
-      $bandPanel.classList.remove('opacity-40', 'pointer-events-none');
+      if (hasRgbPreview) {
+        // Band panel stays dimmed until user clicks a tile for full data
+        $bandPanel.classList.add('opacity-40', 'pointer-events-none');
+      } else {
+        $bandPanel.classList.remove('opacity-40', 'pointer-events-none');
+      }
       $opacityPanel.classList.remove('opacity-40', 'pointer-events-none');
       $overlayPanel.classList.remove('opacity-40', 'pointer-events-none');
 
@@ -928,7 +1086,8 @@
         [Math.max(...lngs), Math.max(...lats)],
       ], { padding: 40, duration: 1500 });
 
-      setStatus(`Loaded: zone ${utmZone}`, 'text-term-green');
+      const rgbLabel = hasRgbPreview ? ' +rgb' : '';
+      setStatus(`Loaded: zone ${utmZone}${rgbLabel}`, 'text-term-green');
 
       // Start loading visible chunks after fly animation
       setTimeout(() => updateVisibleChunks(), 1800);
@@ -963,8 +1122,14 @@
     const nChunksRow = Math.ceil(store.shape[0] / store.chunkShape[0]);
     const nChunksCol = Math.ceil(store.shape[1] / store.chunkShape[1]);
     const total = nChunksRow * nChunksCol;
-    $infoChunks.textContent = `${totalLoaded} / ${total}`;
-    $infoStatus.textContent = loadingChunks > 0 ? `loading ${loadingChunks}...` : 'idle';
+    if (hasRgbPreview) {
+      $infoChunks.textContent = `${totalLoaded} / ${total} (${clickedChunks.size} inspected)`;
+    } else {
+      $infoChunks.textContent = `${totalLoaded} / ${total}`;
+    }
+    let statusText = loadingChunks > 0 ? `loading ${loadingChunks}...` : 'idle';
+    if (hasRgbPreview && loadingChunks === 0) statusText = 'rgb preview — click to inspect';
+    $infoStatus.textContent = statusText;
   }
 
   // ─── Event setup ──────────────────────────────────────────────
@@ -1066,6 +1231,33 @@
     map.on('moveend', () => {
       clearTimeout(moveDebounce);
       moveDebounce = setTimeout(() => updateVisibleChunks(), 300);
+    });
+
+    // Click to inspect: load full 128-band data for a chunk
+    map.on('click', (e) => {
+      if (!store || !hasRgbPreview || !projForward) return;
+      try {
+        const [easting, northing] = projForward(e.lngLat.lng, e.lngLat.lat);
+        const t = store.transform;
+        const px = t[0];
+        const originE = t[2];
+        const originN = t[5];
+        const cs = store.chunkShape;
+
+        const col = Math.floor((easting - originE) / px);
+        const row = Math.floor((originN - northing) / px);
+        if (col < 0 || row < 0 || col >= store.shape[1] || row >= store.shape[0]) return;
+
+        const ci = Math.floor(row / cs[0]);
+        const cj = Math.floor(col / cs[1]);
+        const key = chunkKey(ci, cj);
+
+        if (clickedChunks.has(key)) return;
+        if (store.chunkManifest && !store.chunkManifest.has(key)) return;
+
+        console.log(`[click] inspect chunk (${ci},${cj})`);
+        loadFullChunk(ci, cj);
+      } catch { /* outside projection bounds */ }
     });
 
     // Discover available stores and handle URL params

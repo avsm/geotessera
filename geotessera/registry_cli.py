@@ -2525,12 +2525,41 @@ def file_check_command(args):
 
 def zarr_build_command(args):
     """Build zone-wide Zarr stores from local tile data."""
-    from .zarr_zone import build_zone_stores
+    from .zarr_zone import build_zone_stores, add_rgb_to_existing_store
     from .registry import Registry
 
     base_dir = args.base_dir
     output_dir = args.output_dir or os.path.join(base_dir, "zarr")
     year = args.year
+
+    # Handle --rgb-only mode: add RGB to existing stores
+    if args.rgb_only:
+        zarr_dir = Path(output_dir)
+        if not zarr_dir.is_dir():
+            console.print(f"[red]Error: directory not found: {zarr_dir}[/red]")
+            return 1
+
+        zarr_stores = sorted(
+            p for p in zarr_dir.iterdir()
+            if p.is_dir() and p.name.endswith(".zarr")
+        )
+
+        if not zarr_stores:
+            console.print(f"[yellow]No .zarr stores found in {zarr_dir}[/yellow]")
+            return 1
+
+        console.print(
+            f"[bold]Adding RGB preview to existing stores[/bold]\n"
+            f"  Directory: {zarr_dir}\n"
+            f"  Stores: {len(zarr_stores)}"
+        )
+
+        for store_path in zarr_stores:
+            console.print(f"\n  [cyan]{store_path.name}[/cyan]")
+            add_rgb_to_existing_store(store_path, console=console)
+
+        console.print(f"\n[bold green]RGB preview added to {len(zarr_stores)} store(s)[/bold green]")
+        return 0
 
     # Parse zone filter
     zone_list = None
@@ -2551,6 +2580,8 @@ def zarr_build_command(args):
         console.print(f"  Zones: {', '.join(str(z) for z in zone_list)}")
     if args.dry_run:
         console.print("  [dim](dry run)[/dim]")
+    if args.no_rgb:
+        console.print("  [dim](skipping RGB preview)[/dim]")
 
     # Create registry pointing at local data
     registry = Registry(
@@ -2575,6 +2606,7 @@ def zarr_build_command(args):
         geotessera_version=gt_version,
         dataset_version=args.dataset_version,
         console=console,
+        rgb=not args.no_rgb,
     )
 
     if not args.dry_run and created:
@@ -2654,9 +2686,12 @@ def serve_command(args):
                     continue
                 if (col_dir / "0").exists():
                     chunks.append([row, col])
+        has_rgb = (store_path / "rgb" / "zarr.json").exists()
+        manifest_data = {"chunks": chunks, "has_rgb": has_rgb}
         manifest_path = store_path / "_chunk_manifest.json"
-        manifest_path.write_text(json.dumps({"chunks": chunks}))
-        console.print(f"  [dim]{store_name}: {len(chunks)} chunks indexed[/dim]")
+        manifest_path.write_text(json.dumps(manifest_data))
+        rgb_label = " [green]+rgb[/green]" if has_rgb else ""
+        console.print(f"  [dim]{store_name}: {len(chunks)} chunks indexed{rgb_label}[/dim]")
 
     class CORSHandler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *a, **kw):
@@ -2992,6 +3027,17 @@ Directory Structure:
         "--dry-run",
         action="store_true",
         help="Show zone breakdown without building stores",
+    )
+    zarr_build_parser.add_argument(
+        "--no-rgb",
+        action="store_true",
+        help="Skip RGB preview generation during build",
+    )
+    zarr_build_parser.add_argument(
+        "--rgb-only",
+        action="store_true",
+        help="Add RGB preview to existing stores without rebuilding "
+        "(scans existing .zarr stores in output dir)",
     )
     zarr_build_parser.set_defaults(func=zarr_build_command)
 
