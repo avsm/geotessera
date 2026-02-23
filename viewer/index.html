@@ -193,36 +193,243 @@
     <span id="chunk-loading-text">Loading chunk...</span>
   </div>
 
+  <!-- Progress bar -->
+  <div id="progress-bar" style="display:none; position:fixed; bottom:0; left:0; right:0; height:4px; background:#333; z-index:10;">
+    <div id="progress-fill" style="height:100%; width:0%; background:#4fc3f7; transition:width 0.15s;"></div>
+  </div>
+
   <!-- ============================================================ -->
   <!-- Main application script                                       -->
   <!-- ============================================================ -->
   <script type="module">
 
-  // ─── fzstd dynamic import ──────────────────────────────────────
-  let fzstdDecompress;
-  try {
-    const fzstd = await import('https://cdn.jsdelivr.net/npm/fzstd@0.1.1/+esm');
-    fzstdDecompress = fzstd.decompress || fzstd.default?.decompress;
-  } catch {
-    try {
-      const fzstd = await import('https://esm.sh/fzstd@0.1.1');
-      fzstdDecompress = fzstd.decompress || fzstd.default?.decompress;
-    } catch (e) {
-      console.error('Failed to load fzstd:', e);
-      alert('Failed to load zstd decompressor. Check console.');
+  // ─── WebWorker pool (fzstd loaded inside workers) ────────────────────────────────────────────
+
+  const FZSTD_CDN_PRIMARY   = 'https://cdn.jsdelivr.net/npm/fzstd@0.1.1/+esm';
+  const FZSTD_CDN_FALLBACK  = 'https://esm.sh/fzstd@0.1.1';
+
+  const workerCode = `
+    let fzstdDecompress = null;
+
+    self.onmessage = async function(e) {
+      const msg = e.data;
+
+      if (msg.type === 'init') {
+        // Load fzstd inside the worker via dynamic import
+        try {
+          const m = await import(msg.fzstdUrl);
+          fzstdDecompress = m.decompress || m.default?.decompress;
+        } catch {
+          try {
+            const m = await import(msg.fzstdFallback);
+            fzstdDecompress = m.decompress || m.default?.decompress;
+          } catch (err) {
+            self.postMessage({ type: 'error', error: 'Failed to load fzstd: ' + err.message });
+            return;
+          }
+        }
+        self.postMessage({ type: 'ready' });
+        return;
+      }
+
+      if (msg.type === 'decompress-and-render-rgb') {
+        const { compressedRgb, width, height, strideCol, id } = msg;
+        const rgbRaw = fzstdDecompress(new Uint8Array(compressedRgb));
+        const rgba = new Uint8Array(width * height * 4);
+        let nValid = 0;
+        for (let r = 0; r < height; r++) {
+          for (let c = 0; c < width; c++) {
+            const pi = (r * width + c) * 4;
+            const si = (r * strideCol + c) * 4;
+            rgba[pi]     = rgbRaw[si];
+            rgba[pi + 1] = rgbRaw[si + 1];
+            rgba[pi + 2] = rgbRaw[si + 2];
+            rgba[pi + 3] = rgbRaw[si + 3];
+            if (rgbRaw[si + 3] > 0) nValid++;
+          }
+        }
+        self.postMessage(
+          { type: 'rgb-result', id, rgba: rgba.buffer, width, height, nValid },
+          [rgba.buffer]
+        );
+        return;
+      }
+
+      if (msg.type === 'decompress-and-render-emb') {
+        const { compressedEmb, compressedScales, width, height, strideCol, nBands, bands, id } = msg;
+        const embRaw = fzstdDecompress(new Uint8Array(compressedEmb));
+        const scalesRaw = fzstdDecompress(new Uint8Array(compressedScales));
+
+        // Render bands to RGBA
+        const result = renderBands(embRaw, scalesRaw, width, height, strideCol, nBands, bands);
+        self.postMessage(
+          { type: 'emb-result', id, rgba: result.rgba.buffer, width, height, nValid: result.nValid,
+            embRaw: embRaw.buffer, scalesRaw: scalesRaw.buffer },
+          [result.rgba.buffer, embRaw.buffer, scalesRaw.buffer]
+        );
+        return;
+      }
+
+      if (msg.type === 'render-emb') {
+        // Re-render cached (already decompressed) data with new bands
+        const { embRaw, scalesRaw, width, height, strideCol, nBands, bands, id } = msg;
+        const embBytes = new Uint8Array(embRaw);
+        const scalesBytes = new Uint8Array(scalesRaw);
+        const result = renderBands(embBytes, scalesBytes, width, height, strideCol, nBands, bands);
+        self.postMessage(
+          { type: 'emb-result', id, rgba: result.rgba.buffer, width, height, nValid: result.nValid,
+            embRaw: embRaw, scalesRaw: scalesRaw },
+          [result.rgba.buffer]
+        );
+        return;
+      }
+    };
+
+    function renderBands(embRaw, scalesRaw, w, h, strideCol, nBands, bands) {
+      const embInt8 = new Int8Array(embRaw.buffer, embRaw.byteOffset, embRaw.byteLength);
+      const scalesBuf = new ArrayBuffer(scalesRaw.byteLength);
+      new Uint8Array(scalesBuf).set(scalesRaw);
+      const scalesF32 = new Float32Array(scalesBuf);
+
+      const [bR, bG, bB] = bands;
+      let minR = 127, maxR = -128, minG = 127, maxG = -128, minB = 127, maxB = -128;
+      let nValid = 0;
+
+      for (let r = 0; r < h; r++) {
+        for (let c = 0; c < w; c++) {
+          const si = r * strideCol + c;
+          if (isNaN(scalesF32[si]) || scalesF32[si] === 0) continue;
+          const base = (r * strideCol + c) * nBands;
+          const vr = embInt8[base + bR];
+          const vg = embInt8[base + bG];
+          const vb = embInt8[base + bB];
+          if (vr < minR) minR = vr; if (vr > maxR) maxR = vr;
+          if (vg < minG) minG = vg; if (vg > maxG) maxG = vg;
+          if (vb < minB) minB = vb; if (vb > maxB) maxB = vb;
+          nValid++;
+        }
+      }
+
+      const rgba = new Uint8Array(w * h * 4);
+      if (nValid === 0 || (maxR === minR && maxG === minG && maxB === minB)) {
+        return { rgba, nValid: 0 };
+      }
+
+      const rangeR = maxR - minR || 1;
+      const rangeG = maxG - minG || 1;
+      const rangeB = maxB - minB || 1;
+
+      for (let r = 0; r < h; r++) {
+        for (let c = 0; c < w; c++) {
+          const pi = (r * w + c) * 4;
+          const si = r * strideCol + c;
+          const scale = scalesF32[si];
+          if (isNaN(scale) || scale === 0) { rgba[pi + 3] = 0; continue; }
+          const base = (r * strideCol + c) * nBands;
+          rgba[pi]     = Math.max(0, Math.min(255, ((embInt8[base + bR] - minR) / rangeR) * 255));
+          rgba[pi + 1] = Math.max(0, Math.min(255, ((embInt8[base + bG] - minG) / rangeG) * 255));
+          rgba[pi + 2] = Math.max(0, Math.min(255, ((embInt8[base + bB] - minB) / rangeB) * 255));
+          rgba[pi + 3] = 255;
+        }
+      }
+      return { rgba, nValid };
+    }
+  `;
+
+  const workerBlob = new Blob([workerCode], { type: 'application/javascript' });
+  const workerUrl = URL.createObjectURL(workerBlob);
+
+  class WorkerPool {
+    constructor(size) {
+      this.size = size;
+      this.workers = [];
+      this.queue = [];        // pending tasks
+      this.idle = [];          // indices of idle workers
+      this.resolvers = new Map();  // msgId → { resolve }
+      this.nextId = 0;
+      this.readyCount = 0;
+      this.readyPromise = new Promise(res => { this._readyResolve = res; });
+
+      for (let i = 0; i < size; i++) {
+        const w = new Worker(workerUrl, { type: 'module' });
+        w.onmessage = (e) => this._onMessage(i, e);
+        w.postMessage({ type: 'init', fzstdUrl: FZSTD_CDN_PRIMARY, fzstdFallback: FZSTD_CDN_FALLBACK });
+        this.workers.push(w);
+      }
+    }
+
+    _onMessage(workerIdx, e) {
+      const msg = e.data;
+      if (msg.type === 'ready') {
+        this.readyCount++;
+        this.idle.push(workerIdx);
+        if (this.readyCount === this.size) this._readyResolve();
+        this._drain();
+        return;
+      }
+      if (msg.type === 'error') { console.error('[worker]', msg.error); return; }
+      const resolver = this.resolvers.get(msg.id);
+      if (resolver) {
+        this.resolvers.delete(msg.id);
+        resolver.resolve(msg);
+      }
+      this.idle.push(workerIdx);
+      this._drain();
+    }
+
+    _drain() {
+      while (this.idle.length > 0 && this.queue.length > 0) {
+        const workerIdx = this.idle.shift();
+        const { msg, transfers, resolve } = this.queue.shift();
+        const id = this.nextId++;
+        msg.id = id;
+        this.resolvers.set(id, { resolve });
+        this.workers[workerIdx].postMessage(msg, transfers);
+      }
+    }
+
+    async dispatch(msg, transfers = []) {
+      await this.readyPromise;
+      return new Promise(resolve => {
+        if (this.idle.length > 0) {
+          const workerIdx = this.idle.shift();
+          const id = this.nextId++;
+          msg.id = id;
+          this.resolvers.set(id, { resolve });
+          this.workers[workerIdx].postMessage(msg, transfers);
+        } else {
+          this.queue.push({ msg, transfers, resolve });
+        }
+      });
+    }
+
+    terminateAll() {
+      for (const w of this.workers) w.terminate();
+      this.workers = [];
+      this.idle = [];
+      this.queue = [];
+      this.resolvers.clear();
     }
   }
+
+  const WORKER_COUNT = Math.min(navigator.hardwareConcurrency || 4, 8);
+  const workerPool = new WorkerPool(WORKER_COUNT);
 
   // ─── State ─────────────────────────────────────────────────────
   let map;
   let store = null;           // { url, groupMeta, embMeta, scalesMeta, utmZone, epsg, transform, shape, chunkShape, chunkManifest }
-  const chunkCache = new Map();  // "ci_cj" -> { embRaw, scalesRaw, canvas, sourceId, layerId }
+  const chunkCache = new Map();  // "ci_cj" -> { embRaw, scalesRaw, canvas, sourceId, layerId, isPreview }
   let bands = [0, 1, 2];
   let opacity = 0.80;
   let loadingChunks = 0;
   let totalLoaded = 0;
-  let loadGeneration = 0;      // incremented on each viewport update to cancel stale loads
+  let currentAbort = null;     // AbortController — cancelled on each viewport update
   let autoZoomNext = true;     // zoom to first successfully rendered chunk
+
+  // RGB preview state
+  let hasRgbPreview = false;    // true if current store has an rgb array
+  let rgbMeta = null;           // metadata for the rgb array
+  const clickedChunks = new Set();  // chunk keys where user has clicked for full-band data
 
   const MAX_CACHED = 50;
   const MAX_LOAD_PER_UPDATE = 80;  // cap chunks loaded per viewport change
@@ -254,6 +461,22 @@
   const $overlayPanel     = document.getElementById('overlay-panel');
   const $toggleGrid       = document.getElementById('toggle-grid');
   const $toggleUtm        = document.getElementById('toggle-utm');
+  const $progressBar      = document.getElementById('progress-bar');
+  const $progressFill     = document.getElementById('progress-fill');
+
+  // ─── Progress tracker ─────────────────────────────────────────
+
+  const progressTracker = {
+    total: 0, done: 0,
+    reset() { this.total = 0; this.done = 0; $progressBar.style.display = 'none'; $progressFill.style.width = '0%'; },
+    start(total) { this.total = total; this.done = 0; if (total > 0) { $progressBar.style.display = 'block'; $progressFill.style.width = '0%'; } },
+    tick() {
+      this.done++;
+      const pct = this.total > 0 ? (this.done / this.total * 100) : 100;
+      $progressFill.style.width = pct + '%';
+      if (this.done >= this.total) setTimeout(() => { $progressBar.style.display = 'none'; }, 400);
+    },
+  };
 
   // ─── Zarr v3 reader ───────────────────────────────────────────
 
@@ -263,8 +486,8 @@
     return resp.json();
   }
 
-  async function fetchBytes(url) {
-    const resp = await fetch(url);
+  async function fetchBytes(url, signal) {
+    const resp = await fetch(url, signal ? { signal } : undefined);
     if (!resp.ok) return null;  // chunk might not exist
     return new Uint8Array(await resp.arrayBuffer());
   }
@@ -285,18 +508,10 @@
     return { shape, chunkShape, hasZstd, dtype, fillValue };
   }
 
-  function decompressChunk(compressed) {
-    if (!compressed) return null;
-    if (!fzstdDecompress) throw new Error('zstd decompressor not loaded');
-    return fzstdDecompress(compressed);
-  }
-
-  async function fetchChunk(baseUrl, arrayName, indices) {
+  async function fetchCompressedChunk(baseUrl, arrayName, indices, signal) {
     const key = indices.join('/');
     const url = `${baseUrl}/${arrayName}/c/${key}`;
-    const raw = await fetchBytes(url);
-    if (!raw) return null;
-    return decompressChunk(raw);
+    return await fetchBytes(url, signal);
   }
 
   // ─── Projection ───────────────────────────────────────────────
@@ -391,86 +606,6 @@
       }
     }
     return result;
-  }
-
-  // ─── Chunk rendering ──────────────────────────────────────────
-
-  function renderChunkToCanvas(embRaw, scalesRaw, ci, cj) {
-    const { r0, r1, c0, c1 } = getChunkPixelBounds(ci, cj);
-    const h = r1 - r0;    // actual rows (may be < chunkShape for edge)
-    const w = c1 - c0;    // actual cols (may be < chunkShape for edge)
-    const nBands = store.chunkShape[2];
-
-    // Buffer strides use full chunk dimensions (Zarr stores full-sized chunks
-    // even at edges, padded with fill_value). The decompressed buffer is always
-    // chunkShape[0] * chunkShape[1] * chunkShape[2] for embeddings, etc.
-    const strideCol = store.chunkShape[1];
-
-    // Reinterpret decompressed bytes as signed int8 for embeddings
-    const embInt8 = new Int8Array(embRaw.buffer, embRaw.byteOffset, embRaw.byteLength);
-    // Scales: float32 (little-endian, matching browser native endianness).
-    // Copy to an aligned ArrayBuffer for Float32Array view.
-    const scalesBuf = new ArrayBuffer(scalesRaw.byteLength);
-    new Uint8Array(scalesBuf).set(scalesRaw);
-    const scalesF32 = new Float32Array(scalesBuf);
-
-    const canvas = document.createElement('canvas');
-    canvas.width = w;
-    canvas.height = h;
-    const ctx = canvas.getContext('2d');
-    const img = ctx.createImageData(w, h);
-    const data = img.data;
-
-    const [bR, bG, bB] = bands;
-
-    // Compute per-band min/max for contrast stretch across this chunk
-    let minR = 127, maxR = -128, minG = 127, maxG = -128, minB = 127, maxB = -128;
-    let nValid = 0;
-    for (let r = 0; r < h; r++) {
-      for (let c = 0; c < w; c++) {
-        const si = r * strideCol + c;
-        if (isNaN(scalesF32[si]) || scalesF32[si] === 0) continue;
-        const base = (r * strideCol + c) * nBands;
-        const vr = embInt8[base + bR];
-        const vg = embInt8[base + bG];
-        const vb = embInt8[base + bB];
-        if (vr < minR) minR = vr; if (vr > maxR) maxR = vr;
-        if (vg < minG) minG = vg; if (vg > maxG) maxG = vg;
-        if (vb < minB) minB = vb; if (vb > maxB) maxB = vb;
-        nValid++;
-      }
-    }
-
-    // Return null if no valid data pixels (caller can skip map rendering)
-    if (nValid === 0 || (maxR === minR && maxG === minG && maxB === minB)) {
-      return null;
-    }
-
-    const rangeR = maxR - minR || 1;
-    const rangeG = maxG - minG || 1;
-    const rangeB = maxB - minB || 1;
-
-    for (let r = 0; r < h; r++) {
-      for (let c = 0; c < w; c++) {
-        const pi = (r * w + c) * 4;   // canvas pixel index (dense)
-        const si = r * strideCol + c;  // buffer index (full chunk stride)
-        const scale = scalesF32[si];
-
-        if (isNaN(scale) || scale === 0) {
-          data[pi + 3] = 0;  // transparent
-          continue;
-        }
-
-        const base = (r * strideCol + c) * nBands;
-        data[pi + 0] = Math.max(0, Math.min(255, ((embInt8[base + bR] - minR) / rangeR) * 255));
-        data[pi + 1] = Math.max(0, Math.min(255, ((embInt8[base + bG] - minG) / rangeG) * 255));
-        data[pi + 2] = Math.max(0, Math.min(255, ((embInt8[base + bB] - minB) / rangeB) * 255));
-        data[pi + 3] = 255;
-      }
-    }
-
-    ctx.putImageData(img, 0, 0);
-    return canvas;
   }
 
   // ─── Map integration ──────────────────────────────────────────
@@ -663,7 +798,18 @@
 
   // ─── Chunk loading ────────────────────────────────────────────
 
-  async function loadChunk(ci, cj) {
+  function rgbaToCanvas(rgbaBuffer, w, h) {
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    const img = ctx.createImageData(w, h);
+    img.data.set(new Uint8Array(rgbaBuffer));
+    ctx.putImageData(img, 0, 0);
+    return canvas;
+  }
+
+  async function loadChunk(ci, cj, signal) {
     const key = chunkKey(ci, cj);
     if (chunkCache.has(key) && chunkCache.get(key).embRaw) return;
 
@@ -671,26 +817,42 @@
     showChunkLoading(`Fetching chunk (${ci}, ${cj})...`);
 
     try {
-      // Fetch embeddings and scales in parallel
-      const [embRaw, scalesRaw] = await Promise.all([
-        fetchChunk(store.url, 'embeddings', [ci, cj, 0]),
-        fetchChunk(store.url, 'scales', [ci, cj]),
+      // Fetch compressed embeddings and scales in parallel
+      const [compEmb, compScales] = await Promise.all([
+        fetchCompressedChunk(store.url, 'embeddings', [ci, cj, 0], signal),
+        fetchCompressedChunk(store.url, 'scales', [ci, cj], signal),
       ]);
 
-      if (!embRaw || !scalesRaw) {
-        // Chunk doesn't exist or failed to load
+      if (!compEmb || !compScales) {
         chunkCache.set(key, { embRaw: null, scalesRaw: null, canvas: null, sourceId: null, layerId: null });
         return;
       }
 
-      const canvas = renderChunkToCanvas(embRaw, scalesRaw, ci, cj);
-      let sourceId = null, layerId = null;
-      if (canvas) {
-        ({ sourceId, layerId } = addChunkToMap(ci, cj, canvas));
-        const layers = map.getStyle().layers.map(l => l.id);
-        console.log(`[render] chunk (${ci},${cj}) → ${canvas.width}x${canvas.height}px, layer=${layerId}, order=[${layers.join(', ')}]`);
+      const { r0, r1, c0, c1 } = getChunkPixelBounds(ci, cj);
+      const h = r1 - r0;
+      const w = c1 - c0;
 
-        // Auto-zoom to first rendered chunk so user can see the data
+      // Dispatch decompression + rendering to worker
+      const result = await workerPool.dispatch({
+        type: 'decompress-and-render-emb',
+        compressedEmb: compEmb.buffer,
+        compressedScales: compScales.buffer,
+        width: w, height: h,
+        strideCol: store.chunkShape[1],
+        nBands: store.chunkShape[2],
+        bands,
+      }, [compEmb.buffer, compScales.buffer]);
+
+      // Reconstruct Uint8Array views from transferred buffers
+      const embRaw = new Uint8Array(result.embRaw);
+      const scalesRaw = new Uint8Array(result.scalesRaw);
+
+      let canvas = null, sourceId = null, layerId = null;
+      if (result.nValid > 0) {
+        canvas = rgbaToCanvas(result.rgba, w, h);
+        ({ sourceId, layerId } = addChunkToMap(ci, cj, canvas));
+        console.log(`[render] chunk (${ci},${cj}) → ${w}x${h}px, layer=${layerId}`);
+
         if (autoZoomNext) {
           autoZoomNext = false;
           const corners = getChunkLngLatCorners(ci, cj);
@@ -710,10 +872,128 @@
       totalLoaded++;
       updateInfoPanel();
     } catch (err) {
+      if (err.name === 'AbortError') return;
       console.warn(`Failed to load chunk (${ci},${cj}):`, err);
       chunkCache.set(key, { embRaw: null, scalesRaw: null, canvas: null, sourceId: null, layerId: null });
     } finally {
       loadingChunks--;
+      progressTracker.tick();
+      if (loadingChunks <= 0) hideChunkLoading();
+    }
+  }
+
+  // ─── RGB preview chunk loading ─────────────────────────────────
+
+  async function loadPreviewChunk(ci, cj, signal) {
+    const key = chunkKey(ci, cj);
+    if (chunkCache.has(key)) return;  // already loaded (preview or full)
+
+    loadingChunks++;
+    showChunkLoading(`Preview (${ci}, ${cj})...`);
+
+    try {
+      const compRgb = await fetchCompressedChunk(store.url, 'rgb', [ci, cj, 0], signal);
+      if (!compRgb) {
+        chunkCache.set(key, { embRaw: null, scalesRaw: null, canvas: null, sourceId: null, layerId: null, isPreview: true });
+        return;
+      }
+
+      const { r0, r1, c0, c1 } = getChunkPixelBounds(ci, cj);
+      const h = r1 - r0;
+      const w = c1 - c0;
+
+      const result = await workerPool.dispatch({
+        type: 'decompress-and-render-rgb',
+        compressedRgb: compRgb.buffer,
+        width: w, height: h,
+        strideCol: rgbMeta.chunkShape[1],
+      }, [compRgb.buffer]);
+
+      let canvas = null, sourceId = null, layerId = null;
+      if (result.nValid > 0) {
+        canvas = rgbaToCanvas(result.rgba, w, h);
+        ({ sourceId, layerId } = addChunkToMap(ci, cj, canvas));
+        console.log(`[rgb] chunk (${ci},${cj}) → ${w}x${h}px preview`);
+
+        if (autoZoomNext) {
+          autoZoomNext = false;
+          const corners = getChunkLngLatCorners(ci, cj);
+          const lngs = corners.map(c => c[0]);
+          const lats = corners.map(c => c[1]);
+          map.fitBounds([
+            [Math.min(...lngs), Math.min(...lats)],
+            [Math.max(...lngs), Math.max(...lats)],
+          ], { padding: 40, duration: 1000 });
+        }
+      }
+
+      chunkCache.set(key, { embRaw: null, scalesRaw: null, canvas, sourceId, layerId, isPreview: true });
+      totalLoaded++;
+      updateInfoPanel();
+    } catch (err) {
+      if (err.name === 'AbortError') return;
+      console.warn(`Failed to load preview chunk (${ci},${cj}):`, err);
+      chunkCache.set(key, { embRaw: null, scalesRaw: null, canvas: null, sourceId: null, layerId: null, isPreview: true });
+    } finally {
+      loadingChunks--;
+      progressTracker.tick();
+      if (loadingChunks <= 0) hideChunkLoading();
+    }
+  }
+
+  async function loadFullChunk(ci, cj, signal) {
+    const key = chunkKey(ci, cj);
+    const existing = chunkCache.get(key);
+    if (existing?.embRaw) return;  // already have full data
+
+    loadingChunks++;
+    showChunkLoading(`Full bands (${ci}, ${cj})...`);
+
+    try {
+      const [compEmb, compScales] = await Promise.all([
+        fetchCompressedChunk(store.url, 'embeddings', [ci, cj, 0], signal),
+        fetchCompressedChunk(store.url, 'scales', [ci, cj], signal),
+      ]);
+
+      if (!compEmb || !compScales) return;
+
+      // Remove old preview from map
+      if (existing?.sourceId) removeChunkFromMap(key);
+
+      const { r0, r1, c0, c1 } = getChunkPixelBounds(ci, cj);
+      const h = r1 - r0;
+      const w = c1 - c0;
+
+      const result = await workerPool.dispatch({
+        type: 'decompress-and-render-emb',
+        compressedEmb: compEmb.buffer,
+        compressedScales: compScales.buffer,
+        width: w, height: h,
+        strideCol: store.chunkShape[1],
+        nBands: store.chunkShape[2],
+        bands,
+      }, [compEmb.buffer, compScales.buffer]);
+
+      const embRaw = new Uint8Array(result.embRaw);
+      const scalesRaw = new Uint8Array(result.scalesRaw);
+
+      let canvas = null, sourceId = null, layerId = null;
+      if (result.nValid > 0) {
+        canvas = rgbaToCanvas(result.rgba, w, h);
+        ({ sourceId, layerId } = addChunkToMap(ci, cj, canvas));
+        console.log(`[full] chunk (${ci},${cj}) → ${w}x${h}px custom bands`);
+      }
+
+      chunkCache.set(key, { embRaw, scalesRaw, canvas, sourceId, layerId, isPreview: false });
+      clickedChunks.add(key);
+      $bandPanel.classList.remove('opacity-40', 'pointer-events-none');
+      updateInfoPanel();
+    } catch (err) {
+      if (err.name === 'AbortError') return;
+      console.warn(`Failed to load full chunk (${ci},${cj}):`, err);
+    } finally {
+      loadingChunks--;
+      progressTracker.tick();
       if (loadingChunks <= 0) hideChunkLoading();
     }
   }
@@ -722,7 +1002,10 @@
 
   async function updateVisibleChunks() {
     if (!store) return;
-    const gen = ++loadGeneration;  // cancel any in-flight loads
+    currentAbort?.abort();                       // cancel in-flight fetches
+    progressTracker.reset();
+    const abort = currentAbort = new AbortController();
+    const signal = abort.signal;
 
     const visible = getVisibleChunkIndices();
     const visibleKeys = new Set(visible.map(([ci, cj]) => chunkKey(ci, cj)));
@@ -736,18 +1019,18 @@
       }
     }
 
-    // Load new visible chunks (parallel, up to 3 at a time)
+    // Load new visible chunks (parallel, up to 4 at a time)
     const toLoad = [];
     for (const [ci, cj] of visible) {
       const key = chunkKey(ci, cj);
       const entry = chunkCache.get(key);
 
-      if (entry?.embRaw && entry.canvas && !entry.sourceId) {
-        // Already in cache, just re-add to map
+      if (entry?.canvas && !entry.sourceId) {
+        // Already in cache (preview or full), just re-add to map
         const ids = addChunkToMap(ci, cj, entry.canvas);
         entry.sourceId = ids.sourceId;
         entry.layerId = ids.layerId;
-      } else if (!entry || (!entry.embRaw && entry.embRaw !== null)) {
+      } else if (!entry) {
         toLoad.push([ci, cj]);
       }
     }
@@ -773,17 +1056,24 @@
     }
 
     // Load chunks with concurrency limit, aborting if viewport changes
+    // Route to preview or full depending on RGB availability
+    progressTracker.start(toLoad.length);
     if (toLoad.length > 0) {
-      console.log(`[fetch] loading ${toLoad.length} chunks: ${toLoad.slice(0, 20).map(([ci,cj]) => `(${ci},${cj})`).join(' ')}${toLoad.length > 20 ? ' ...' : ''}`);
+      console.log(`[fetch] loading ${toLoad.length} chunks (${hasRgbPreview ? 'rgb preview' : 'full'}): ${toLoad.slice(0, 20).map(([ci,cj]) => `(${ci},${cj})`).join(' ')}${toLoad.length > 20 ? ' ...' : ''}`);
     }
     const CONCURRENCY = 4;
     for (let i = 0; i < toLoad.length; i += CONCURRENCY) {
-      if (gen !== loadGeneration) {
+      if (signal.aborted) {
         console.log(`[fetch] cancelled: viewport changed (loaded ${i}/${toLoad.length})`);
         break;
       }
       const batch = toLoad.slice(i, i + CONCURRENCY);
-      await Promise.all(batch.map(([ci, cj]) => loadChunk(ci, cj)));
+      await Promise.all(batch.map(([ci, cj]) => {
+        if (hasRgbPreview && !clickedChunks.has(chunkKey(ci, cj))) {
+          return loadPreviewChunk(ci, cj, signal);
+        }
+        return loadChunk(ci, cj, signal);
+      }));
     }
 
     // Evict oldest cache entries if over limit, but not visible ones
@@ -800,19 +1090,47 @@
 
   // ─── Re-render on band change ─────────────────────────────────
 
-  function reRenderAllChunks() {
+  async function reRenderAllChunks() {
+    const tasks = [];
     for (const [key, entry] of chunkCache) {
-      if (!entry.embRaw) continue;
+      if (!entry.embRaw) continue;  // skip preview-only chunks
       const [ci, cj] = key.split('_').map(Number);
       const wasOnMap = !!entry.sourceId;
       if (wasOnMap) removeChunkFromMap(key);
-      entry.canvas = renderChunkToCanvas(entry.embRaw, entry.scalesRaw, ci, cj);
-      if (entry.canvas && wasOnMap) {
-        const ids = addChunkToMap(ci, cj, entry.canvas);
-        entry.sourceId = ids.sourceId;
-        entry.layerId = ids.layerId;
-      }
+
+      const { r0, r1, c0, c1 } = getChunkPixelBounds(ci, cj);
+      const h = r1 - r0;
+      const w = c1 - c0;
+
+      // Send already-decompressed data for re-render with new bands
+      const embCopy = entry.embRaw.slice().buffer;
+      const scalesCopy = entry.scalesRaw.slice().buffer;
+      const task = workerPool.dispatch({
+        type: 'render-emb',
+        embRaw: embCopy,
+        scalesRaw: scalesCopy,
+        width: w, height: h,
+        strideCol: store.chunkShape[1],
+        nBands: store.chunkShape[2],
+        bands,
+      }, [embCopy, scalesCopy]).then(result => {
+        // Recover decompressed bytes (not transferred for render-emb since we made copies)
+        entry.embRaw = new Uint8Array(result.embRaw);
+        entry.scalesRaw = new Uint8Array(result.scalesRaw);
+        if (result.nValid > 0) {
+          entry.canvas = rgbaToCanvas(result.rgba, w, h);
+          if (wasOnMap) {
+            const ids = addChunkToMap(ci, cj, entry.canvas);
+            entry.sourceId = ids.sourceId;
+            entry.layerId = ids.layerId;
+          }
+        } else {
+          entry.canvas = null;
+        }
+      });
+      tasks.push(task);
     }
+    await Promise.all(tasks);
   }
 
   // ─── Opacity update ───────────────────────────────────────────
@@ -852,6 +1170,9 @@
       totalLoaded = 0;
       autoZoomNext = true;
       store = null;
+      hasRgbPreview = false;
+      rgbMeta = null;
+      clickedChunks.clear();
 
       // Read metadata
       setStatus('Reading metadata...', 'text-term-cyan');
@@ -867,6 +1188,16 @@
         throw new Error('Missing required store metadata (utm_zone, transform, shape)');
       }
 
+      // Try to detect RGB preview array
+      try {
+        rgbMeta = await readArrayMeta(url, 'rgb');
+        hasRgbPreview = true;
+        setStatus('RGB preview detected', 'text-term-cyan');
+      } catch {
+        hasRgbPreview = false;
+        rgbMeta = null;
+      }
+
       // Load chunk manifest (generated by serve command) to avoid 404s on sparse stores
       let chunkManifest = null;
       try {
@@ -874,6 +1205,13 @@
         if (manifestData?.chunks) {
           chunkManifest = new Set(manifestData.chunks.map(([ci, cj]) => `${ci}_${cj}`));
           setStatus(`Manifest: ${chunkManifest.size} chunks`, 'text-term-cyan');
+        }
+        // Also check manifest for has_rgb
+        if (manifestData?.has_rgb !== undefined) {
+          hasRgbPreview = manifestData.has_rgb;
+          if (hasRgbPreview && !rgbMeta) {
+            try { rgbMeta = await readArrayMeta(url, 'rgb'); } catch { hasRgbPreview = false; }
+          }
         }
       } catch {
         // No manifest available - will request all grid positions
@@ -899,7 +1237,12 @@
       updateInfoPanel();
 
       // Enable controls
-      $bandPanel.classList.remove('opacity-40', 'pointer-events-none');
+      if (hasRgbPreview) {
+        // Band panel stays dimmed until user clicks a tile for full data
+        $bandPanel.classList.add('opacity-40', 'pointer-events-none');
+      } else {
+        $bandPanel.classList.remove('opacity-40', 'pointer-events-none');
+      }
       $opacityPanel.classList.remove('opacity-40', 'pointer-events-none');
       $overlayPanel.classList.remove('opacity-40', 'pointer-events-none');
 
@@ -928,7 +1271,8 @@
         [Math.max(...lngs), Math.max(...lats)],
       ], { padding: 40, duration: 1500 });
 
-      setStatus(`Loaded: zone ${utmZone}`, 'text-term-green');
+      const rgbLabel = hasRgbPreview ? ' +rgb' : '';
+      setStatus(`Loaded: zone ${utmZone}${rgbLabel}`, 'text-term-green');
 
       // Start loading visible chunks after fly animation
       setTimeout(() => updateVisibleChunks(), 1800);
@@ -963,8 +1307,14 @@
     const nChunksRow = Math.ceil(store.shape[0] / store.chunkShape[0]);
     const nChunksCol = Math.ceil(store.shape[1] / store.chunkShape[1]);
     const total = nChunksRow * nChunksCol;
-    $infoChunks.textContent = `${totalLoaded} / ${total}`;
-    $infoStatus.textContent = loadingChunks > 0 ? `loading ${loadingChunks}...` : 'idle';
+    if (hasRgbPreview) {
+      $infoChunks.textContent = `${totalLoaded} / ${total} (${clickedChunks.size} inspected)`;
+    } else {
+      $infoChunks.textContent = `${totalLoaded} / ${total}`;
+    }
+    let statusText = loadingChunks > 0 ? `loading ${loadingChunks}...` : 'idle';
+    if (hasRgbPreview && loadingChunks === 0) statusText = 'rgb preview — click to inspect';
+    $infoStatus.textContent = statusText;
   }
 
   // ─── Event setup ──────────────────────────────────────────────
@@ -1066,6 +1416,33 @@
     map.on('moveend', () => {
       clearTimeout(moveDebounce);
       moveDebounce = setTimeout(() => updateVisibleChunks(), 300);
+    });
+
+    // Click to inspect: load full 128-band data for a chunk
+    map.on('click', (e) => {
+      if (!store || !hasRgbPreview || !projForward) return;
+      try {
+        const [easting, northing] = projForward(e.lngLat.lng, e.lngLat.lat);
+        const t = store.transform;
+        const px = t[0];
+        const originE = t[2];
+        const originN = t[5];
+        const cs = store.chunkShape;
+
+        const col = Math.floor((easting - originE) / px);
+        const row = Math.floor((originN - northing) / px);
+        if (col < 0 || row < 0 || col >= store.shape[1] || row >= store.shape[0]) return;
+
+        const ci = Math.floor(row / cs[0]);
+        const cj = Math.floor(col / cs[1]);
+        const key = chunkKey(ci, cj);
+
+        if (clickedChunks.has(key)) return;
+        if (store.chunkManifest && !store.chunkManifest.has(key)) return;
+
+        console.log(`[click] inspect chunk (${ci},${cj})`);
+        loadFullChunk(ci, cj);
+      } catch { /* outside projection bounds */ }
     });
 
     // Discover available stores and handle URL params
