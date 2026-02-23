@@ -1021,6 +1021,12 @@ def _tile_info_from_scan_result(result):
 # =============================================================================
 
 
+def _default_workers() -> int:
+    """Return a sensible default thread count."""
+    import multiprocessing
+    return min(multiprocessing.cpu_count(), 16)
+
+
 def build_zone_stores(
     registry: "Registry",
     output_dir: Path,
@@ -1031,6 +1037,7 @@ def build_zone_stores(
     dataset_version: str = "v1",
     console: Optional["rich.console.Console"] = None,
     rgb: bool = True,
+    workers: Optional[int] = None,
 ) -> List[Path]:
     """Build zone-wide Zarr stores from local tile data.
 
@@ -1048,10 +1055,14 @@ def build_zone_stores(
         dataset_version: Tessera dataset version
         console: Optional Rich Console for progress display
         rgb: If True, generate RGB preview arrays (default: True)
+        workers: Number of threads for parallel I/O (default: cpu_count, max 16)
 
     Returns:
         List of paths to created Zarr stores
     """
+    if workers is None:
+        workers = _default_workers()
+
     output_dir = Path(output_dir)
 
     # Gather and group tiles
@@ -1120,7 +1131,10 @@ def build_zone_stores(
             include_rgb=rgb,
         )
 
-        # Write tiles with progress bar
+        # Write tiles in parallel (each tile writes to a non-overlapping
+        # region; file I/O and zarr chunk writes release the GIL)
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         errors = 0
         if console is not None:
             with Progress(
@@ -1134,48 +1148,60 @@ def build_zone_stores(
                 console=console,
             ) as progress:
                 task = progress.add_task(
-                    f"Writing zone {zone_num}",
+                    f"Writing zone {zone_num} ({workers} threads)",
                     total=len(tile_infos),
                     status="starting...",
                 )
 
-                for ti in tile_infos:
-                    progress.update(
-                        task,
-                        status=f"({ti.lon:.2f}, {ti.lat:.2f})",
-                    )
-                    try:
-                        _write_single_tile(store, ti, zone_grid)
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to write tile ({ti.lon}, {ti.lat}): {e}"
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = {
+                        pool.submit(_write_single_tile, store, ti, zone_grid): ti
+                        for ti in tile_infos
+                    }
+                    for future in as_completed(futures):
+                        ti = futures[future]
+                        try:
+                            future.result()
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to write tile ({ti.lon}, {ti.lat}): {e}"
+                            )
+                            errors += 1
+                        progress.update(
+                            task,
+                            status=f"({ti.lon:.2f}, {ti.lat:.2f})",
                         )
-                        errors += 1
-                    progress.advance(task)
+                        progress.advance(task)
 
                 status = "done"
                 if errors:
                     status = f"done ({errors} errors)"
                 progress.update(task, status=status)
         else:
-            for ti in tile_infos:
-                try:
-                    _write_single_tile(store, ti, zone_grid)
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to write tile ({ti.lon}, {ti.lat}): {e}"
-                    )
-                    errors += 1
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(_write_single_tile, store, ti, zone_grid): ti
+                    for ti in tile_infos
+                }
+                for future in as_completed(futures):
+                    ti = futures[future]
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to write tile ({ti.lon}, {ti.lat}): {e}"
+                        )
+                        errors += 1
 
         # RGB preview pass: compute stretch from the store, then write preview
         if rgb:
-            stretch = compute_stretch_from_store(store, console=console)
+            stretch = compute_stretch_from_store(store, workers=workers, console=console)
             if console is not None:
                 console.print(
                     f"  RGB stretch: min={[f'{v:.2f}' for v in stretch['min']]}, "
                     f"max={[f'{v:.2f}' for v in stretch['max']]}"
                 )
-            written = write_rgb_pass(store, stretch, console=console)
+            written = write_rgb_pass(store, stretch, workers=workers, console=console)
             store.attrs.update({
                 "has_rgb_preview": True,
                 "rgb_bands": list(RGB_PREVIEW_BANDS),
@@ -1370,16 +1396,18 @@ def write_rgb_pass(
 
 def add_rgb_to_existing_store(
     store_path: Path,
+    workers: Optional[int] = None,
     console: Optional["rich.console.Console"] = None,
 ) -> None:
     """Add RGB preview array to an existing Zarr store.
 
     Two-pass process:
     1. Parallel chunk reads to compute percentile stretch
-    2. Write RGB preview data
+    2. Parallel RGB chunk writes
 
     Args:
         store_path: Path to existing .zarr directory
+        workers: Number of threads (default: cpu_count, max 16)
         console: Optional Rich Console for progress
     """
     import zarr
@@ -1403,16 +1431,19 @@ def add_rgb_to_existing_store(
             dimension_names=["northing", "easting", "rgba"],
         )
 
-    if console is not None:
-        console.print(f"  Pass 1: Computing band statistics (parallel)...")
+    if workers is None:
+        workers = _default_workers()
 
-    stretch = compute_stretch_from_store(store, console=console)
+    if console is not None:
+        console.print(f"  Pass 1: Computing band statistics ({workers} threads)...")
+
+    stretch = compute_stretch_from_store(store, workers=workers, console=console)
     if console is not None:
         console.print(f"  Stretch: min={stretch['min']}, max={stretch['max']}")
         console.print(f"  Pass 2: Writing RGB preview...")
 
     # Pass 2: write RGB
-    written = write_rgb_pass(store, stretch, console=console)
+    written = write_rgb_pass(store, stretch, workers=workers, console=console)
 
     # Update store attrs
     store.attrs.update({

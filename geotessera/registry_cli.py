@@ -2556,7 +2556,7 @@ def zarr_build_command(args):
 
         for store_path in zarr_stores:
             console.print(f"\n  [cyan]{store_path.name}[/cyan]")
-            add_rgb_to_existing_store(store_path, console=console)
+            add_rgb_to_existing_store(store_path, workers=args.workers, console=console)
 
         console.print(f"\n[bold green]RGB preview added to {len(zarr_stores)} store(s)[/bold green]")
         return 0
@@ -2607,6 +2607,7 @@ def zarr_build_command(args):
         dataset_version=args.dataset_version,
         console=console,
         rgb=not args.no_rgb,
+        workers=args.workers,
     )
 
     if not args.dry_run and created:
@@ -3027,6 +3028,13 @@ Directory Structure:
         "--dry-run",
         action="store_true",
         help="Show zone breakdown without building stores",
+    )
+    zarr_build_parser.add_argument(
+        "--workers",
+        "-j",
+        type=int,
+        default=None,
+        help="Number of threads for parallel I/O (default: cpu_count, max 16)",
     )
     zarr_build_parser.add_argument(
         "--no-rgb",
