@@ -151,6 +151,23 @@
       </div>
     </div>
 
+    <!-- Overlays -->
+    <div id="overlay-panel" class="px-4 py-3 border-b border-gray-800/60 opacity-40 pointer-events-none transition-opacity">
+      <label class="text-gray-500 text-[10px] uppercase tracking-[0.15em]">Overlays</label>
+      <div class="mt-2 space-y-1.5">
+        <label class="flex items-center gap-2 cursor-pointer group">
+          <input id="toggle-grid" type="checkbox" checked
+                 class="w-3 h-3 rounded accent-[#00e5ff] bg-gray-950 border-gray-700">
+          <span class="text-[11px] group-hover:text-term-cyan transition-colors">Chunk grid</span>
+        </label>
+        <label class="flex items-center gap-2 cursor-pointer group">
+          <input id="toggle-utm" type="checkbox" checked
+                 class="w-3 h-3 rounded accent-[#39ff14] bg-gray-950 border-gray-700">
+          <span class="text-[11px] group-hover:text-term-green transition-colors">UTM zone</span>
+        </label>
+      </div>
+    </div>
+
     <!-- Info panel -->
     <div id="info-panel" class="px-4 py-3 text-[10px] space-y-1 hidden">
       <div class="flex justify-between"><span class="text-gray-600">Zone</span><span id="info-zone" class="text-gray-400">--</span></div>
@@ -233,6 +250,9 @@
   const $coordText   = document.getElementById('coord-text');
   const $chunkLoading     = document.getElementById('chunk-loading');
   const $chunkLoadingText = document.getElementById('chunk-loading-text');
+  const $overlayPanel     = document.getElementById('overlay-panel');
+  const $toggleGrid       = document.getElementById('toggle-grid');
+  const $toggleUtm        = document.getElementById('toggle-utm');
 
   // ─── Zarr v3 reader ───────────────────────────────────────────
 
@@ -474,8 +494,8 @@
       coordinates: corners,
     });
 
-    // Insert below labels but above basemap
-    const labelLayer = findFirstLabelLayer();
+    // Insert below overlays (or below labels if no overlays)
+    const labelLayer = findRasterInsertionPoint();
     map.addLayer({
       id: layerId,
       type: 'raster',
@@ -508,6 +528,161 @@
       }
     }
     return undefined;
+  }
+
+  // ─── Overlays ───────────────────────────────────────────────
+
+  const OVERLAY_LAYERS = [
+    'chunk-grid-nodata', 'chunk-grid-data', 'chunk-grid-lines',
+    'utm-zone-fill', 'utm-zone-line', 'chunk-grid-labels',
+  ];
+
+  function findRasterInsertionPoint() {
+    // Insert raster chunks below overlay layers
+    for (const id of OVERLAY_LAYERS) {
+      if (map.getLayer(id)) return id;
+    }
+    return findFirstLabelLayer();
+  }
+
+  function removeOverlays() {
+    for (const id of OVERLAY_LAYERS) {
+      if (map.getLayer(id)) map.removeLayer(id);
+    }
+    if (map.getSource('utm-zone')) map.removeSource('utm-zone');
+    if (map.getSource('chunk-grid')) map.removeSource('chunk-grid');
+  }
+
+  function addOverlays() {
+    if (!store) return;
+    removeOverlays();
+
+    const labelLayer = findFirstLabelLayer();
+
+    // === UTM Zone boundary ===
+    const zone = store.utmZone;
+    const isSouth = store.epsg >= 32700 && store.epsg <= 32760;
+    const lonMin = (zone - 1) * 6 - 180;
+    const lonMax = zone * 6 - 180;
+    const latMin = isSouth ? -80 : 0;
+    const latMax = isSouth ? 0 : 84;
+
+    map.addSource('utm-zone', {
+      type: 'geojson',
+      data: {
+        type: 'Feature',
+        properties: {},
+        geometry: {
+          type: 'Polygon',
+          coordinates: [[[lonMin, latMin], [lonMax, latMin], [lonMax, latMax], [lonMin, latMax], [lonMin, latMin]]]
+        }
+      }
+    });
+
+    map.addLayer({
+      id: 'utm-zone-fill',
+      type: 'fill',
+      source: 'utm-zone',
+      paint: { 'fill-color': '#39ff14', 'fill-opacity': 0.03 },
+      layout: { 'visibility': $toggleUtm.checked ? 'visible' : 'none' },
+    }, labelLayer);
+
+    // === Chunk grid ===
+    const cs = store.chunkShape;
+    const s = store.shape;
+    const nRows = Math.ceil(s[0] / cs[0]);
+    const nCols = Math.ceil(s[1] / cs[1]);
+
+    const features = [];
+    for (let ci = 0; ci < nRows; ci++) {
+      for (let cj = 0; cj < nCols; cj++) {
+        const hasData = store.chunkManifest ? store.chunkManifest.has(`${ci}_${cj}`) : true;
+        const corners = getChunkLngLatCorners(ci, cj);
+        features.push({
+          type: 'Feature',
+          properties: { ci, cj, hasData, label: `${ci},${cj}` },
+          geometry: {
+            type: 'Polygon',
+            coordinates: [[corners[0], corners[1], corners[2], corners[3], corners[0]]]
+          }
+        });
+      }
+    }
+
+    map.addSource('chunk-grid', {
+      type: 'geojson',
+      data: { type: 'FeatureCollection', features }
+    });
+
+    const gridVis = $toggleGrid.checked ? 'visible' : 'none';
+
+    // No-data fill (dim)
+    map.addLayer({
+      id: 'chunk-grid-nodata',
+      type: 'fill',
+      source: 'chunk-grid',
+      filter: ['==', ['get', 'hasData'], false],
+      paint: { 'fill-color': '#374151', 'fill-opacity': 0.15 },
+      layout: { 'visibility': gridVis },
+    }, labelLayer);
+
+    // Data fill (very subtle cyan)
+    map.addLayer({
+      id: 'chunk-grid-data',
+      type: 'fill',
+      source: 'chunk-grid',
+      filter: ['==', ['get', 'hasData'], true],
+      paint: { 'fill-color': '#00e5ff', 'fill-opacity': 0.04 },
+      layout: { 'visibility': gridVis },
+    }, labelLayer);
+
+    // Grid lines (cyan for data, gray for nodata)
+    map.addLayer({
+      id: 'chunk-grid-lines',
+      type: 'line',
+      source: 'chunk-grid',
+      paint: {
+        'line-color': ['case', ['get', 'hasData'], '#00e5ff', '#374151'],
+        'line-width': ['case', ['get', 'hasData'], 1, 0.5],
+        'line-opacity': ['case', ['get', 'hasData'], 0.4, 0.2],
+      },
+      layout: { 'visibility': gridVis },
+    }, labelLayer);
+
+    // UTM zone outline (on top of grid, always visible)
+    map.addLayer({
+      id: 'utm-zone-line',
+      type: 'line',
+      source: 'utm-zone',
+      paint: {
+        'line-color': '#39ff14',
+        'line-width': 2,
+        'line-opacity': 0.5,
+        'line-dasharray': [6, 4],
+      },
+      layout: { 'visibility': $toggleUtm.checked ? 'visible' : 'none' },
+    }, labelLayer);
+
+    // Chunk index labels (visible at higher zoom)
+    map.addLayer({
+      id: 'chunk-grid-labels',
+      type: 'symbol',
+      source: 'chunk-grid',
+      filter: ['==', ['get', 'hasData'], true],
+      minzoom: 8,
+      layout: {
+        'text-field': ['get', 'label'],
+        'text-size': 10,
+        'text-font': ['Open Sans Regular'],
+        'visibility': gridVis,
+      },
+      paint: {
+        'text-color': '#00e5ff',
+        'text-opacity': 0.5,
+        'text-halo-color': '#000',
+        'text-halo-width': 1,
+      },
+    }, labelLayer);
   }
 
   // ─── Chunk loading ────────────────────────────────────────────
@@ -583,6 +758,19 @@
           toLoad.push([ci, cj]);
         }
       }
+
+      // Sort by distance from viewport center so nearest chunks render first
+      try {
+        const center = map.getCenter();
+        const [cE, cN] = projForward(center.lng, center.lat);
+        toLoad.sort((a, b) => {
+          const ba = getChunkUtmBounds(a[0], a[1]);
+          const bb = getChunkUtmBounds(b[0], b[1]);
+          const da = Math.hypot((ba.minE + ba.maxE) / 2 - cE, (ba.minN + ba.maxN) / 2 - cN);
+          const db = Math.hypot((bb.minE + bb.maxE) / 2 - cE, (bb.minN + bb.maxN) / 2 - cN);
+          return da - db;
+        });
+      } catch { /* projection error, keep original order */ }
 
       // Load chunks with concurrency limit
       const CONCURRENCY = 3;
@@ -660,6 +848,7 @@
       // Clear previous state
       for (const [key] of chunkCache) removeChunkFromMap(key);
       chunkCache.clear();
+      removeOverlays();
       totalLoaded = 0;
       store = null;
 
@@ -711,6 +900,10 @@
       // Enable controls
       $bandPanel.classList.remove('opacity-40', 'pointer-events-none');
       $opacityPanel.classList.remove('opacity-40', 'pointer-events-none');
+      $overlayPanel.classList.remove('opacity-40', 'pointer-events-none');
+
+      // Add overlays (chunk grid + UTM zone boundary)
+      addOverlays();
 
       // Fly to store bounds
       const px = transform[0];
@@ -804,6 +997,21 @@
       opacity = +$opacity.value / 100;
       $opacityVal.textContent = opacity.toFixed(2);
       updateAllOpacity();
+    });
+
+    // Overlay toggles
+    $toggleGrid.addEventListener('change', () => {
+      const vis = $toggleGrid.checked ? 'visible' : 'none';
+      for (const id of ['chunk-grid-nodata', 'chunk-grid-data', 'chunk-grid-lines', 'chunk-grid-labels']) {
+        if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', vis);
+      }
+    });
+
+    $toggleUtm.addEventListener('change', () => {
+      const vis = $toggleUtm.checked ? 'visible' : 'none';
+      for (const id of ['utm-zone-fill', 'utm-zone-line']) {
+        if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', vis);
+      }
     });
   }
 
