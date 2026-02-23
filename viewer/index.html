@@ -222,6 +222,7 @@
   let loadingChunks = 0;
   let totalLoaded = 0;
   let loadGeneration = 0;      // incremented on each viewport update to cancel stale loads
+  let autoZoomNext = true;     // zoom to first successfully rendered chunk
 
   const MAX_CACHED = 50;
   const MAX_LOAD_PER_UPDATE = 80;  // cap chunks loaded per viewport change
@@ -494,8 +495,7 @@
       coordinates: corners,
     });
 
-    // Insert below overlays (or below labels if no overlays)
-    const labelLayer = findRasterInsertionPoint();
+    // Add raster layer on top, then move overlay lines above it
     map.addLayer({
       id: layerId,
       type: 'raster',
@@ -504,7 +504,11 @@
         'raster-opacity': opacity,
         'raster-fade-duration': 0,
       },
-    }, labelLayer);
+    });
+
+    // Keep grid lines and UTM outline on top of all raster chunks
+    if (map.getLayer('chunk-grid-lines')) map.moveLayer('chunk-grid-lines');
+    if (map.getLayer('utm-zone-line')) map.moveLayer('utm-zone-line');
 
     return { sourceId, layerId };
   }
@@ -536,13 +540,6 @@
     'chunk-grid-nodata', 'chunk-grid-data', 'chunk-grid-lines',
     'utm-zone-fill', 'utm-zone-line',
   ];
-
-  function findRasterInsertionPoint() {
-    // Insert raster chunks above fills but below grid lines
-    if (map.getLayer('chunk-grid-lines')) return 'chunk-grid-lines';
-    if (map.getLayer('utm-zone-line')) return 'utm-zone-line';
-    return undefined;  // add on top
-  }
 
   function removeOverlays() {
     for (const id of OVERLAY_LAYERS) {
@@ -690,7 +687,21 @@
       let sourceId = null, layerId = null;
       if (canvas) {
         ({ sourceId, layerId } = addChunkToMap(ci, cj, canvas));
-        console.log(`[render] chunk (${ci},${cj}) → ${canvas.width}x${canvas.height}px, layer=${layerId}`);
+        const layers = map.getStyle().layers.map(l => l.id);
+        console.log(`[render] chunk (${ci},${cj}) → ${canvas.width}x${canvas.height}px, layer=${layerId}, order=[${layers.join(', ')}]`);
+
+        // Auto-zoom to first rendered chunk so user can see the data
+        if (autoZoomNext) {
+          autoZoomNext = false;
+          const corners = getChunkLngLatCorners(ci, cj);
+          const lngs = corners.map(c => c[0]);
+          const lats = corners.map(c => c[1]);
+          map.fitBounds([
+            [Math.min(...lngs), Math.min(...lats)],
+            [Math.max(...lngs), Math.max(...lats)],
+          ], { padding: 40, duration: 1000 });
+          console.log(`[zoom] auto-zoomed to chunk (${ci},${cj})`);
+        }
       } else {
         console.log(`[render] chunk (${ci},${cj}) → no valid pixels, skipped`);
       }
@@ -839,6 +850,7 @@
       chunkCache.clear();
       removeOverlays();
       totalLoaded = 0;
+      autoZoomNext = true;
       store = null;
 
       // Read metadata
