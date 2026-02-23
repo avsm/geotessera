@@ -538,10 +538,10 @@
   ];
 
   function findRasterInsertionPoint() {
-    // Insert raster chunks below overlay layers
-    for (const id of OVERLAY_LAYERS) {
-      if (map.getLayer(id)) return id;
-    }
+    // Insert raster chunks above fills but below grid lines and labels
+    if (map.getLayer('chunk-grid-lines')) return 'chunk-grid-lines';
+    if (map.getLayer('utm-zone-line')) return 'utm-zone-line';
+    if (map.getLayer('chunk-grid-labels')) return 'chunk-grid-labels';
     return findFirstLabelLayer();
   }
 
@@ -711,6 +711,9 @@
       let sourceId = null, layerId = null;
       if (canvas) {
         ({ sourceId, layerId } = addChunkToMap(ci, cj, canvas));
+        console.log(`[render] chunk (${ci},${cj}) → ${canvas.width}x${canvas.height}px, layer=${layerId}`);
+      } else {
+        console.log(`[render] chunk (${ci},${cj}) → no valid pixels, skipped`);
       }
 
       chunkCache.set(key, { embRaw, scalesRaw, canvas, sourceId, layerId });
@@ -735,6 +738,8 @@
     try {
       const visible = getVisibleChunkIndices();
       const visibleKeys = new Set(visible.map(([ci, cj]) => chunkKey(ci, cj)));
+      const bounds = map.getBounds();
+      console.log(`[viewport] zoom=${map.getZoom().toFixed(1)} bounds=[${bounds.getWest().toFixed(3)},${bounds.getSouth().toFixed(3)}]-[${bounds.getEast().toFixed(3)},${bounds.getNorth().toFixed(3)}] visible_chunks=${visible.length}`);
 
       // Remove off-screen chunks from map (keep in cache)
       for (const [key, entry] of chunkCache) {
@@ -773,6 +778,9 @@
       } catch { /* projection error, keep original order */ }
 
       // Load chunks with concurrency limit
+      if (toLoad.length > 0) {
+        console.log(`[fetch] loading ${toLoad.length} chunks: ${toLoad.map(([ci,cj]) => `(${ci},${cj})`).join(' ')}`);
+      }
       const CONCURRENCY = 3;
       for (let i = 0; i < toLoad.length; i += CONCURRENCY) {
         const batch = toLoad.slice(i, i + CONCURRENCY);
