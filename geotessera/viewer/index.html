@@ -221,10 +221,10 @@
   let opacity = 0.80;
   let loadingChunks = 0;
   let totalLoaded = 0;
-  let updatePending = false;
-  let updateQueued = false;
+  let loadGeneration = 0;      // incremented on each viewport update to cancel stale loads
 
   const MAX_CACHED = 50;
+  const MAX_LOAD_PER_UPDATE = 80;  // cap chunks loaded per viewport change
 
   // ─── DOM refs ──────────────────────────────────────────────────
   const $storeSelect = document.getElementById('store-select');
@@ -534,15 +534,14 @@
 
   const OVERLAY_LAYERS = [
     'chunk-grid-nodata', 'chunk-grid-data', 'chunk-grid-lines',
-    'utm-zone-fill', 'utm-zone-line', 'chunk-grid-labels',
+    'utm-zone-fill', 'utm-zone-line',
   ];
 
   function findRasterInsertionPoint() {
-    // Insert raster chunks above fills but below grid lines and labels
+    // Insert raster chunks above fills but below grid lines
     if (map.getLayer('chunk-grid-lines')) return 'chunk-grid-lines';
     if (map.getLayer('utm-zone-line')) return 'utm-zone-line';
-    if (map.getLayer('chunk-grid-labels')) return 'chunk-grid-labels';
-    return findFirstLabelLayer();
+    return undefined;  // add on top
   }
 
   function removeOverlays() {
@@ -663,26 +662,6 @@
       layout: { 'visibility': $toggleUtm.checked ? 'visible' : 'none' },
     }, labelLayer);
 
-    // Chunk index labels (visible at higher zoom)
-    map.addLayer({
-      id: 'chunk-grid-labels',
-      type: 'symbol',
-      source: 'chunk-grid',
-      filter: ['==', ['get', 'hasData'], true],
-      minzoom: 8,
-      layout: {
-        'text-field': ['get', 'label'],
-        'text-size': 10,
-        'text-font': ['Open Sans Regular'],
-        'visibility': gridVis,
-      },
-      paint: {
-        'text-color': '#00e5ff',
-        'text-opacity': 0.5,
-        'text-halo-color': '#000',
-        'text-halo-width': 1,
-      },
-    }, labelLayer);
   }
 
   // ─── Chunk loading ────────────────────────────────────────────
@@ -732,76 +711,78 @@
 
   async function updateVisibleChunks() {
     if (!store) return;
-    if (updatePending) { updateQueued = true; return; }
-    updatePending = true;
+    const gen = ++loadGeneration;  // cancel any in-flight loads
 
+    const visible = getVisibleChunkIndices();
+    const visibleKeys = new Set(visible.map(([ci, cj]) => chunkKey(ci, cj)));
+    const bounds = map.getBounds();
+    console.log(`[viewport] zoom=${map.getZoom().toFixed(1)} bounds=[${bounds.getWest().toFixed(3)},${bounds.getSouth().toFixed(3)}]-[${bounds.getEast().toFixed(3)},${bounds.getNorth().toFixed(3)}] visible_chunks=${visible.length}`);
+
+    // Remove off-screen chunks from map (keep in cache)
+    for (const [key, entry] of chunkCache) {
+      if (!visibleKeys.has(key) && entry.sourceId) {
+        removeChunkFromMap(key);
+      }
+    }
+
+    // Load new visible chunks (parallel, up to 3 at a time)
+    const toLoad = [];
+    for (const [ci, cj] of visible) {
+      const key = chunkKey(ci, cj);
+      const entry = chunkCache.get(key);
+
+      if (entry?.embRaw && entry.canvas && !entry.sourceId) {
+        // Already in cache, just re-add to map
+        const ids = addChunkToMap(ci, cj, entry.canvas);
+        entry.sourceId = ids.sourceId;
+        entry.layerId = ids.layerId;
+      } else if (!entry || (!entry.embRaw && entry.embRaw !== null)) {
+        toLoad.push([ci, cj]);
+      }
+    }
+
+    // Sort by distance from viewport center so nearest chunks render first
     try {
-      const visible = getVisibleChunkIndices();
-      const visibleKeys = new Set(visible.map(([ci, cj]) => chunkKey(ci, cj)));
-      const bounds = map.getBounds();
-      console.log(`[viewport] zoom=${map.getZoom().toFixed(1)} bounds=[${bounds.getWest().toFixed(3)},${bounds.getSouth().toFixed(3)}]-[${bounds.getEast().toFixed(3)},${bounds.getNorth().toFixed(3)}] visible_chunks=${visible.length}`);
+      const center = map.getCenter();
+      const [cE, cN] = projForward(center.lng, center.lat);
+      toLoad.sort((a, b) => {
+        const ba = getChunkUtmBounds(a[0], a[1]);
+        const bb = getChunkUtmBounds(b[0], b[1]);
+        const da = Math.hypot((ba.minE + ba.maxE) / 2 - cE, (ba.minN + ba.maxN) / 2 - cN);
+        const db = Math.hypot((bb.minE + bb.maxE) / 2 - cE, (bb.minN + bb.maxN) / 2 - cN);
+        return da - db;
+      });
+    } catch { /* projection error, keep original order */ }
 
-      // Remove off-screen chunks from map (keep in cache)
-      for (const [key, entry] of chunkCache) {
-        if (!visibleKeys.has(key) && entry.sourceId) {
-          removeChunkFromMap(key);
+    // Cap chunks to avoid loading thousands when zoomed out
+    if (toLoad.length > MAX_LOAD_PER_UPDATE) {
+      console.log(`[fetch] capping ${toLoad.length} → ${MAX_LOAD_PER_UPDATE} chunks (zoom in for full coverage)`);
+      setStatus(`Loading nearest ${MAX_LOAD_PER_UPDATE} of ${toLoad.length} chunks — zoom in`, 'text-yellow-400');
+      toLoad.length = MAX_LOAD_PER_UPDATE;
+    }
+
+    // Load chunks with concurrency limit, aborting if viewport changes
+    if (toLoad.length > 0) {
+      console.log(`[fetch] loading ${toLoad.length} chunks: ${toLoad.slice(0, 20).map(([ci,cj]) => `(${ci},${cj})`).join(' ')}${toLoad.length > 20 ? ' ...' : ''}`);
+    }
+    const CONCURRENCY = 4;
+    for (let i = 0; i < toLoad.length; i += CONCURRENCY) {
+      if (gen !== loadGeneration) {
+        console.log(`[fetch] cancelled: viewport changed (loaded ${i}/${toLoad.length})`);
+        break;
+      }
+      const batch = toLoad.slice(i, i + CONCURRENCY);
+      await Promise.all(batch.map(([ci, cj]) => loadChunk(ci, cj)));
+    }
+
+    // Evict oldest cache entries if over limit, but not visible ones
+    if (chunkCache.size > MAX_CACHED) {
+      const keys = [...chunkCache.keys()];
+      for (let i = 0; i < keys.length && chunkCache.size > MAX_CACHED; i++) {
+        if (!visibleKeys.has(keys[i])) {
+          removeChunkFromMap(keys[i]);
+          chunkCache.delete(keys[i]);
         }
-      }
-
-      // Load new visible chunks (parallel, up to 3 at a time)
-      const toLoad = [];
-      for (const [ci, cj] of visible) {
-        const key = chunkKey(ci, cj);
-        const entry = chunkCache.get(key);
-
-        if (entry?.embRaw && entry.canvas && !entry.sourceId) {
-          // Already in cache, just re-add to map
-          const ids = addChunkToMap(ci, cj, entry.canvas);
-          entry.sourceId = ids.sourceId;
-          entry.layerId = ids.layerId;
-        } else if (!entry || (!entry.embRaw && entry.embRaw !== null)) {
-          toLoad.push([ci, cj]);
-        }
-      }
-
-      // Sort by distance from viewport center so nearest chunks render first
-      try {
-        const center = map.getCenter();
-        const [cE, cN] = projForward(center.lng, center.lat);
-        toLoad.sort((a, b) => {
-          const ba = getChunkUtmBounds(a[0], a[1]);
-          const bb = getChunkUtmBounds(b[0], b[1]);
-          const da = Math.hypot((ba.minE + ba.maxE) / 2 - cE, (ba.minN + ba.maxN) / 2 - cN);
-          const db = Math.hypot((bb.minE + bb.maxE) / 2 - cE, (bb.minN + bb.maxN) / 2 - cN);
-          return da - db;
-        });
-      } catch { /* projection error, keep original order */ }
-
-      // Load chunks with concurrency limit
-      if (toLoad.length > 0) {
-        console.log(`[fetch] loading ${toLoad.length} chunks: ${toLoad.map(([ci,cj]) => `(${ci},${cj})`).join(' ')}`);
-      }
-      const CONCURRENCY = 3;
-      for (let i = 0; i < toLoad.length; i += CONCURRENCY) {
-        const batch = toLoad.slice(i, i + CONCURRENCY);
-        await Promise.all(batch.map(([ci, cj]) => loadChunk(ci, cj)));
-      }
-
-      // Evict oldest cache entries if over limit, but not visible ones
-      if (chunkCache.size > MAX_CACHED) {
-        const keys = [...chunkCache.keys()];
-        for (let i = 0; i < keys.length && chunkCache.size > MAX_CACHED; i++) {
-          if (!visibleKeys.has(keys[i])) {
-            removeChunkFromMap(keys[i]);
-            chunkCache.delete(keys[i]);
-          }
-        }
-      }
-    } finally {
-      updatePending = false;
-      if (updateQueued) {
-        updateQueued = false;
-        setTimeout(() => updateVisibleChunks(), 100);
       }
     }
   }
@@ -1010,7 +991,7 @@
     // Overlay toggles
     $toggleGrid.addEventListener('change', () => {
       const vis = $toggleGrid.checked ? 'visible' : 'none';
-      for (const id of ['chunk-grid-nodata', 'chunk-grid-data', 'chunk-grid-lines', 'chunk-grid-labels']) {
+      for (const id of ['chunk-grid-nodata', 'chunk-grid-data', 'chunk-grid-lines']) {
         if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', vis);
       }
     });
@@ -1045,7 +1026,7 @@
           minzoom: 0,
           maxzoom: 20,
         }],
-        glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf',
+        // No glyphs needed - basemap labels come from raster tiles
       },
       center: [10, 60],
       zoom: 4,
