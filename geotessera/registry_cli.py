@@ -2525,7 +2525,7 @@ def file_check_command(args):
 
 def zarr_build_command(args):
     """Build zone-wide Zarr stores from local tile data."""
-    from .zarr_zone import build_zone_stores, add_rgb_to_existing_store
+    from .zarr_zone import build_zone_stores, add_rgb_to_existing_store, add_pca_to_existing_store
     from .registry import Registry
 
     base_dir = args.base_dir
@@ -2583,6 +2583,56 @@ def zarr_build_command(args):
         console.print(f"\n[bold green]RGB preview added to {len(zarr_stores)} store(s)[/bold green]")
         return 0
 
+    # Handle --pca-only mode: add PCA to existing stores
+    if args.pca_only:
+        zarr_dir = Path(output_dir)
+        if not zarr_dir.is_dir():
+            console.print(f"[red]Error: directory not found: {zarr_dir}[/red]")
+            return 1
+
+        # Parse zone filter for --pca-only mode too
+        zone_filter = None
+        if args.zones:
+            try:
+                zone_filter = {int(z.strip()) for z in args.zones.split(",")}
+            except ValueError:
+                console.print("[red]Error: --zones must be comma-separated integers[/red]")
+                return 1
+
+        def _store_matches_pca(p):
+            """Check if a .zarr store name matches the zone filter."""
+            if zone_filter is None:
+                return True
+            try:
+                zone_num = int(p.name.split("_")[0].replace("utm", ""))
+                return zone_num in zone_filter
+            except (ValueError, IndexError):
+                return True
+
+        zarr_stores = sorted(
+            p for p in zarr_dir.iterdir()
+            if p.is_dir() and p.name.endswith(".zarr") and _store_matches_pca(p)
+        )
+
+        if not zarr_stores:
+            console.print(f"[yellow]No .zarr stores found in {zarr_dir}[/yellow]")
+            return 1
+
+        console.print(
+            f"[bold]Adding PCA preview to existing stores[/bold]\n"
+            f"  Directory: {zarr_dir}\n"
+            f"  Stores: {len(zarr_stores)}"
+        )
+        if zone_filter:
+            console.print(f"  Zones: {', '.join(str(z) for z in sorted(zone_filter))}")
+
+        for store_path in zarr_stores:
+            console.print(f"\n  [cyan]{store_path.name}[/cyan]")
+            add_pca_to_existing_store(store_path, workers=args.workers, console=console)
+
+        console.print(f"\n[bold green]PCA preview added to {len(zarr_stores)} store(s)[/bold green]")
+        return 0
+
     # Parse zone filter
     zone_list = None
     if args.zones:
@@ -2604,6 +2654,8 @@ def zarr_build_command(args):
         console.print("  [dim](dry run)[/dim]")
     if args.no_rgb:
         console.print("  [dim](skipping RGB preview)[/dim]")
+    if args.no_pca:
+        console.print("  [dim](skipping PCA preview)[/dim]")
 
     # Create registry pointing at local data
     registry = Registry(
@@ -2629,6 +2681,7 @@ def zarr_build_command(args):
         dataset_version=args.dataset_version,
         console=console,
         rgb=not args.no_rgb,
+        pca=not args.no_pca,
         workers=args.workers,
     )
 
@@ -2710,11 +2763,13 @@ def serve_command(args):
                 if (col_dir / "0").exists():
                     chunks.append([row, col])
         has_rgb = (store_path / "rgb" / "zarr.json").exists()
-        manifest_data = {"chunks": chunks, "has_rgb": has_rgb}
+        has_pca_rgb = (store_path / "pca_rgb" / "zarr.json").exists()
+        manifest_data = {"chunks": chunks, "has_rgb": has_rgb, "has_pca_rgb": has_pca_rgb}
         manifest_path = store_path / "_chunk_manifest.json"
         manifest_path.write_text(json.dumps(manifest_data))
         rgb_label = " [green]+rgb[/green]" if has_rgb else ""
-        console.print(f"  [dim]{store_name}: {len(chunks)} chunks indexed{rgb_label}[/dim]")
+        pca_label = " [green]+pca[/green]" if has_pca_rgb else ""
+        console.print(f"  [dim]{store_name}: {len(chunks)} chunks indexed{rgb_label}{pca_label}[/dim]")
 
     class CORSHandler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *a, **kw):
@@ -3067,6 +3122,17 @@ Directory Structure:
         "--rgb-only",
         action="store_true",
         help="Add RGB preview to existing stores without rebuilding "
+        "(scans existing .zarr stores in output dir)",
+    )
+    zarr_build_parser.add_argument(
+        "--no-pca",
+        action="store_true",
+        help="Skip PCA preview generation during build",
+    )
+    zarr_build_parser.add_argument(
+        "--pca-only",
+        action="store_true",
+        help="Add PCA preview to existing stores without rebuilding "
         "(scans existing .zarr stores in output dir)",
     )
     zarr_build_parser.set_defaults(func=zarr_build_command)

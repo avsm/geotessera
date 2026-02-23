@@ -151,6 +151,24 @@
       </div>
     </div>
 
+    <!-- Preview source toggle (PCA / RGB) -->
+    <div id="preview-panel" class="px-4 py-3 border-b border-gray-800/60 hidden">
+      <label class="text-gray-500 text-[10px] uppercase tracking-[0.15em]">Preview</label>
+      <div class="mt-2 flex gap-1.5">
+        <button id="preview-rgb-btn"
+                class="flex-1 text-[10px] font-bold tracking-wider py-1.5 rounded border transition-all
+                       bg-term-cyan/20 text-term-cyan border-term-cyan/40">
+          RGB
+        </button>
+        <button id="preview-pca-btn"
+                class="flex-1 text-[10px] font-bold tracking-wider py-1.5 rounded border transition-all
+                       bg-gray-950 text-gray-500 border-gray-700/60 hover:text-gray-300 hover:border-gray-500">
+          PCA
+        </button>
+      </div>
+      <div id="pca-info" class="mt-1.5 text-[10px] text-gray-600 hidden"></div>
+    </div>
+
     <!-- Overlays -->
     <div id="overlay-panel" class="px-4 py-3 border-b border-gray-800/60 opacity-40 pointer-events-none transition-opacity">
       <label class="text-gray-500 text-[10px] uppercase tracking-[0.15em]">Overlays</label>
@@ -431,6 +449,11 @@
   let rgbMeta = null;           // metadata for the rgb array
   const clickedChunks = new Set();  // chunk keys where user has clicked for full-band data
 
+  // PCA preview state
+  let hasPcaPreview = false;    // true if current store has a pca_rgb array
+  let pcaRgbMeta = null;        // metadata for the pca_rgb array
+  let previewSource = 'rgb';    // 'rgb' or 'pca_rgb'
+
   const MAX_CACHED = 50;
   const MAX_LOAD_PER_UPDATE = 80;  // cap chunks loaded per viewport change
 
@@ -463,6 +486,10 @@
   const $toggleUtm        = document.getElementById('toggle-utm');
   const $progressBar      = document.getElementById('progress-bar');
   const $progressFill     = document.getElementById('progress-fill');
+  const $previewPanel     = document.getElementById('preview-panel');
+  const $previewRgbBtn    = document.getElementById('preview-rgb-btn');
+  const $previewPcaBtn    = document.getElementById('preview-pca-btn');
+  const $pcaInfo          = document.getElementById('pca-info');
 
   // ─── Progress tracker ─────────────────────────────────────────
 
@@ -889,10 +916,13 @@
     if (chunkCache.has(key)) return;  // already loaded (preview or full)
 
     loadingChunks++;
-    showChunkLoading(`Preview (${ci}, ${cj})...`);
+    const srcLabel = previewSource === 'pca_rgb' ? 'PCA' : 'RGB';
+    showChunkLoading(`${srcLabel} (${ci}, ${cj})...`);
 
     try {
-      const compRgb = await fetchCompressedChunk(store.url, 'rgb', [ci, cj, 0], signal);
+      const arrayName = previewSource;  // 'rgb' or 'pca_rgb'
+      const meta = previewSource === 'pca_rgb' ? pcaRgbMeta : rgbMeta;
+      const compRgb = await fetchCompressedChunk(store.url, arrayName, [ci, cj, 0], signal);
       if (!compRgb) {
         chunkCache.set(key, { embRaw: null, scalesRaw: null, canvas: null, sourceId: null, layerId: null, isPreview: true });
         return;
@@ -906,7 +936,7 @@
         type: 'decompress-and-render-rgb',
         compressedRgb: compRgb.buffer,
         width: w, height: h,
-        strideCol: rgbMeta.chunkShape[1],
+        strideCol: meta.chunkShape[1],
       }, [compRgb.buffer]);
 
       let canvas = null, sourceId = null, layerId = null;
@@ -1056,10 +1086,12 @@
     }
 
     // Load chunks with concurrency limit, aborting if viewport changes
-    // Route to preview or full depending on RGB availability
+    // Route to preview or full depending on preview availability
+    const usePreview = (previewSource === 'pca_rgb' && hasPcaPreview) || (previewSource === 'rgb' && hasRgbPreview);
+    const previewLabel = usePreview ? `${previewSource} preview` : 'full';
     progressTracker.start(toLoad.length);
     if (toLoad.length > 0) {
-      console.log(`[fetch] loading ${toLoad.length} chunks (${hasRgbPreview ? 'rgb preview' : 'full'}): ${toLoad.slice(0, 20).map(([ci,cj]) => `(${ci},${cj})`).join(' ')}${toLoad.length > 20 ? ' ...' : ''}`);
+      console.log(`[fetch] loading ${toLoad.length} chunks (${previewLabel}): ${toLoad.slice(0, 20).map(([ci,cj]) => `(${ci},${cj})`).join(' ')}${toLoad.length > 20 ? ' ...' : ''}`);
     }
     const CONCURRENCY = 4;
     for (let i = 0; i < toLoad.length; i += CONCURRENCY) {
@@ -1069,7 +1101,7 @@
       }
       const batch = toLoad.slice(i, i + CONCURRENCY);
       await Promise.all(batch.map(([ci, cj]) => {
-        if (hasRgbPreview && !clickedChunks.has(chunkKey(ci, cj))) {
+        if (usePreview && !clickedChunks.has(chunkKey(ci, cj))) {
           return loadPreviewChunk(ci, cj, signal);
         }
         return loadChunk(ci, cj, signal);
@@ -1172,6 +1204,9 @@
       store = null;
       hasRgbPreview = false;
       rgbMeta = null;
+      hasPcaPreview = false;
+      pcaRgbMeta = null;
+      previewSource = 'rgb';
       clickedChunks.clear();
 
       // Read metadata
@@ -1198,6 +1233,16 @@
         rgbMeta = null;
       }
 
+      // Try to detect PCA RGB preview array
+      try {
+        pcaRgbMeta = await readArrayMeta(url, 'pca_rgb');
+        hasPcaPreview = true;
+        setStatus('PCA preview detected', 'text-term-cyan');
+      } catch {
+        hasPcaPreview = false;
+        pcaRgbMeta = null;
+      }
+
       // Load chunk manifest (generated by serve command) to avoid 404s on sparse stores
       let chunkManifest = null;
       try {
@@ -1211,6 +1256,13 @@
           hasRgbPreview = manifestData.has_rgb;
           if (hasRgbPreview && !rgbMeta) {
             try { rgbMeta = await readArrayMeta(url, 'rgb'); } catch { hasRgbPreview = false; }
+          }
+        }
+        // Also check manifest for has_pca_rgb
+        if (manifestData?.has_pca_rgb !== undefined) {
+          hasPcaPreview = manifestData.has_pca_rgb;
+          if (hasPcaPreview && !pcaRgbMeta) {
+            try { pcaRgbMeta = await readArrayMeta(url, 'pca_rgb'); } catch { hasPcaPreview = false; }
           }
         }
       } catch {
@@ -1246,6 +1298,27 @@
       $opacityPanel.classList.remove('opacity-40', 'pointer-events-none');
       $overlayPanel.classList.remove('opacity-40', 'pointer-events-none');
 
+      // Show preview toggle if both RGB and PCA are available
+      if (hasRgbPreview && hasPcaPreview) {
+        $previewPanel.classList.remove('hidden');
+        // Default to PCA if available
+        previewSource = 'pca_rgb';
+        updatePreviewButtons();
+        // Show PCA explained variance if available
+        if (groupMeta.pca_explained_variance) {
+          const evr = groupMeta.pca_explained_variance;
+          $pcaInfo.textContent = `Variance: ${(evr[0]*100).toFixed(0)}% + ${(evr[1]*100).toFixed(0)}% + ${(evr[2]*100).toFixed(0)}%`;
+          $pcaInfo.classList.remove('hidden');
+        }
+      } else if (hasPcaPreview && !hasRgbPreview) {
+        // Only PCA available — use it as sole preview
+        previewSource = 'pca_rgb';
+        $previewPanel.classList.add('hidden');
+      } else {
+        previewSource = 'rgb';
+        $previewPanel.classList.add('hidden');
+      }
+
       // Add overlays (chunk grid + UTM zone boundary)
       addOverlays();
 
@@ -1272,7 +1345,8 @@
       ], { padding: 40, duration: 1500 });
 
       const rgbLabel = hasRgbPreview ? ' +rgb' : '';
-      setStatus(`Loaded: zone ${utmZone}${rgbLabel}`, 'text-term-green');
+      const pcaLabel = hasPcaPreview ? ' +pca' : '';
+      setStatus(`Loaded: zone ${utmZone}${rgbLabel}${pcaLabel}`, 'text-term-green');
 
       // Start loading visible chunks after fly animation
       setTimeout(() => updateVisibleChunks(), 1800);
@@ -1302,18 +1376,47 @@
     $chunkLoading.classList.add('hidden');
   }
 
+  function updatePreviewButtons() {
+    if (previewSource === 'pca_rgb') {
+      $previewPcaBtn.className = 'flex-1 text-[10px] font-bold tracking-wider py-1.5 rounded border transition-all bg-term-cyan/20 text-term-cyan border-term-cyan/40';
+      $previewRgbBtn.className = 'flex-1 text-[10px] font-bold tracking-wider py-1.5 rounded border transition-all bg-gray-950 text-gray-500 border-gray-700/60 hover:text-gray-300 hover:border-gray-500';
+    } else {
+      $previewRgbBtn.className = 'flex-1 text-[10px] font-bold tracking-wider py-1.5 rounded border transition-all bg-term-cyan/20 text-term-cyan border-term-cyan/40';
+      $previewPcaBtn.className = 'flex-1 text-[10px] font-bold tracking-wider py-1.5 rounded border transition-all bg-gray-950 text-gray-500 border-gray-700/60 hover:text-gray-300 hover:border-gray-500';
+    }
+  }
+
+  function switchPreviewSource(source) {
+    if (source === previewSource) return;
+    previewSource = source;
+    updatePreviewButtons();
+    // Clear all preview chunks from cache so they reload from the new array
+    for (const [key, entry] of chunkCache) {
+      if (entry.isPreview) {
+        removeChunkFromMap(key);
+        chunkCache.delete(key);
+      }
+    }
+    totalLoaded = clickedChunks.size;  // keep count of full-band chunks
+    updateVisibleChunks();
+  }
+
   function updateInfoPanel() {
     if (!store) return;
     const nChunksRow = Math.ceil(store.shape[0] / store.chunkShape[0]);
     const nChunksCol = Math.ceil(store.shape[1] / store.chunkShape[1]);
     const total = nChunksRow * nChunksCol;
-    if (hasRgbPreview) {
+    const usePreview = (previewSource === 'pca_rgb' && hasPcaPreview) || (previewSource === 'rgb' && hasRgbPreview);
+    if (usePreview) {
       $infoChunks.textContent = `${totalLoaded} / ${total} (${clickedChunks.size} inspected)`;
     } else {
       $infoChunks.textContent = `${totalLoaded} / ${total}`;
     }
     let statusText = loadingChunks > 0 ? `loading ${loadingChunks}...` : 'idle';
-    if (hasRgbPreview && loadingChunks === 0) statusText = 'rgb preview — click to inspect';
+    if (usePreview && loadingChunks === 0) {
+      const srcName = previewSource === 'pca_rgb' ? 'pca' : 'rgb';
+      statusText = `${srcName} preview — click to inspect`;
+    }
     $infoStatus.textContent = statusText;
   }
 
@@ -1349,6 +1452,10 @@
       $opacityVal.textContent = opacity.toFixed(2);
       updateAllOpacity();
     });
+
+    // Preview source toggle (RGB / PCA)
+    $previewRgbBtn.addEventListener('click', () => switchPreviewSource('rgb'));
+    $previewPcaBtn.addEventListener('click', () => switchPreviewSource('pca_rgb'));
 
     // Overlay toggles
     $toggleGrid.addEventListener('change', () => {

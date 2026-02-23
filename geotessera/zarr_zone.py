@@ -457,6 +457,7 @@ def create_zone_store(
     geotessera_version: str = "unknown",
     dataset_version: str = "v1",
     include_rgb: bool = False,
+    include_pca: bool = False,
 ) -> "zarr.Group":
     """Create a new Zarr store for a UTM zone.
 
@@ -466,6 +467,7 @@ def create_zone_store(
         geotessera_version: Version of geotessera
         dataset_version: Tessera dataset version
         include_rgb: If True, create an additional RGB preview array
+        include_pca: If True, create a PCA RGB preview array
 
     Returns:
         zarr.Group root of the created store
@@ -511,6 +513,18 @@ def create_zone_store(
     if include_rgb:
         store.create_array(
             "rgb",
+            shape=(zone_grid.height_px, zone_grid.width_px, 4),
+            chunks=(1024, 1024, 4),
+            dtype=np.uint8,
+            fill_value=np.uint8(0),
+            compressors=zstd,
+            dimension_names=["northing", "easting", "rgba"],
+        )
+
+    # Create PCA RGB preview array if requested
+    if include_pca:
+        store.create_array(
+            "pca_rgb",
             shape=(zone_grid.height_px, zone_grid.width_px, 4),
             chunks=(1024, 1024, 4),
             dtype=np.uint8,
@@ -1037,6 +1051,7 @@ def build_zone_stores(
     dataset_version: str = "v1",
     console: Optional["rich.console.Console"] = None,
     rgb: bool = True,
+    pca: bool = True,
     workers: Optional[int] = None,
 ) -> List[Path]:
     """Build zone-wide Zarr stores from local tile data.
@@ -1055,6 +1070,7 @@ def build_zone_stores(
         dataset_version: Tessera dataset version
         console: Optional Rich Console for progress display
         rgb: If True, generate RGB preview arrays (default: True)
+        pca: If True, generate PCA RGB preview arrays (default: True)
         workers: Number of threads for parallel I/O (default: cpu_count, max 16)
 
     Returns:
@@ -1129,6 +1145,7 @@ def build_zone_stores(
             geotessera_version=geotessera_version,
             dataset_version=dataset_version,
             include_rgb=rgb,
+            include_pca=pca,
         )
 
         # Write tiles in parallel (each tile writes to a non-overlapping
@@ -1209,6 +1226,30 @@ def build_zone_stores(
             })
             if console is not None:
                 console.print(f"  [green]RGB preview: {written} chunks written[/green]")
+
+        # PCA preview pass: compute PCA basis from all bands, then write PCA preview
+        if pca:
+            pca_basis = compute_pca_basis(store, workers=workers, console=console)
+            if console is not None:
+                evr = pca_basis["explained_variance_ratio"]
+                console.print(
+                    f"  PCA explained variance: "
+                    f"[{evr[0]:.1%}, {evr[1]:.1%}, {evr[2]:.1%}] "
+                    f"(total {evr.sum():.1%})"
+                )
+            pca_written = write_pca_pass(store, pca_basis, workers=workers, console=console)
+            store.attrs.update({
+                "has_pca_preview": True,
+                "pca_explained_variance": pca_basis["explained_variance_ratio"].tolist(),
+                "pca_components": pca_basis["components"].tolist(),
+                "pca_mean": pca_basis["mean"].tolist(),
+                "pca_stretch": {
+                    "min": pca_basis["p_low"].tolist(),
+                    "max": pca_basis["p_high"].tolist(),
+                },
+            })
+            if console is not None:
+                console.print(f"  [green]PCA preview: {pca_written} chunks written[/green]")
 
         store_path = output_dir / store_name
         created_stores.append(store_path)
@@ -1454,6 +1495,435 @@ def add_rgb_to_existing_store(
 
     if console is not None:
         console.print(f"  [green]RGB preview: {written} chunks written[/green]")
+
+
+# =============================================================================
+# PCA preview pass
+# =============================================================================
+
+
+def _sample_chunk_pca_stats(
+    emb_arr,
+    scales_arr,
+    ci: int,
+    cj: int,
+    chunk_h: int,
+    chunk_w: int,
+    emb_shape: tuple,
+    max_per_chunk: int = 5000,
+) -> Optional[np.ndarray]:
+    """Read one chunk and return subsampled dequantised values for ALL bands.
+
+    Like ``_sample_chunk_stats`` but reads all 128 bands for PCA.
+
+    Returns:
+        (N, 128) float32 array of dequantised samples, or None if chunk empty.
+    """
+    r0 = ci * chunk_h
+    r1 = min(r0 + chunk_h, emb_shape[0])
+    c0 = cj * chunk_w
+    c1 = min(c0 + chunk_w, emb_shape[1])
+
+    scales_chunk = np.asarray(scales_arr[r0:r1, c0:c1])
+    valid = ~np.isnan(scales_chunk) & (scales_chunk != 0)
+    if not np.any(valid):
+        return None
+
+    emb_chunk = np.asarray(emb_arr[r0:r1, c0:c1, :])
+
+    scales_valid = scales_chunk[valid]
+    all_valid = emb_chunk[valid].astype(np.float32) * scales_valid[:, np.newaxis]
+
+    if all_valid.shape[0] > max_per_chunk:
+        rng = np.random.default_rng(ci * 10007 + cj)
+        idx = rng.choice(all_valid.shape[0], max_per_chunk, replace=False)
+        all_valid = all_valid[idx]
+
+    return all_valid
+
+
+def compute_pca_basis(
+    store: "zarr.Group",
+    n_components: int = 3,
+    max_per_chunk: int = 5000,
+    workers: int = 8,
+    console: Optional["rich.console.Console"] = None,
+) -> dict:
+    """Compute PCA basis from an existing store using parallel reads.
+
+    Two phases:
+    1. Parallel subsampled reads of all 128 bands (dequantised)
+    2. SVD on centred data to get principal components
+
+    Args:
+        store: Zarr group with embeddings and scales arrays
+        n_components: Number of PCA components (default 3 for RGB)
+        max_per_chunk: Max pixels to sample per chunk
+        workers: Number of threads
+        console: Optional Rich Console for progress
+
+    Returns:
+        Dict with 'components' (3, 128), 'mean' (128,),
+        'p_low' (3,), 'p_high' (3,), 'explained_variance_ratio' (3,)
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    emb_arr = store["embeddings"]
+    scales_arr = store["scales"]
+    emb_shape = emb_arr.shape
+    chunk_h, chunk_w = emb_arr.chunks[:2]
+    n_rows = math.ceil(emb_shape[0] / chunk_h)
+    n_cols = math.ceil(emb_shape[1] / chunk_w)
+    total_chunks = n_rows * n_cols
+
+    samples = []
+
+    if console is not None:
+        from rich.progress import (
+            Progress, SpinnerColumn, BarColumn, TextColumn,
+            MofNCompleteColumn, TimeElapsedColumn,
+        )
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task(
+                f"Sampling for PCA ({workers} threads)", total=total_chunks,
+            )
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(
+                        _sample_chunk_pca_stats,
+                        emb_arr, scales_arr, ci, cj,
+                        chunk_h, chunk_w, emb_shape,
+                        max_per_chunk,
+                    ): (ci, cj)
+                    for ci in range(n_rows)
+                    for cj in range(n_cols)
+                }
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result is not None:
+                        samples.append(result)
+                    progress.advance(task)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    _sample_chunk_pca_stats,
+                    emb_arr, scales_arr, ci, cj,
+                    chunk_h, chunk_w, emb_shape,
+                    max_per_chunk,
+                ): (ci, cj)
+                for ci in range(n_rows)
+                for cj in range(n_cols)
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                if result is not None:
+                    samples.append(result)
+
+    if not samples:
+        # Return identity-like basis as fallback
+        components = np.eye(n_components, N_BANDS, dtype=np.float32)
+        return {
+            "components": components,
+            "mean": np.zeros(N_BANDS, dtype=np.float32),
+            "p_low": np.zeros(n_components, dtype=np.float32),
+            "p_high": np.ones(n_components, dtype=np.float32),
+            "explained_variance_ratio": np.zeros(n_components, dtype=np.float32),
+        }
+
+    all_data = np.concatenate(samples, axis=0)  # (N, 128)
+    n_samples = all_data.shape[0]
+    if console is not None:
+        console.print(f"  PCA: {n_samples} samples collected, computing SVD...")
+
+    # Centre the data
+    mean = all_data.mean(axis=0)  # (128,)
+    centred = all_data - mean  # (N, 128)
+
+    # SVD on centred data: centred = U @ diag(S) @ Vt
+    # Components are the first n_components rows of Vt
+    # Use full_matrices=False for efficiency
+    U, S, Vt = np.linalg.svd(centred, full_matrices=False)
+    components = Vt[:n_components].astype(np.float32)  # (3, 128)
+
+    # Explained variance ratio
+    total_var = np.sum(S ** 2)
+    explained = (S[:n_components] ** 2) / total_var if total_var > 0 else np.zeros(n_components)
+    explained = explained.astype(np.float32)
+
+    # Project all samples to get stretch percentiles
+    projected = centred @ components.T  # (N, 3)
+    p_low = np.percentile(projected, 2, axis=0).astype(np.float32)  # (3,)
+    p_high = np.percentile(projected, 98, axis=0).astype(np.float32)  # (3,)
+
+    # Ensure non-zero range
+    for i in range(n_components):
+        if p_high[i] <= p_low[i]:
+            p_high[i] = p_low[i] + 1.0
+
+    return {
+        "components": components,
+        "mean": mean.astype(np.float32),
+        "p_low": p_low,
+        "p_high": p_high,
+        "explained_variance_ratio": explained,
+    }
+
+
+def compute_pca_chunk(
+    embedding_int8: np.ndarray,
+    scales: np.ndarray,
+    pca_basis: dict,
+) -> np.ndarray:
+    """Compute an RGBA uint8 PCA preview from embedding + scales.
+
+    Args:
+        embedding_int8: int8 array (H, W, 128)
+        scales: float32 array (H, W)
+        pca_basis: Dict with 'components', 'mean', 'p_low', 'p_high'
+
+    Returns:
+        uint8 RGBA array of shape (H, W, 4)
+    """
+    h, w = scales.shape[:2]
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+
+    valid = ~np.isnan(scales) & (scales != 0)
+    n_valid = np.count_nonzero(valid)
+    if n_valid == 0:
+        return rgba
+
+    components = pca_basis["components"]  # (3, 128)
+    mean = pca_basis["mean"]              # (128,)
+    p_low = pca_basis["p_low"]            # (3,)
+    p_high = pca_basis["p_high"]          # (3,)
+
+    # Dequantise valid pixels
+    scales_safe = np.where(valid, scales, 0.0)
+    float_emb = embedding_int8.astype(np.float32) * scales_safe[:, :, np.newaxis]
+
+    # Reshape to (H*W, 128) for matrix multiply
+    flat = float_emb.reshape(-1, N_BANDS)
+    valid_flat = valid.ravel()
+
+    # Project: (H*W, 128) @ (128, 3) -> (H*W, 3)
+    projected = (flat - mean) @ components.T
+
+    # Stretch to [0, 1]
+    for i in range(3):
+        projected[:, i] = (projected[:, i] - p_low[i]) / (p_high[i] - p_low[i])
+
+    # Clip and scale to uint8
+    projected = np.clip(projected, 0, 1) * 255
+    rgb_flat = projected.astype(np.uint8)  # (H*W, 3)
+
+    # Write into RGBA
+    rgba_flat = rgba.reshape(-1, 4)
+    rgba_flat[:, 0] = rgb_flat[:, 0]
+    rgba_flat[:, 1] = rgb_flat[:, 1]
+    rgba_flat[:, 2] = rgb_flat[:, 2]
+
+    # Zero out invalid, set alpha
+    inv_flat = ~valid_flat
+    rgba_flat[inv_flat, 0] = 0
+    rgba_flat[inv_flat, 1] = 0
+    rgba_flat[inv_flat, 2] = 0
+    rgba_flat[:, 3] = np.where(valid_flat, 255, 0).astype(np.uint8)
+
+    return rgba
+
+
+def _process_pca_chunk(
+    emb_arr,
+    scales_arr,
+    pca_rgb_arr,
+    ci: int,
+    cj: int,
+    chunk_h: int,
+    chunk_w: int,
+    emb_shape: tuple,
+    pca_basis: dict,
+) -> bool:
+    """Read one chunk, compute PCA RGB, write to store. Runs in a thread.
+
+    Returns True if chunk had data and was written, False if skipped.
+    """
+    r0 = ci * chunk_h
+    r1 = min(r0 + chunk_h, emb_shape[0])
+    c0 = cj * chunk_w
+    c1 = min(c0 + chunk_w, emb_shape[1])
+
+    scales_chunk = np.asarray(scales_arr[r0:r1, c0:c1])
+    if np.all(np.isnan(scales_chunk) | (scales_chunk == 0)):
+        return False
+
+    emb_chunk = np.asarray(emb_arr[r0:r1, c0:c1, :])
+    rgba = compute_pca_chunk(emb_chunk, scales_chunk, pca_basis)
+    pca_rgb_arr[r0:r1, c0:c1, :] = rgba
+    return True
+
+
+def write_pca_pass(
+    store: "zarr.Group",
+    pca_basis: dict,
+    workers: int = 8,
+    console: Optional["rich.console.Console"] = None,
+) -> int:
+    """Write PCA preview data into an existing store's pca_rgb array.
+
+    Args:
+        store: Zarr group with embeddings, scales, and pca_rgb arrays
+        pca_basis: Dict from compute_pca_basis
+        workers: Number of threads (default 8)
+        console: Optional Rich Console for progress
+
+    Returns:
+        Number of chunks written
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    emb_arr = store["embeddings"]
+    scales_arr = store["scales"]
+    pca_rgb_arr = store["pca_rgb"]
+
+    emb_shape = emb_arr.shape
+    chunk_h, chunk_w = emb_arr.chunks[:2]
+    n_rows = math.ceil(emb_shape[0] / chunk_h)
+    n_cols = math.ceil(emb_shape[1] / chunk_w)
+    total_chunks = n_rows * n_cols
+
+    written = 0
+
+    if console is not None:
+        from rich.progress import (
+            Progress, SpinnerColumn, BarColumn, TextColumn,
+            MofNCompleteColumn, TimeElapsedColumn,
+        )
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task(
+                f"Writing PCA preview ({workers} threads)",
+                total=total_chunks,
+            )
+
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(
+                        _process_pca_chunk,
+                        emb_arr, scales_arr, pca_rgb_arr,
+                        ci, cj, chunk_h, chunk_w, emb_shape,
+                        pca_basis,
+                    ): (ci, cj)
+                    for ci in range(n_rows)
+                    for cj in range(n_cols)
+                }
+                for future in as_completed(futures):
+                    if future.result():
+                        written += 1
+                    progress.advance(task)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    _process_pca_chunk,
+                    emb_arr, scales_arr, pca_rgb_arr,
+                    ci, cj, chunk_h, chunk_w, emb_shape,
+                    pca_basis,
+                ): (ci, cj)
+                for ci in range(n_rows)
+                for cj in range(n_cols)
+            }
+            for future in as_completed(futures):
+                if future.result():
+                    written += 1
+
+    return written
+
+
+def add_pca_to_existing_store(
+    store_path: Path,
+    workers: Optional[int] = None,
+    console: Optional["rich.console.Console"] = None,
+) -> None:
+    """Add PCA RGB preview array to an existing Zarr store.
+
+    Two-pass process:
+    1. Parallel chunk reads to compute PCA basis (subsample + SVD)
+    2. Parallel PCA chunk writes
+
+    Args:
+        store_path: Path to existing .zarr directory
+        workers: Number of threads (default: cpu_count, max 16)
+        console: Optional Rich Console for progress
+    """
+    import zarr
+    from zarr.codecs import ZstdCodec
+
+    store = zarr.open_group(str(store_path), mode="r+")
+
+    # Create pca_rgb array if missing
+    try:
+        _ = store["pca_rgb"]
+    except KeyError:
+        zstd = ZstdCodec(level=3)
+        emb_shape = store["embeddings"].shape
+        store.create_array(
+            "pca_rgb",
+            shape=(emb_shape[0], emb_shape[1], 4),
+            chunks=(1024, 1024, 4),
+            dtype=np.uint8,
+            fill_value=np.uint8(0),
+            compressors=zstd,
+            dimension_names=["northing", "easting", "rgba"],
+        )
+
+    if workers is None:
+        workers = _default_workers()
+
+    if console is not None:
+        console.print(f"  Pass 1: Computing PCA basis ({workers} threads)...")
+
+    pca_basis = compute_pca_basis(store, workers=workers, console=console)
+    if console is not None:
+        evr = pca_basis["explained_variance_ratio"]
+        console.print(
+            f"  PCA explained variance: "
+            f"[{evr[0]:.1%}, {evr[1]:.1%}, {evr[2]:.1%}] "
+            f"(total {evr.sum():.1%})"
+        )
+        console.print(f"  Pass 2: Writing PCA preview...")
+
+    written = write_pca_pass(store, pca_basis, workers=workers, console=console)
+
+    # Update store attrs
+    store.attrs.update({
+        "has_pca_preview": True,
+        "pca_explained_variance": pca_basis["explained_variance_ratio"].tolist(),
+        "pca_components": pca_basis["components"].tolist(),
+        "pca_mean": pca_basis["mean"].tolist(),
+        "pca_stretch": {
+            "min": pca_basis["p_low"].tolist(),
+            "max": pca_basis["p_high"].tolist(),
+        },
+    })
+
+    if console is not None:
+        console.print(f"  [green]PCA preview: {written} chunks written[/green]")
 
 
 # =============================================================================
