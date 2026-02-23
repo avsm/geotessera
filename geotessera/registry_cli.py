@@ -2740,36 +2740,71 @@ def serve_command(args):
 
     # Generate chunk manifests so the viewer knows which chunks exist
     # (avoids 404s for sparse stores where not all grid positions have data)
+    # Uses the zarr library to open stores and read scales chunks to detect
+    # which shard/chunk positions contain valid data (non-NaN scales).
+    import math as _math
+    import numpy as _np
+
+    import zarr as _zarr
+    from geotessera.zarr_zone import _configure_zarr
+    _configure_zarr()
+
     for store_name in zarr_stores:
         store_path = Path(zarr_dir) / store_name
-        emb_chunks_dir = store_path / "embeddings" / "c"
-        if not emb_chunks_dir.is_dir():
+        try:
+            zgroup = _zarr.open_group(str(store_path), mode="r")
+        except Exception:
             continue
+        try:
+            scales_arr = zgroup["scales"]
+        except KeyError:
+            continue
+
+        shape = scales_arr.shape          # (H, W)
+        chunk_h, chunk_w = scales_arr.chunks[:2]  # shard or chunk shape
+        n_rows = _math.ceil(shape[0] / chunk_h)
+        n_cols = _math.ceil(shape[1] / chunk_w)
+
+        # Detect sharding from codecs metadata
+        emb_meta_path = store_path / "embeddings" / "zarr.json"
+        sharded = False
+        if emb_meta_path.exists():
+            import json as _json
+            emb_meta = _json.loads(emb_meta_path.read_text())
+            codecs = emb_meta.get("codecs", [])
+            sharded = any(
+                c.get("name") == "sharding_indexed" for c in codecs
+            )
+
         chunks = []
-        for row_dir in sorted(emb_chunks_dir.iterdir()):
-            if not row_dir.is_dir():
-                continue
-            try:
-                row = int(row_dir.name)
-            except ValueError:
-                continue
-            for col_dir in sorted(row_dir.iterdir()):
-                if not col_dir.is_dir():
-                    continue
+        for ci in range(n_rows):
+            r0 = ci * chunk_h
+            r1 = min(r0 + chunk_h, shape[0])
+            for cj in range(n_cols):
+                c0 = cj * chunk_w
+                c1 = min(c0 + chunk_w, shape[1])
+                # Read the scales chunk and check for valid data
                 try:
-                    col = int(col_dir.name)
-                except ValueError:
-                    continue
-                if (col_dir / "0").exists():
-                    chunks.append([row, col])
-        has_rgb = (store_path / "rgb" / "zarr.json").exists()
-        has_pca_rgb = (store_path / "pca_rgb" / "zarr.json").exists()
-        manifest_data = {"chunks": chunks, "has_rgb": has_rgb, "has_pca_rgb": has_pca_rgb}
+                    chunk_data = _np.asarray(scales_arr[r0:r1, c0:c1])
+                    if _np.any(~_np.isnan(chunk_data) & (chunk_data != 0)):
+                        chunks.append([ci, cj])
+                except Exception:
+                    pass
+
+        has_rgb = "rgb" in zgroup
+        has_pca_rgb = "pca_rgb" in zgroup
+        manifest_data = {
+            "chunks": chunks,
+            "has_rgb": has_rgb,
+            "has_pca_rgb": has_pca_rgb,
+            "sharded": sharded,
+        }
         manifest_path = store_path / "_chunk_manifest.json"
         manifest_path.write_text(json.dumps(manifest_data))
+        shard_label = " [dim]sharded[/dim]" if sharded else ""
         rgb_label = " [green]+rgb[/green]" if has_rgb else ""
         pca_label = " [green]+pca[/green]" if has_pca_rgb else ""
-        console.print(f"  [dim]{store_name}: {len(chunks)} chunks indexed{rgb_label}{pca_label}[/dim]")
+        console.print(f"  [dim]{store_name}: {len(chunks)} chunks indexed{shard_label}{rgb_label}{pca_label}[/dim]")
 
     class CORSHandler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *a, **kw):

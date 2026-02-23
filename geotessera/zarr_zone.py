@@ -4,12 +4,14 @@ This module provides tools for building and reading Zarr v3 stores that
 consolidate all tiles within a UTM zone into a single store per year.
 This enables efficient spatial subsetting and cloud-native access.
 
-Store layout:
+Store layout (sharded, uncompressed):
     utm{zone:02d}_{year}.zarr/
-        embeddings    # int8    (northing, easting, band)  chunks=(1024, 1024, 128)
-        scales        # float32 (northing, easting)        chunks=(1024, 1024)
+        embeddings    # int8    (northing, easting, band)  shards=(4096, 4096, 128) chunks=(256, 256, 128)
+        scales        # float32 (northing, easting)        shards=(4096, 4096)      chunks=(256, 256)
 
 NaN in scales indicates no-data (water or no coverage).
+Embeddings are high-entropy quantised values; compression gives negligible
+benefit so we store uncompressed and rely on sharding to reduce file count.
 """
 
 import logging
@@ -25,6 +27,19 @@ logger = logging.getLogger(__name__)
 
 # Number of embedding bands in Tessera
 N_BANDS = 128
+
+# Zarr async concurrency — higher values improve throughput for sharded
+# stores where many inner chunks are fetched per shard read.
+_zarr_configured = False
+
+def _configure_zarr():
+    """Set zarr global config on first use (idempotent)."""
+    global _zarr_configured
+    if _zarr_configured:
+        return
+    import zarr
+    zarr.config.set({"async.concurrency": 128})
+    _zarr_configured = True
 
 # Bands used for the RGB preview array (indices into the 128-band embedding)
 RGB_PREVIEW_BANDS = (0, 1, 2)
@@ -474,9 +489,7 @@ def create_zone_store(
         zarr.Group root of the created store
     """
     import zarr
-    from zarr.codecs import ZstdCodec
-
-    zstd = ZstdCodec(level=3)
+    _configure_zarr()
 
     store_path = output_dir / _store_name(zone_grid.zone, zone_grid.year)
 
@@ -488,14 +501,19 @@ def create_zone_store(
 
     store = zarr.open_group(store_path, mode="w", zarr_format=3)
 
+    # Sharded, uncompressed arrays.  Embeddings are high-entropy quantised
+    # int8 values where zstd gives negligible benefit; we disable compression
+    # for all arrays and use sharding to keep the file count low.
+
     # Create embeddings array: int8 (northing, easting, band)
     store.create_array(
         "embeddings",
         shape=(zone_grid.height_px, zone_grid.width_px, N_BANDS),
-        chunks=(1024, 1024, N_BANDS),
+        shards=(4096, 4096, N_BANDS),
+        chunks=(256, 256, N_BANDS),
         dtype=np.int8,
         fill_value=np.int8(0),
-        compressors=zstd,
+        compressors=None,
         dimension_names=["northing", "easting", "band"],
     )
 
@@ -503,10 +521,11 @@ def create_zone_store(
     store.create_array(
         "scales",
         shape=(zone_grid.height_px, zone_grid.width_px),
-        chunks=(1024, 1024),
+        shards=(4096, 4096),
+        chunks=(256, 256),
         dtype=np.float32,
         fill_value=np.float32("nan"),
-        compressors=zstd,
+        compressors=None,
         dimension_names=["northing", "easting"],
     )
 
@@ -515,10 +534,11 @@ def create_zone_store(
         store.create_array(
             "rgb",
             shape=(zone_grid.height_px, zone_grid.width_px, 4),
-            chunks=(1024, 1024, 4),
+            shards=(4096, 4096, 4),
+            chunks=(256, 256, 4),
             dtype=np.uint8,
             fill_value=np.uint8(0),
-            compressors=zstd,
+            compressors=None,
             dimension_names=["northing", "easting", "rgba"],
         )
 
@@ -527,14 +547,15 @@ def create_zone_store(
         store.create_array(
             "pca_rgb",
             shape=(zone_grid.height_px, zone_grid.width_px, 4),
-            chunks=(1024, 1024, 4),
+            shards=(4096, 4096, 4),
+            chunks=(256, 256, 4),
             dtype=np.uint8,
             fill_value=np.uint8(0),
-            compressors=zstd,
+            compressors=None,
             dimension_names=["northing", "easting", "rgba"],
         )
 
-    # Create coordinate arrays
+    # Create coordinate arrays (small, no sharding needed)
     easting_coords = (
         zone_grid.origin_easting
         + (np.arange(zone_grid.width_px) + 0.5) * zone_grid.pixel_size
@@ -550,7 +571,7 @@ def create_zone_store(
         shape=(zone_grid.width_px,),
         dtype=np.float64,
         fill_value=0.0,
-        compressors=zstd,
+        compressors=None,
         dimension_names=["easting"],
     )
     store["easting"][:] = easting_coords
@@ -560,7 +581,7 @@ def create_zone_store(
         shape=(zone_grid.height_px,),
         dtype=np.float64,
         fill_value=0.0,
-        compressors=zstd,
+        compressors=None,
         dimension_names=["northing"],
     )
     store["northing"][:] = northing_coords
@@ -570,7 +591,7 @@ def create_zone_store(
         shape=(N_BANDS,),
         dtype=np.int32,
         fill_value=0,
-        compressors=zstd,
+        compressors=None,
         dimension_names=["band"],
     )
     store["band"][:] = band_coords
@@ -1517,7 +1538,7 @@ def add_rgb_to_existing_store(
         console: Optional Rich Console for progress
     """
     import zarr
-    from zarr.codecs import ZstdCodec
+    _configure_zarr()
 
     store = zarr.open_group(str(store_path), mode="r+")
 
@@ -1525,15 +1546,15 @@ def add_rgb_to_existing_store(
     try:
         _ = store["rgb"]
     except KeyError:
-        zstd = ZstdCodec(level=3)
         emb_shape = store["embeddings"].shape
         store.create_array(
             "rgb",
             shape=(emb_shape[0], emb_shape[1], 4),
-            chunks=(1024, 1024, 4),
+            shards=(4096, 4096, 4),
+            chunks=(256, 256, 4),
             dtype=np.uint8,
             fill_value=np.uint8(0),
-            compressors=zstd,
+            compressors=None,
             dimension_names=["northing", "easting", "rgba"],
         )
 
@@ -2017,7 +2038,7 @@ def add_pca_to_existing_store(
         console: Optional Rich Console for progress
     """
     import zarr
-    from zarr.codecs import ZstdCodec
+    _configure_zarr()
 
     store = zarr.open_group(str(store_path), mode="r+")
 
@@ -2025,15 +2046,15 @@ def add_pca_to_existing_store(
     try:
         _ = store["pca_rgb"]
     except KeyError:
-        zstd = ZstdCodec(level=3)
         emb_shape = store["embeddings"].shape
         store.create_array(
             "pca_rgb",
             shape=(emb_shape[0], emb_shape[1], 4),
-            chunks=(1024, 1024, 4),
+            shards=(4096, 4096, 4),
+            chunks=(256, 256, 4),
             dtype=np.uint8,
             fill_value=np.uint8(0),
-            compressors=zstd,
+            compressors=None,
             dimension_names=["northing", "easting", "rgba"],
         )
 
@@ -2107,6 +2128,7 @@ def read_region_from_zone(
         where embeddings is (H, W, 128) int8 and scales is (H, W) float32
     """
     import zarr
+    _configure_zarr()
 
     store = zarr.open_group(str(path), mode="r")
     attrs = dict(store.attrs)

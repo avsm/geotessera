@@ -221,50 +221,27 @@
   <!-- ============================================================ -->
   <script type="module">
 
-  // ─── WebWorker pool (fzstd loaded inside workers) ────────────────────────────────────────────
+  import * as zarr from "https://cdn.jsdelivr.net/npm/zarrita@0.4.0-next.18/+esm";
 
-  const FZSTD_CDN_PRIMARY   = 'https://cdn.jsdelivr.net/npm/fzstd@0.1.1/+esm';
-  const FZSTD_CDN_FALLBACK  = 'https://esm.sh/fzstd@0.1.1';
+  // ─── WebWorker pool (rendering only, no decompression) ─────────────────────────
 
   const workerCode = `
-    let fzstdDecompress = null;
-
-    self.onmessage = async function(e) {
+    self.onmessage = function(e) {
       const msg = e.data;
 
-      if (msg.type === 'init') {
-        // Load fzstd inside the worker via dynamic import
-        try {
-          const m = await import(msg.fzstdUrl);
-          fzstdDecompress = m.decompress || m.default?.decompress;
-        } catch {
-          try {
-            const m = await import(msg.fzstdFallback);
-            fzstdDecompress = m.decompress || m.default?.decompress;
-          } catch (err) {
-            self.postMessage({ type: 'error', error: 'Failed to load fzstd: ' + err.message });
-            return;
-          }
-        }
-        self.postMessage({ type: 'ready' });
-        return;
-      }
-
-      if (msg.type === 'decompress-and-render-rgb') {
-        const { compressedRgb, width, height, strideCol, id } = msg;
-        const rgbRaw = fzstdDecompress(new Uint8Array(compressedRgb));
+      if (msg.type === 'render-rgb') {
+        const { rgbData, width, height, id } = msg;
+        const src = new Uint8Array(rgbData);
         const rgba = new Uint8Array(width * height * 4);
         let nValid = 0;
-        for (let r = 0; r < height; r++) {
-          for (let c = 0; c < width; c++) {
-            const pi = (r * width + c) * 4;
-            const si = (r * strideCol + c) * 4;
-            rgba[pi]     = rgbRaw[si];
-            rgba[pi + 1] = rgbRaw[si + 1];
-            rgba[pi + 2] = rgbRaw[si + 2];
-            rgba[pi + 3] = rgbRaw[si + 3];
-            if (rgbRaw[si + 3] > 0) nValid++;
-          }
+        for (let i = 0; i < width * height; i++) {
+          const si = i * 4;
+          const pi = i * 4;
+          rgba[pi]     = src[si];
+          rgba[pi + 1] = src[si + 1];
+          rgba[pi + 2] = src[si + 2];
+          rgba[pi + 3] = src[si + 3];
+          if (src[si + 3] > 0) nValid++;
         }
         self.postMessage(
           { type: 'rgb-result', id, rgba: rgba.buffer, width, height, nValid },
@@ -273,27 +250,13 @@
         return;
       }
 
-      if (msg.type === 'decompress-and-render-emb') {
-        const { compressedEmb, compressedScales, width, height, strideCol, nBands, bands, id } = msg;
-        const embRaw = fzstdDecompress(new Uint8Array(compressedEmb));
-        const scalesRaw = fzstdDecompress(new Uint8Array(compressedScales));
-
-        // Render bands to RGBA
-        const result = renderBands(embRaw, scalesRaw, width, height, strideCol, nBands, bands);
-        self.postMessage(
-          { type: 'emb-result', id, rgba: result.rgba.buffer, width, height, nValid: result.nValid,
-            embRaw: embRaw.buffer, scalesRaw: scalesRaw.buffer },
-          [result.rgba.buffer, embRaw.buffer, scalesRaw.buffer]
-        );
-        return;
-      }
-
       if (msg.type === 'render-emb') {
-        // Re-render cached (already decompressed) data with new bands
-        const { embRaw, scalesRaw, width, height, strideCol, nBands, bands, id } = msg;
-        const embBytes = new Uint8Array(embRaw);
-        const scalesBytes = new Uint8Array(scalesRaw);
-        const result = renderBands(embBytes, scalesBytes, width, height, strideCol, nBands, bands);
+        const { embRaw, scalesRaw, width, height, nBands, bands, id } = msg;
+        const embBytes = new Int8Array(embRaw);
+        const scalesBuf = new ArrayBuffer(new Uint8Array(scalesRaw).byteLength);
+        new Uint8Array(scalesBuf).set(new Uint8Array(scalesRaw));
+        const scalesF32 = new Float32Array(scalesBuf);
+        const result = renderBands(embBytes, scalesF32, width, height, nBands, bands);
         self.postMessage(
           { type: 'emb-result', id, rgba: result.rgba.buffer, width, height, nValid: result.nValid,
             embRaw: embRaw, scalesRaw: scalesRaw },
@@ -303,29 +266,21 @@
       }
     };
 
-    function renderBands(embRaw, scalesRaw, w, h, strideCol, nBands, bands) {
-      const embInt8 = new Int8Array(embRaw.buffer, embRaw.byteOffset, embRaw.byteLength);
-      const scalesBuf = new ArrayBuffer(scalesRaw.byteLength);
-      new Uint8Array(scalesBuf).set(scalesRaw);
-      const scalesF32 = new Float32Array(scalesBuf);
-
+    function renderBands(embInt8, scalesF32, w, h, nBands, bands) {
       const [bR, bG, bB] = bands;
       let minR = 127, maxR = -128, minG = 127, maxG = -128, minB = 127, maxB = -128;
       let nValid = 0;
 
-      for (let r = 0; r < h; r++) {
-        for (let c = 0; c < w; c++) {
-          const si = r * strideCol + c;
-          if (isNaN(scalesF32[si]) || scalesF32[si] === 0) continue;
-          const base = (r * strideCol + c) * nBands;
-          const vr = embInt8[base + bR];
-          const vg = embInt8[base + bG];
-          const vb = embInt8[base + bB];
-          if (vr < minR) minR = vr; if (vr > maxR) maxR = vr;
-          if (vg < minG) minG = vg; if (vg > maxG) maxG = vg;
-          if (vb < minB) minB = vb; if (vb > maxB) maxB = vb;
-          nValid++;
-        }
+      for (let i = 0; i < w * h; i++) {
+        if (isNaN(scalesF32[i]) || scalesF32[i] === 0) continue;
+        const base = i * nBands;
+        const vr = embInt8[base + bR];
+        const vg = embInt8[base + bG];
+        const vb = embInt8[base + bB];
+        if (vr < minR) minR = vr; if (vr > maxR) maxR = vr;
+        if (vg < minG) minG = vg; if (vg > maxG) maxG = vg;
+        if (vb < minB) minB = vb; if (vb > maxB) maxB = vb;
+        nValid++;
       }
 
       const rgba = new Uint8Array(w * h * 4);
@@ -337,18 +292,15 @@
       const rangeG = maxG - minG || 1;
       const rangeB = maxB - minB || 1;
 
-      for (let r = 0; r < h; r++) {
-        for (let c = 0; c < w; c++) {
-          const pi = (r * w + c) * 4;
-          const si = r * strideCol + c;
-          const scale = scalesF32[si];
-          if (isNaN(scale) || scale === 0) { rgba[pi + 3] = 0; continue; }
-          const base = (r * strideCol + c) * nBands;
-          rgba[pi]     = Math.max(0, Math.min(255, ((embInt8[base + bR] - minR) / rangeR) * 255));
-          rgba[pi + 1] = Math.max(0, Math.min(255, ((embInt8[base + bG] - minG) / rangeG) * 255));
-          rgba[pi + 2] = Math.max(0, Math.min(255, ((embInt8[base + bB] - minB) / rangeB) * 255));
-          rgba[pi + 3] = 255;
-        }
+      for (let i = 0; i < w * h; i++) {
+        const pi = i * 4;
+        const scale = scalesF32[i];
+        if (isNaN(scale) || scale === 0) { rgba[pi + 3] = 0; continue; }
+        const base = i * nBands;
+        rgba[pi]     = Math.max(0, Math.min(255, ((embInt8[base + bR] - minR) / rangeR) * 255));
+        rgba[pi + 1] = Math.max(0, Math.min(255, ((embInt8[base + bG] - minG) / rangeG) * 255));
+        rgba[pi + 2] = Math.max(0, Math.min(255, ((embInt8[base + bB] - minB) / rangeB) * 255));
+        rgba[pi + 3] = 255;
       }
       return { rgba, nValid };
     }
@@ -365,26 +317,17 @@
       this.idle = [];          // indices of idle workers
       this.resolvers = new Map();  // msgId → { resolve }
       this.nextId = 0;
-      this.readyCount = 0;
-      this.readyPromise = new Promise(res => { this._readyResolve = res; });
 
       for (let i = 0; i < size; i++) {
-        const w = new Worker(workerUrl, { type: 'module' });
+        const w = new Worker(workerUrl);
         w.onmessage = (e) => this._onMessage(i, e);
-        w.postMessage({ type: 'init', fzstdUrl: FZSTD_CDN_PRIMARY, fzstdFallback: FZSTD_CDN_FALLBACK });
         this.workers.push(w);
+        this.idle.push(i);
       }
     }
 
     _onMessage(workerIdx, e) {
       const msg = e.data;
-      if (msg.type === 'ready') {
-        this.readyCount++;
-        this.idle.push(workerIdx);
-        if (this.readyCount === this.size) this._readyResolve();
-        this._drain();
-        return;
-      }
       if (msg.type === 'error') { console.error('[worker]', msg.error); return; }
       const resolver = this.resolvers.get(msg.id);
       if (resolver) {
@@ -406,8 +349,7 @@
       }
     }
 
-    async dispatch(msg, transfers = []) {
-      await this.readyPromise;
+    dispatch(msg, transfers = []) {
       return new Promise(resolve => {
         if (this.idle.length > 0) {
           const workerIdx = this.idle.shift();
@@ -435,7 +377,7 @@
 
   // ─── State ─────────────────────────────────────────────────────
   let map;
-  let store = null;           // { url, groupMeta, embMeta, scalesMeta, utmZone, epsg, transform, shape, chunkShape, chunkManifest }
+  let store = null;           // { url, groupMeta, embArr, scalesArr, rgbArr, pcaArr, utmZone, epsg, transform, shape, chunkShape, nBands, chunkManifest }
   const chunkCache = new Map();  // "ci_cj" -> { embRaw, scalesRaw, canvas, sourceId, layerId, isPreview }
   let bands = [0, 1, 2];
   let opacity = 0.80;
@@ -446,12 +388,10 @@
 
   // RGB preview state
   let hasRgbPreview = false;    // true if current store has an rgb array
-  let rgbMeta = null;           // metadata for the rgb array
   const clickedChunks = new Set();  // chunk keys where user has clicked for full-band data
 
   // PCA preview state
   let hasPcaPreview = false;    // true if current store has a pca_rgb array
-  let pcaRgbMeta = null;        // metadata for the pca_rgb array
   let previewSource = 'rgb';    // 'rgb' or 'pca_rgb'
 
   const MAX_CACHED = 50;
@@ -505,7 +445,7 @@
     },
   };
 
-  // ─── Zarr v3 reader ───────────────────────────────────────────
+  // ─── Zarr helpers (zarrita.js) ────────────────────────────────
 
   async function fetchJSON(url) {
     const resp = await fetch(url);
@@ -513,32 +453,12 @@
     return resp.json();
   }
 
-  async function fetchBytes(url, signal) {
-    const resp = await fetch(url, signal ? { signal } : undefined);
-    if (!resp.ok) return null;  // chunk might not exist
-    return new Uint8Array(await resp.arrayBuffer());
-  }
-
-  async function readStoreMeta(baseUrl) {
-    const meta = await fetchJSON(`${baseUrl}/zarr.json`);
-    return meta.attributes || {};
-  }
-
-  async function readArrayMeta(baseUrl, name) {
-    const meta = await fetchJSON(`${baseUrl}/${name}/zarr.json`);
-    const shape = meta.shape;
-    const chunkShape = meta.chunk_grid?.configuration?.chunk_shape;
-    // Find zstd in codecs
-    const hasZstd = (meta.codecs || []).some(c => c.name === 'zstd');
-    const dtype = typeof meta.data_type === 'string' ? meta.data_type : meta.data_type?.name;
-    const fillValue = meta.fill_value;
-    return { shape, chunkShape, hasZstd, dtype, fillValue };
-  }
-
-  async function fetchCompressedChunk(baseUrl, arrayName, indices, signal) {
-    const key = indices.join('/');
-    const url = `${baseUrl}/${arrayName}/c/${key}`;
-    return await fetchBytes(url, signal);
+  /** Fetch a region from a zarr array using zarrita.js get() with slicing. */
+  async function fetchRegion(arr, slices) {
+    const sel = slices.map(s =>
+      s === null ? null : Array.isArray(s) ? zarr.slice(s[0], s[1]) : s
+    );
+    return await zarr.get(arr, sel);
   }
 
   // ─── Projection ───────────────────────────────────────────────
@@ -844,35 +764,36 @@
     showChunkLoading(`Fetching chunk (${ci}, ${cj})...`);
 
     try {
-      // Fetch compressed embeddings and scales in parallel
-      const [compEmb, compScales] = await Promise.all([
-        fetchCompressedChunk(store.url, 'embeddings', [ci, cj, 0], signal),
-        fetchCompressedChunk(store.url, 'scales', [ci, cj], signal),
-      ]);
-
-      if (!compEmb || !compScales) {
-        chunkCache.set(key, { embRaw: null, scalesRaw: null, canvas: null, sourceId: null, layerId: null });
-        return;
-      }
-
       const { r0, r1, c0, c1 } = getChunkPixelBounds(ci, cj);
       const h = r1 - r0;
       const w = c1 - c0;
 
-      // Dispatch decompression + rendering to worker
-      const result = await workerPool.dispatch({
-        type: 'decompress-and-render-emb',
-        compressedEmb: compEmb.buffer,
-        compressedScales: compScales.buffer,
-        width: w, height: h,
-        strideCol: store.chunkShape[1],
-        nBands: store.chunkShape[2],
-        bands,
-      }, [compEmb.buffer, compScales.buffer]);
+      // Fetch embeddings and scales in parallel via zarrita
+      const [embView, scalesView] = await Promise.all([
+        fetchRegion(store.embArr, [[r0, r1], [c0, c1], null]),
+        fetchRegion(store.scalesArr, [[r0, r1], [c0, c1]]),
+      ]);
 
-      // Reconstruct Uint8Array views from transferred buffers
-      const embRaw = new Uint8Array(result.embRaw);
-      const scalesRaw = new Uint8Array(result.scalesRaw);
+      if (signal?.aborted) return;
+
+      const embRaw = new Int8Array(embView.data.buffer, embView.data.byteOffset, embView.data.byteLength);
+      const scalesRaw = new Float32Array(scalesView.data.buffer, scalesView.data.byteOffset, scalesView.data.byteLength);
+
+      // Dispatch rendering to worker
+      const embBuf = embRaw.slice().buffer;
+      const scalesBuf = new Uint8Array(scalesRaw.buffer, scalesRaw.byteOffset, scalesRaw.byteLength).slice().buffer;
+
+      const result = await workerPool.dispatch({
+        type: 'render-emb',
+        embRaw: embBuf,
+        scalesRaw: scalesBuf,
+        width: w, height: h,
+        nBands: store.nBands,
+        bands,
+      }, [embBuf, scalesBuf]);
+
+      const embResult = new Uint8Array(result.embRaw);
+      const scalesResult = new Uint8Array(result.scalesRaw);
 
       let canvas = null, sourceId = null, layerId = null;
       if (result.nValid > 0) {
@@ -895,7 +816,7 @@
         console.log(`[render] chunk (${ci},${cj}) → no valid pixels, skipped`);
       }
 
-      chunkCache.set(key, { embRaw, scalesRaw, canvas, sourceId, layerId });
+      chunkCache.set(key, { embRaw: embResult, scalesRaw: scalesResult, canvas, sourceId, layerId });
       totalLoaded++;
       updateInfoPanel();
     } catch (err) {
@@ -920,24 +841,21 @@
     showChunkLoading(`${srcLabel} (${ci}, ${cj})...`);
 
     try {
-      const arrayName = previewSource;  // 'rgb' or 'pca_rgb'
-      const meta = previewSource === 'pca_rgb' ? pcaRgbMeta : rgbMeta;
-      const compRgb = await fetchCompressedChunk(store.url, arrayName, [ci, cj, 0], signal);
-      if (!compRgb) {
-        chunkCache.set(key, { embRaw: null, scalesRaw: null, canvas: null, sourceId: null, layerId: null, isPreview: true });
-        return;
-      }
-
+      const previewArr = previewSource === 'pca_rgb' ? store.pcaArr : store.rgbArr;
       const { r0, r1, c0, c1 } = getChunkPixelBounds(ci, cj);
       const h = r1 - r0;
       const w = c1 - c0;
 
+      const rgbView = await fetchRegion(previewArr, [[r0, r1], [c0, c1], null]);
+      if (signal?.aborted) return;
+
+      const rgbData = new Uint8Array(rgbView.data.buffer, rgbView.data.byteOffset, rgbView.data.byteLength).slice().buffer;
+
       const result = await workerPool.dispatch({
-        type: 'decompress-and-render-rgb',
-        compressedRgb: compRgb.buffer,
+        type: 'render-rgb',
+        rgbData,
         width: w, height: h,
-        strideCol: meta.chunkShape[1],
-      }, [compRgb.buffer]);
+      }, [rgbData]);
 
       let canvas = null, sourceId = null, layerId = null;
       if (result.nValid > 0) {
@@ -980,29 +898,32 @@
     showChunkLoading(`Full bands (${ci}, ${cj})...`);
 
     try {
-      const [compEmb, compScales] = await Promise.all([
-        fetchCompressedChunk(store.url, 'embeddings', [ci, cj, 0], signal),
-        fetchCompressedChunk(store.url, 'scales', [ci, cj], signal),
-      ]);
-
-      if (!compEmb || !compScales) return;
-
-      // Remove old preview from map
-      if (existing?.sourceId) removeChunkFromMap(key);
-
       const { r0, r1, c0, c1 } = getChunkPixelBounds(ci, cj);
       const h = r1 - r0;
       const w = c1 - c0;
 
+      // Fetch embeddings and scales in parallel via zarrita
+      const [embView, scalesView] = await Promise.all([
+        fetchRegion(store.embArr, [[r0, r1], [c0, c1], null]),
+        fetchRegion(store.scalesArr, [[r0, r1], [c0, c1]]),
+      ]);
+
+      if (signal?.aborted) return;
+
+      // Remove old preview from map
+      if (existing?.sourceId) removeChunkFromMap(key);
+
+      const embBuf = new Int8Array(embView.data.buffer, embView.data.byteOffset, embView.data.byteLength).slice().buffer;
+      const scalesBuf = new Uint8Array(new Float32Array(scalesView.data.buffer, scalesView.data.byteOffset, scalesView.data.byteLength).buffer).slice().buffer;
+
       const result = await workerPool.dispatch({
-        type: 'decompress-and-render-emb',
-        compressedEmb: compEmb.buffer,
-        compressedScales: compScales.buffer,
+        type: 'render-emb',
+        embRaw: embBuf,
+        scalesRaw: scalesBuf,
         width: w, height: h,
-        strideCol: store.chunkShape[1],
-        nBands: store.chunkShape[2],
+        nBands: store.nBands,
         bands,
-      }, [compEmb.buffer, compScales.buffer]);
+      }, [embBuf, scalesBuf]);
 
       const embRaw = new Uint8Array(result.embRaw);
       const scalesRaw = new Uint8Array(result.scalesRaw);
@@ -1142,8 +1063,7 @@
         embRaw: embCopy,
         scalesRaw: scalesCopy,
         width: w, height: h,
-        strideCol: store.chunkShape[1],
-        nBands: store.chunkShape[2],
+        nBands: store.nBands,
         bands,
       }, [embCopy, scalesCopy]).then(result => {
         // Recover decompressed bytes (not transferred for render-emb since we made copies)
@@ -1203,44 +1123,46 @@
       autoZoomNext = true;
       store = null;
       hasRgbPreview = false;
-      rgbMeta = null;
       hasPcaPreview = false;
-      pcaRgbMeta = null;
       previewSource = 'rgb';
       clickedChunks.clear();
 
-      // Read metadata
+      // Open zarr store via zarrita.js
       setStatus('Reading metadata...', 'text-term-cyan');
-      const groupMeta = await readStoreMeta(url);
-      const embMeta = await readArrayMeta(url, 'embeddings');
-      const scalesMeta = await readArrayMeta(url, 'scales');
+      const fetchStore = new zarr.FetchStore(url);
+      const root = zarr.root(fetchStore);
+      const group = await zarr.open(root, { kind: "group" });
+      const groupMeta = group.attrs;
+
+      const embArr = await zarr.open(root.resolve("embeddings"), { kind: "array" });
+      const scalesArr = await zarr.open(root.resolve("scales"), { kind: "array" });
 
       const utmZone = groupMeta.utm_zone;
       const epsg = groupMeta.crs_epsg;
       const transform = groupMeta.transform;
 
-      if (!utmZone || !transform || !embMeta.shape) {
+      if (!utmZone || !transform || !embArr.shape) {
         throw new Error('Missing required store metadata (utm_zone, transform, shape)');
       }
 
       // Try to detect RGB preview array
+      let rgbArr = null;
       try {
-        rgbMeta = await readArrayMeta(url, 'rgb');
+        rgbArr = await zarr.open(root.resolve("rgb"), { kind: "array" });
         hasRgbPreview = true;
         setStatus('RGB preview detected', 'text-term-cyan');
       } catch {
         hasRgbPreview = false;
-        rgbMeta = null;
       }
 
       // Try to detect PCA RGB preview array
+      let pcaArr = null;
       try {
-        pcaRgbMeta = await readArrayMeta(url, 'pca_rgb');
+        pcaArr = await zarr.open(root.resolve("pca_rgb"), { kind: "array" });
         hasPcaPreview = true;
         setStatus('PCA preview detected', 'text-term-cyan');
       } catch {
         hasPcaPreview = false;
-        pcaRgbMeta = null;
       }
 
       // Load chunk manifest (generated by serve command) to avoid 404s on sparse stores
@@ -1254,15 +1176,15 @@
         // Also check manifest for has_rgb
         if (manifestData?.has_rgb !== undefined) {
           hasRgbPreview = manifestData.has_rgb;
-          if (hasRgbPreview && !rgbMeta) {
-            try { rgbMeta = await readArrayMeta(url, 'rgb'); } catch { hasRgbPreview = false; }
+          if (hasRgbPreview && !rgbArr) {
+            try { rgbArr = await zarr.open(root.resolve("rgb"), { kind: "array" }); } catch { hasRgbPreview = false; }
           }
         }
         // Also check manifest for has_pca_rgb
         if (manifestData?.has_pca_rgb !== undefined) {
           hasPcaPreview = manifestData.has_pca_rgb;
-          if (hasPcaPreview && !pcaRgbMeta) {
-            try { pcaRgbMeta = await readArrayMeta(url, 'pca_rgb'); } catch { hasPcaPreview = false; }
+          if (hasPcaPreview && !pcaArr) {
+            try { pcaArr = await zarr.open(root.resolve("pca_rgb"), { kind: "array" }); } catch { hasPcaPreview = false; }
           }
         }
       } catch {
@@ -1272,11 +1194,16 @@
       const isSouth = epsg >= 32700 && epsg <= 32760;
       setupProjection(utmZone, isSouth);
 
+      // Shard shape = embArr.chunks (zarrita reports the outer chunk_grid shape)
+      const chunkShape = embArr.chunks;
+      const nBands = embArr.shape[2] || 128;
+
       store = {
-        url, groupMeta, embMeta, scalesMeta,
+        url, groupMeta, embArr, scalesArr, rgbArr, pcaArr,
         utmZone, epsg, transform,
-        shape: embMeta.shape,
-        chunkShape: embMeta.chunkShape,
+        shape: embArr.shape,
+        chunkShape,
+        nBands,
         chunkManifest,
       };
 
