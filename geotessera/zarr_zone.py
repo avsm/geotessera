@@ -231,15 +231,20 @@ def compute_rgb_chunk(
 
     valid = ~np.isnan(scales) & (scales != 0)
 
+    scales_safe = np.where(valid, scales, 0.0)
+
     for i, band_idx in enumerate(band_indices):
         raw = embedding_int8[:, :, band_idx].astype(np.float32)
-        dequant = raw * scales
+        dequant = raw * scales_safe
         lo, hi = stretch_min[i], stretch_max[i]
         normalised = (dequant - lo) / (hi - lo)
-        channel = np.clip(normalised * 255, 0, 255).astype(np.uint8)
-        channel[~valid] = 0
-        rgba[:, :, i] = channel
+        rgba[:, :, i] = np.clip(normalised * 255, 0, 255).astype(np.uint8)
 
+    # Zero out RGB channels for invalid pixels, set alpha
+    inv = ~valid
+    rgba[inv, 0] = 0
+    rgba[inv, 1] = 0
+    rgba[inv, 2] = 0
     rgba[:, :, 3] = np.where(valid, 255, 0).astype(np.uint8)
     return rgba
 
@@ -1240,24 +1245,62 @@ def _write_single_tile(
 # =============================================================================
 
 
+def _process_rgb_chunk(
+    emb_arr,
+    scales_arr,
+    rgb_arr,
+    ci: int,
+    cj: int,
+    chunk_h: int,
+    chunk_w: int,
+    emb_shape: tuple,
+    stretch_min: List[float],
+    stretch_max: List[float],
+) -> bool:
+    """Read one chunk, compute RGB, write to store. Runs in a thread.
+
+    Returns True if chunk had data and was written, False if skipped.
+    """
+    r0 = ci * chunk_h
+    r1 = min(r0 + chunk_h, emb_shape[0])
+    c0 = cj * chunk_w
+    c1 = min(c0 + chunk_w, emb_shape[1])
+
+    scales_chunk = np.asarray(scales_arr[r0:r1, c0:c1])
+    if np.all(np.isnan(scales_chunk) | (scales_chunk == 0)):
+        return False
+
+    emb_chunk = np.asarray(emb_arr[r0:r1, c0:c1, :])
+    rgba = compute_rgb_chunk(
+        emb_chunk, scales_chunk,
+        RGB_PREVIEW_BANDS, stretch_min, stretch_max,
+    )
+    rgb_arr[r0:r1, c0:c1, :] = rgba
+    return True
+
+
 def write_rgb_pass(
     store: "zarr.Group",
     stretch: dict,
+    workers: int = 8,
     console: Optional["rich.console.Console"] = None,
 ) -> int:
     """Write RGB preview data into an existing store's rgb array.
 
-    Reads embeddings and scales chunk-by-chunk and writes computed RGBA
-    into the rgb array.
+    Reads embeddings and scales, computes RGBA, and writes to the rgb
+    array — all in parallel using threads (zarr I/O releases the GIL).
 
     Args:
         store: Zarr group with embeddings, scales, and rgb arrays
         stretch: Dict with 'min' and 'max' lists (3 floats each)
+        workers: Number of threads (default 8)
         console: Optional Rich Console for progress
 
     Returns:
         Number of chunks written
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     emb_arr = store["embeddings"]
     scales_arr = store["scales"]
     rgb_arr = store["rgb"]
@@ -1266,6 +1309,7 @@ def write_rgb_pass(
     chunk_h, chunk_w = emb_arr.chunks[:2]
     n_rows = math.ceil(emb_shape[0] / chunk_h)
     n_cols = math.ceil(emb_shape[1] / chunk_w)
+    total_chunks = n_rows * n_cols
 
     stretch_min = stretch["min"]
     stretch_max = stretch["max"]
@@ -1286,49 +1330,40 @@ def write_rgb_pass(
             console=console,
         ) as progress:
             task = progress.add_task(
-                "Writing RGB preview",
-                total=n_rows * n_cols,
+                f"Writing RGB preview ({workers} threads)",
+                total=total_chunks,
             )
 
-            for ci in range(n_rows):
-                for cj in range(n_cols):
-                    r0 = ci * chunk_h
-                    r1 = min(r0 + chunk_h, emb_shape[0])
-                    c0 = cj * chunk_w
-                    c1 = min(c0 + chunk_w, emb_shape[1])
-
-                    scales_chunk = np.asarray(scales_arr[r0:r1, c0:c1])
-                    if np.all(np.isnan(scales_chunk) | (scales_chunk == 0)):
-                        progress.advance(task)
-                        continue
-
-                    emb_chunk = np.asarray(emb_arr[r0:r1, c0:c1, :])
-                    rgba = compute_rgb_chunk(
-                        emb_chunk, scales_chunk,
-                        RGB_PREVIEW_BANDS, stretch_min, stretch_max,
-                    )
-                    rgb_arr[r0:r1, c0:c1, :] = rgba
-                    written += 1
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(
+                        _process_rgb_chunk,
+                        emb_arr, scales_arr, rgb_arr,
+                        ci, cj, chunk_h, chunk_w, emb_shape,
+                        stretch_min, stretch_max,
+                    ): (ci, cj)
+                    for ci in range(n_rows)
+                    for cj in range(n_cols)
+                }
+                for future in as_completed(futures):
+                    if future.result():
+                        written += 1
                     progress.advance(task)
     else:
-        for ci in range(n_rows):
-            for cj in range(n_cols):
-                r0 = ci * chunk_h
-                r1 = min(r0 + chunk_h, emb_shape[0])
-                c0 = cj * chunk_w
-                c1 = min(c0 + chunk_w, emb_shape[1])
-
-                scales_chunk = np.asarray(scales_arr[r0:r1, c0:c1])
-                if np.all(np.isnan(scales_chunk) | (scales_chunk == 0)):
-                    continue
-
-                emb_chunk = np.asarray(emb_arr[r0:r1, c0:c1, :])
-                rgba = compute_rgb_chunk(
-                    emb_chunk, scales_chunk,
-                    RGB_PREVIEW_BANDS, stretch_min, stretch_max,
-                )
-                rgb_arr[r0:r1, c0:c1, :] = rgba
-                written += 1
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    _process_rgb_chunk,
+                    emb_arr, scales_arr, rgb_arr,
+                    ci, cj, chunk_h, chunk_w, emb_shape,
+                    stretch_min, stretch_max,
+                ): (ci, cj)
+                for ci in range(n_rows)
+                for cj in range(n_cols)
+            }
+            for future in as_completed(futures):
+                if future.result():
+                    written += 1
 
     return written
 
