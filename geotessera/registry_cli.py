@@ -2624,6 +2624,12 @@ def serve_command(args):
     with importlib.resources.as_file(viewer_html) as src_path:
         shutil.copy2(src_path, viewer_dest)
 
+    # Write store manifest so the viewer can discover available stores
+    import json
+
+    stores_manifest = Path(zarr_dir) / "_stores.json"
+    stores_manifest.write_text(json.dumps(zarr_stores))
+
     class CORSHandler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *a, **kw):
             super().__init__(*a, directory=zarr_dir, **kw)
@@ -2650,11 +2656,7 @@ def serve_command(args):
                 # Chunk fetch - show in dim
                 pass  # suppress chunk-level noise
 
-    # Build viewer URL
-    store_param = ""
-    if zarr_stores:
-        store_param = f"?store=http://localhost:{port}/{zarr_stores[0]}"
-    viewer_url = f"http://localhost:{port}/_viewer.html{store_param}"
+    viewer_url = f"http://localhost:{port}/_viewer.html"
 
     console.print(f"\n[bold green]Viewer:[/bold green] {viewer_url}")
     console.print(f"[dim]Press Ctrl+C to stop[/dim]\n")
@@ -2668,11 +2670,12 @@ def serve_command(args):
     except KeyboardInterrupt:
         console.print("\n[dim]Stopped.[/dim]")
     finally:
-        # Clean up the copied viewer file
-        try:
-            viewer_dest.unlink(missing_ok=True)
-        except Exception:
-            pass
+        # Clean up temp files
+        for f in (viewer_dest, stores_manifest):
+            try:
+                f.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     return 0
 

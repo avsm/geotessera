@@ -77,16 +77,18 @@
       <p class="text-gray-600 text-[10px] mt-0.5 tracking-wider">ZARR EMBEDDING VIEWER</p>
     </div>
 
-    <!-- Store URL -->
+    <!-- Store selector -->
     <div class="px-4 py-3 border-b border-gray-800/60">
-      <label class="text-gray-500 text-[10px] uppercase tracking-[0.15em]">Store URL</label>
+      <label class="text-gray-500 text-[10px] uppercase tracking-[0.15em]">Store</label>
       <div class="flex gap-1.5 mt-1.5">
-        <input id="store-url" type="text"
-               class="flex-1 bg-gray-950 border border-gray-700/60 rounded px-2 py-1.5
-                      text-gray-300 text-[11px] focus:border-term-cyan/60 focus:outline-none
-                      focus:shadow-[0_0_8px_rgba(0,229,255,0.15)] transition-all
-                      placeholder-gray-700"
-               placeholder="http://localhost:8000/utm33_2024.zarr">
+        <select id="store-select"
+                class="flex-1 bg-gray-950 border border-gray-700/60 rounded px-2 py-1.5
+                       text-gray-300 text-[11px] focus:border-term-cyan/60 focus:outline-none
+                       focus:shadow-[0_0_8px_rgba(0,229,255,0.15)] transition-all
+                       appearance-none cursor-pointer"
+                style="background-image: url('data:image/svg+xml;utf8,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%2212%22 height=%2212%22 viewBox=%220 0 24 24%22 fill=%22none%22 stroke=%2266707a%22 stroke-width=%222%22><polyline points=%226 9 12 15 18 9%22/></svg>'); background-repeat: no-repeat; background-position: right 6px center;">
+          <option value="" disabled selected>Discovering stores...</option>
+        </select>
         <button id="load-btn"
                 class="bg-term-cyan/90 hover:bg-term-cyan text-black font-bold text-[10px]
                        px-3 py-1.5 rounded tracking-wider transition-all
@@ -94,6 +96,18 @@
           LOAD
         </button>
       </div>
+      <!-- Manual URL fallback (collapsed by default) -->
+      <details class="mt-1.5">
+        <summary class="text-[10px] text-gray-600 cursor-pointer hover:text-gray-400 transition-colors">
+          Manual URL
+        </summary>
+        <input id="store-url" type="text"
+               class="mt-1 w-full bg-gray-950 border border-gray-700/60 rounded px-2 py-1.5
+                      text-gray-300 text-[11px] focus:border-term-cyan/60 focus:outline-none
+                      focus:shadow-[0_0_8px_rgba(0,229,255,0.15)] transition-all
+                      placeholder-gray-700"
+               placeholder="http://host:port/utm33_2024.zarr">
+      </details>
       <div id="status" class="mt-1.5 text-[10px] text-gray-600 truncate">Ready</div>
     </div>
 
@@ -196,6 +210,7 @@
   const MAX_CACHED = 50;
 
   // ─── DOM refs ──────────────────────────────────────────────────
+  const $storeSelect = document.getElementById('store-select');
   const $storeUrl    = document.getElementById('store-url');
   const $loadBtn     = document.getElementById('load-btn');
   const $status      = document.getElementById('status');
@@ -622,8 +637,15 @@
 
   // ─── Store loading ────────────────────────────────────────────
 
+  function getBaseUrl() {
+    return window.location.origin + window.location.pathname.replace(/[^/]*$/, '');
+  }
+
   async function doLoadStore() {
-    const url = $storeUrl.value.trim().replace(/\/+$/, '');
+    // Prefer manual URL if filled in, otherwise use dropdown selection
+    const manual = $storeUrl.value.trim().replace(/\/+$/, '');
+    const selected = $storeSelect.value;
+    const url = manual || (selected ? getBaseUrl() + selected : '');
     if (!url) return;
 
     setStatus('Connecting...', 'text-term-cyan');
@@ -739,6 +761,7 @@
   function setupControls() {
     $loadBtn.addEventListener('click', doLoadStore);
     $storeUrl.addEventListener('keydown', (e) => { if (e.key === 'Enter') doLoadStore(); });
+    $storeSelect.addEventListener('change', doLoadStore);
 
     // Band sliders
     function onBandChange() {
@@ -819,13 +842,53 @@
       moveDebounce = setTimeout(() => updateVisibleChunks(), 300);
     });
 
-    // Check URL params for store
-    const params = new URLSearchParams(window.location.search);
-    const storeParam = params.get('store');
-    if (storeParam) {
-      $storeUrl.value = storeParam;
-      map.once('load', () => setTimeout(doLoadStore, 500));
-    }
+    // Discover available stores and handle URL params
+    map.once('load', async () => {
+      const params = new URLSearchParams(window.location.search);
+      const storeParam = params.get('store');
+
+      // Try to fetch store manifest from the server
+      try {
+        const baseUrl = getBaseUrl();
+        const resp = await fetch(baseUrl + '_stores.json');
+        if (resp.ok) {
+          const stores = await resp.json();
+          $storeSelect.innerHTML = '';
+          if (stores.length === 0) {
+            $storeSelect.innerHTML = '<option value="" disabled selected>No stores found</option>';
+          } else {
+            for (const name of stores) {
+              const opt = document.createElement('option');
+              opt.value = name;
+              opt.textContent = name;
+              $storeSelect.appendChild(opt);
+            }
+            // Auto-select from URL param or first store
+            if (storeParam) {
+              // If param is a full URL, extract just the store name
+              const storeName = storeParam.split('/').pop();
+              const match = stores.find(s => s === storeName);
+              if (match) $storeSelect.value = match;
+              else $storeUrl.value = storeParam;
+            } else {
+              $storeSelect.value = stores[0];
+            }
+            // Auto-load the selected store
+            setTimeout(doLoadStore, 300);
+          }
+        } else {
+          throw new Error('no manifest');
+        }
+      } catch {
+        // No manifest available - use manual URL mode
+        $storeSelect.innerHTML = '<option value="" disabled selected>Enter URL below</option>';
+        if (storeParam) {
+          $storeUrl.value = storeParam;
+          $storeUrl.parentElement.parentElement.open = true;  // expand details
+          setTimeout(doLoadStore, 300);
+        }
+      }
+    });
   }
 
   // ─── Init ─────────────────────────────────────────────────────
