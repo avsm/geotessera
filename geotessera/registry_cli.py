@@ -2710,11 +2710,21 @@ def serve_command(args):
         console.print(f"[red]Error: directory not found: {zarr_dir}[/red]")
         return 1
 
-    # Find .zarr stores in the directory
-    zarr_stores = sorted(
-        p.name for p in Path(zarr_dir).iterdir()
-        if p.is_dir() and p.name.endswith(".zarr")
-    )
+    # Find .zarr stores in the directory (or use --store if specified)
+    if args.store:
+        store_name = args.store
+        if not store_name.endswith(".zarr"):
+            store_name += ".zarr"
+        store_path = Path(zarr_dir) / store_name
+        if not store_path.is_dir():
+            console.print(f"[red]Error: store not found: {store_path}[/red]")
+            return 1
+        zarr_stores = [store_name]
+    else:
+        zarr_stores = sorted(
+            p.name for p in Path(zarr_dir).iterdir()
+            if p.is_dir() and p.name.endswith(".zarr")
+        )
 
     if zarr_stores:
         console.print(f"[bold]Serving Zarr stores from[/bold] {zarr_dir}")
@@ -2795,7 +2805,10 @@ def serve_command(args):
             else:
                 console.print(f"  [dim]{msg}[/dim]")
 
-    viewer_url = f"http://localhost:{port}/_viewer.html"
+    if args.store:
+        viewer_url = f"http://localhost:{port}/_viewer.html?store={zarr_stores[0]}"
+    else:
+        viewer_url = f"http://localhost:{port}/_viewer.html"
 
     console.print(f"\n[bold green]Viewer:[/bold green] {viewer_url}")
     console.print(f"[dim]Press Ctrl+C to stop[/dim]\n")
@@ -3157,6 +3170,11 @@ Directory Structure:
         "--no-open",
         action="store_true",
         help="Don't automatically open the browser",
+    )
+    serve_parser.add_argument(
+        "--store",
+        "-s",
+        help="Specific .zarr store to serve (skip discovery of all stores)",
     )
     serve_parser.set_defaults(func=serve_command)
 
