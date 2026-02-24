@@ -1260,11 +1260,15 @@ def build_zone_stores(
             include_pca=pca,
         )
 
-        # Write tiles in parallel (each tile writes to a non-overlapping
-        # region; file I/O and zarr chunk writes release the GIL)
+        # Two-phase write: (1) read all tiles in parallel (I/O bound,
+        # uses all workers), (2) group by chunk and write each chunk once
+        # to avoid read-modify-write amplification on the zarr store.
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        errors = 0
+        # --- Phase 1: parallel tile reads ---
+        tile_data: Dict[int, Tuple[np.ndarray, np.ndarray, int, int]] = {}
+        read_errors = 0
+
         if console is not None:
             with Progress(
                 SpinnerColumn(),
@@ -1277,28 +1281,92 @@ def build_zone_stores(
                 console=console,
             ) as progress:
                 task = progress.add_task(
-                    f"Writing zone {zone_num} ({workers} threads)",
+                    f"Reading tiles ({workers} threads)",
                     total=len(tile_infos),
                     status="starting...",
                 )
-
                 with ThreadPoolExecutor(max_workers=workers) as pool:
                     futures = {
-                        pool.submit(_write_single_tile, store, ti, zone_grid): ti
+                        pool.submit(_read_single_tile, ti, zone_grid): ti
                         for ti in tile_infos
                     }
                     for future in as_completed(futures):
                         ti = futures[future]
                         try:
-                            future.result()
+                            tile_data[id(ti)] = future.result()
                         except Exception as e:
                             logger.warning(
-                                f"Failed to write tile ({ti.lon}, {ti.lat}): {e}"
+                                f"Failed to read tile ({ti.lon}, {ti.lat}): {e}"
+                            )
+                            read_errors += 1
+                        progress.update(
+                            task, status=f"({ti.lon:.2f}, {ti.lat:.2f})",
+                        )
+                        progress.advance(task)
+                if read_errors:
+                    progress.update(task, status=f"done ({read_errors} errors)")
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(_read_single_tile, ti, zone_grid): ti
+                    for ti in tile_infos
+                }
+                for future in as_completed(futures):
+                    ti = futures[future]
+                    try:
+                        tile_data[id(ti)] = future.result()
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to read tile ({ti.lon}, {ti.lat}): {e}"
+                        )
+                        read_errors += 1
+
+        # --- Phase 2: chunk-batched writes (no read-modify-write) ---
+        chunk_groups = _group_tiles_by_chunk(tile_infos, zone_grid)
+        n_chunks = len(chunk_groups)
+        # Each chunk buffer is ~128 MB (embeddings) + ~4 MB (scales);
+        # cap writers to limit peak memory.
+        chunk_workers = min(workers, max(1, min(n_chunks, 8)))
+
+        errors = 0
+        tiles_written = 0
+        if console is not None:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                TextColumn("•"),
+                TextColumn("[dim]{task.fields[status]}", justify="left"),
+                console=console,
+            ) as progress:
+                task = progress.add_task(
+                    f"Writing chunks ({chunk_workers} threads, {n_chunks} chunks)",
+                    total=n_chunks,
+                    status="starting...",
+                )
+
+                with ThreadPoolExecutor(max_workers=chunk_workers) as pool:
+                    futures = {
+                        pool.submit(
+                            _write_chunk_batch,
+                            store, ck, tile_data, ctiles, zone_grid,
+                        ): ck
+                        for ck, ctiles in chunk_groups.items()
+                    }
+                    for future in as_completed(futures):
+                        ck = futures[future]
+                        try:
+                            n = future.result()
+                            tiles_written += n
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to write chunk {ck}: {e}"
                             )
                             errors += 1
                         progress.update(
-                            task,
-                            status=f"({ti.lon:.2f}, {ti.lat:.2f})",
+                            task, status=f"chunk {ck} ({tiles_written} tiles)",
                         )
                         progress.advance(task)
 
@@ -1307,20 +1375,27 @@ def build_zone_stores(
                     status = f"done ({errors} errors)"
                 progress.update(task, status=status)
         else:
-            with ThreadPoolExecutor(max_workers=workers) as pool:
+            with ThreadPoolExecutor(max_workers=chunk_workers) as pool:
                 futures = {
-                    pool.submit(_write_single_tile, store, ti, zone_grid): ti
-                    for ti in tile_infos
+                    pool.submit(
+                        _write_chunk_batch,
+                        store, ck, tile_data, ctiles, zone_grid,
+                    ): ck
+                    for ck, ctiles in chunk_groups.items()
                 }
                 for future in as_completed(futures):
-                    ti = futures[future]
+                    ck = futures[future]
                     try:
-                        future.result()
+                        n = future.result()
+                        tiles_written += n
                     except Exception as e:
                         logger.warning(
-                            f"Failed to write tile ({ti.lon}, {ti.lat}): {e}"
+                            f"Failed to write chunk {ck}: {e}"
                         )
                         errors += 1
+
+        # Free tile data to release memory before preview passes
+        del tile_data
 
         # RGB preview pass: compute stretch from the store, then write preview
         if rgb:
@@ -1369,17 +1444,14 @@ def build_zone_stores(
     return created_stores
 
 
-def _write_single_tile(
-    store: "zarr.Group",
+def _read_single_tile(
     tile_info: TileInfo,
     zone_grid: ZoneGrid,
-) -> None:
-    """Read a single tile's data and write it into the zone store.
+) -> Tuple[np.ndarray, np.ndarray, int, int]:
+    """Read a single tile from disk and return its data and pixel offset.
 
-    Args:
-        store: Zarr group (root of zone store)
-        tile_info: Tile metadata
-        zone_grid: Zone grid specification
+    Returns:
+        (embedding_int8, scales, row_start, col_start)
     """
     # Read embedding (int8)
     embedding = np.load(tile_info.embedding_path)
@@ -1416,7 +1488,121 @@ def _write_single_tile(
             f"exceeds zone grid ({zone_grid.height_px}, {zone_grid.width_px})"
         )
 
-    write_tile_to_store(store, embedding, scales, row_start, col_start)
+    return embedding, scales, row_start, col_start
+
+
+# Chunk size used for grouping (must match create_zone_store)
+_CHUNK_PX = 1024
+
+
+def _group_tiles_by_chunk(
+    tile_infos: List[TileInfo],
+    zone_grid: ZoneGrid,
+) -> Dict[Tuple[int, int], List[TileInfo]]:
+    """Group tiles by which chunk(s) they overlap.
+
+    A tile that straddles a chunk boundary appears in multiple groups.
+
+    Returns:
+        Dict mapping (chunk_row, chunk_col) to list of TileInfo.
+    """
+    from collections import defaultdict
+
+    chunk_tiles: Dict[Tuple[int, int], List[TileInfo]] = defaultdict(list)
+
+    for ti in tile_infos:
+        row_start, col_start = tile_pixel_offset(ti, zone_grid)
+        h, w = ti.height, ti.width
+
+        cr_min = row_start // _CHUNK_PX
+        cr_max = (row_start + h - 1) // _CHUNK_PX
+        cc_min = col_start // _CHUNK_PX
+        cc_max = (col_start + w - 1) // _CHUNK_PX
+
+        for cr in range(cr_min, cr_max + 1):
+            for cc in range(cc_min, cc_max + 1):
+                chunk_tiles[(cr, cc)].append(ti)
+
+    return dict(chunk_tiles)
+
+
+def _write_chunk_batch(
+    store: "zarr.Group",
+    chunk_key: Tuple[int, int],
+    tile_data_map: Dict[int, Tuple[np.ndarray, np.ndarray, int, int]],
+    tile_infos: List[TileInfo],
+    zone_grid: ZoneGrid,
+) -> int:
+    """Assemble pre-read tile data for one chunk and write once.
+
+    Builds a full chunk buffer in memory and writes it in a single
+    slice assignment, avoiding read-modify-write on the underlying
+    chunk files.
+
+    Args:
+        store: Zarr group (root of zone store)
+        chunk_key: (chunk_row, chunk_col)
+        tile_data_map: id(tile_info) -> (emb, scales, row, col) from read phase
+        tile_infos: Tiles that overlap this chunk
+        zone_grid: Zone grid specification
+
+    Returns:
+        Number of tiles placed into this chunk.
+    """
+    cr, cc = chunk_key
+    r0 = cr * _CHUNK_PX
+    c0 = cc * _CHUNK_PX
+    r1 = min(r0 + _CHUNK_PX, zone_grid.height_px)
+    c1 = min(c0 + _CHUNK_PX, zone_grid.width_px)
+    ch = r1 - r0
+    cw = c1 - c0
+
+    emb_buf = np.zeros((ch, cw, N_BANDS), dtype=np.int8)
+    scales_buf = np.full((ch, cw), np.float32("nan"), dtype=np.float32)
+
+    written = 0
+    for ti in tile_infos:
+        data = tile_data_map.get(id(ti))
+        if data is None:
+            continue
+
+        embedding, scales, row_start, col_start = data
+        h, w = embedding.shape[:2]
+
+        # Clip tile region to this chunk
+        tr0 = max(row_start, r0)
+        tc0 = max(col_start, c0)
+        tr1 = min(row_start + h, r1)
+        tc1 = min(col_start + w, c1)
+
+        if tr0 >= tr1 or tc0 >= tc1:
+            continue
+
+        # Offsets into tile arrays
+        tile_r0 = tr0 - row_start
+        tile_c0 = tc0 - col_start
+        tile_r1 = tr1 - row_start
+        tile_c1 = tc1 - col_start
+
+        # Offsets into chunk buffer
+        buf_r0 = tr0 - r0
+        buf_c0 = tc0 - c0
+        buf_r1 = tr1 - r0
+        buf_c1 = tc1 - c0
+
+        emb_buf[buf_r0:buf_r1, buf_c0:buf_c1, :] = embedding[
+            tile_r0:tile_r1, tile_c0:tile_c1, :
+        ]
+        scales_buf[buf_r0:buf_r1, buf_c0:buf_c1] = scales[
+            tile_r0:tile_r1, tile_c0:tile_c1
+        ]
+        written += 1
+
+    # Single whole-chunk write — no read-modify-write
+    store["embeddings"][r0:r1, c0:c1, :] = emb_buf
+    store["scales"][r0:r1, c0:c1] = scales_buf
+
+    return written
 
 
 # =============================================================================
