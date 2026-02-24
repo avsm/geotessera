@@ -2657,11 +2657,25 @@ def zarr_build_command(args):
     if args.pca:
         console.print("  [green]+PCA preview[/green]")
 
-    # Create registry pointing at local data
+    # Find registry directory: explicit flag, or auto-detect from base_dir
+    registry_dir = args.registry_dir
+    if registry_dir is None:
+        # Search base_dir and its parents for registry.parquet
+        candidate = Path(base_dir)
+        for _ in range(3):  # check base_dir and up to 2 parents
+            if (candidate / "registry.parquet").exists():
+                registry_dir = str(candidate)
+                break
+            candidate = candidate.parent
+        if registry_dir is None:
+            registry_dir = base_dir
+        if registry_dir != base_dir:
+            console.print(f"  Registry: {registry_dir}")
+
     registry = Registry(
         version=args.dataset_version,
         embeddings_dir=base_dir,
-        registry_dir=args.registry_dir or base_dir,
+        registry_dir=registry_dir,
     )
 
     try:
@@ -3112,7 +3126,7 @@ Directory Structure:
         type=str,
         default=None,
         help="Directory containing registry.parquet and landmasks.parquet "
-        "(default: same as base_dir)",
+        "(default: auto-detected from base_dir)",
     )
     zarr_build_parser.add_argument(
         "--dry-run",
