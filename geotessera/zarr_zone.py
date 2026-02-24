@@ -156,12 +156,6 @@ def northing_to_canonical(northing: float, epsg: int) -> float:
     return northing
 
 
-def _lon_to_utm_zone(lon: float) -> int:
-    """Compute the UTM zone number for a longitude."""
-    zone = int(math.floor((lon + 180) / 6)) + 1
-    return max(1, min(60, zone))
-
-
 # =============================================================================
 # Grid computation
 # =============================================================================
@@ -469,112 +463,6 @@ def _read_single_tile(
 
 
 # =============================================================================
-# Tile scanning (runs in worker processes)
-# =============================================================================
-
-
-def _scan_one_tile(args):
-    """Scan a single tile's landmask for CRS info. Runs in a worker process.
-
-    Returns serialisable tuple or None if files are missing or tile is invalid.
-    """
-    import rasterio
-
-    tile_year, tile_lon, tile_lat, emb_path, scales_path, landmask_path = args
-
-    # Check all three files exist
-    if not (os.path.exists(emb_path) and os.path.exists(scales_path)
-            and os.path.exists(landmask_path)):
-        return None
-
-    try:
-        with rasterio.open(landmask_path) as src:
-            epsg = src.crs.to_epsg()
-            t = src.transform
-            height = src.height
-            width = src.width
-    except Exception:
-        return None
-
-    if epsg is None:
-        return None
-
-    try:
-        epsg_to_utm_zone(epsg)
-    except ValueError:
-        return None
-
-    if abs(t.a - 10.0) > 0.01 or abs(t.e - (-10.0)) > 0.01:
-        return None
-
-    warnings = []
-
-    # Check if tile straddles a UTM zone boundary
-    west_zone = _lon_to_utm_zone(tile_lon - 0.05)
-    east_zone = _lon_to_utm_zone(tile_lon + 0.05)
-    landmask_zone = epsg_to_utm_zone(epsg)
-
-    if west_zone != east_zone:
-        warnings.append(
-            f"({tile_lon:.2f}, {tile_lat:.2f}): "
-            f"straddles zone boundary: west edge zone {west_zone}, "
-            f"east edge zone {east_zone}, landmask zone {landmask_zone}"
-        )
-
-    try:
-        comp_epsg, comp_tf, comp_h, comp_w = compute_tile_grid(tile_lon, tile_lat)
-        if comp_epsg != epsg:
-            warnings.append(
-                f"({tile_lon:.2f}, {tile_lat:.2f}): "
-                f"EPSG mismatch: computed {comp_epsg}, landmask {epsg}"
-            )
-        if comp_h != height or comp_w != width:
-            warnings.append(
-                f"({tile_lon:.2f}, {tile_lat:.2f}): "
-                f"size mismatch: computed {comp_w}x{comp_h}, "
-                f"landmask {width}x{height}"
-            )
-        if abs(comp_tf[2] - t.c) > 0.5 or abs(comp_tf[5] - t.f) > 0.5:
-            warnings.append(
-                f"({tile_lon:.2f}, {tile_lat:.2f}): "
-                f"origin mismatch: computed ({comp_tf[2]:.1f}, {comp_tf[5]:.1f}), "
-                f"landmask ({t.c:.1f}, {t.f:.1f})"
-            )
-    except Exception as e:
-        warnings.append(
-            f"({tile_lon:.2f}, {tile_lat:.2f}): grid computation failed: {e}"
-        )
-
-    return (
-        tile_year, tile_lon, tile_lat, epsg,
-        (t.a, t.b, t.c, t.d, t.e, t.f),
-        height, width, landmask_path, emb_path, scales_path,
-        warnings,
-    )
-
-
-def _tile_info_from_scan_result(result):
-    """Reconstruct a TileInfo from the serialised scan result."""
-    from rasterio.transform import Affine
-
-    (
-        tile_year, tile_lon, tile_lat, epsg,
-        transform_tuple, height, width,
-        landmask_path, emb_path, scales_path,
-        warnings,
-    ) = result
-
-    ti = TileInfo(
-        lon=tile_lon, lat=tile_lat, year=tile_year, epsg=epsg,
-        transform=Affine(*transform_tuple),
-        height=height, width=width,
-        landmask_path=landmask_path,
-        embedding_path=emb_path, scales_path=scales_path,
-    )
-    return ti, warnings
-
-
-# =============================================================================
 # Tile info gathering
 # =============================================================================
 
@@ -588,18 +476,14 @@ def gather_tile_infos(
 ) -> Dict[int, List[TileInfo]]:
     """Gather tile metadata from local files and group by UTM zone.
 
-    Iterates all tiles for the given year, scans each tile in parallel
-    (checking file existence and reading CRS info), and groups by zone.
+    Computes grid info deterministically from coordinates (no file I/O
+    needed for metadata), checks file existence, and groups by zone.
     """
-    from concurrent.futures import ProcessPoolExecutor, as_completed
-    import multiprocessing
+    from rasterio.transform import Affine
     from .registry import (
         EMBEDDINGS_DIR_NAME, LANDMASKS_DIR_NAME,
         tile_to_embedding_paths, tile_to_landmask_filename,
     )
-
-    if workers is None:
-        workers = min(multiprocessing.cpu_count(), 8)
 
     # Get tiles for this year from MultiIndex
     gdf = registry._registry_gdf
@@ -631,10 +515,11 @@ def gather_tile_infos(
                 f"(skipped {before - len(tiles):,})"
             )
 
-    # Build scan arguments with file paths
+    # Build TileInfos using computed grid (no file I/O for metadata)
     base_emb = str(registry._embeddings_dir / EMBEDDINGS_DIR_NAME)
     base_lm = str(registry._embeddings_dir / LANDMASKS_DIR_NAME)
-    scan_args = []
+    zones_dict: Dict[int, List[TileInfo]] = {}
+    n_missing = 0
 
     for tile_year, tile_lon, tile_lat in tiles:
         emb_rel, scales_rel = tile_to_embedding_paths(tile_lon, tile_lat, tile_year)
@@ -643,62 +528,27 @@ def gather_tile_infos(
         landmask_path = os.path.join(
             base_lm, tile_to_landmask_filename(tile_lon, tile_lat)
         )
-        scan_args.append(
-            (tile_year, tile_lon, tile_lat, emb_path, scales_path, landmask_path)
-        )
 
-    # Scan landmasks in parallel to get CRS info and group by zone
-    zones_dict: Dict[int, List[TileInfo]] = {}
-    skipped = 0
-    all_warnings: List[str] = []
+        # Check all three files exist
+        if not (os.path.exists(emb_path) and os.path.exists(scales_path)
+                and os.path.exists(landmask_path)):
+            n_missing += 1
+            continue
 
-    def _handle_result(result):
-        nonlocal skipped
-        if result is None:
-            skipped += 1
-            return
-        ti, warnings = _tile_info_from_scan_result(result)
-        all_warnings.extend(warnings)
-        zone = epsg_to_utm_zone(ti.epsg)
+        # Compute grid from coordinates (no rasterio needed)
+        epsg, tf_tuple, height, width = compute_tile_grid(tile_lon, tile_lat)
+        zone = epsg_to_utm_zone(epsg)
         if zone_set is not None and zone not in zone_set:
-            skipped += 1
-            return
-        zones_dict.setdefault(zone, []).append(ti)
+            continue
 
-    if console is not None:
-        from rich.progress import (
-            Progress, SpinnerColumn, BarColumn, TextColumn,
-            MofNCompleteColumn,
+        ti = TileInfo(
+            lon=tile_lon, lat=tile_lat, year=tile_year, epsg=epsg,
+            transform=Affine(*tf_tuple),
+            height=height, width=width,
+            landmask_path=landmask_path,
+            embedding_path=emb_path, scales_path=scales_path,
         )
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(), MofNCompleteColumn(),
-            TextColumn("•"),
-            TextColumn("[dim]{task.fields[status]}", justify="left"),
-            console=console,
-        ) as progress:
-            task = progress.add_task(
-                "Scanning tiles", total=len(scan_args),
-                status=f"{len(scan_args)} tiles, {workers} workers",
-            )
-            with ProcessPoolExecutor(max_workers=workers) as pool:
-                futures = {
-                    pool.submit(_scan_one_tile, args): args
-                    for args in scan_args
-                }
-                for future in as_completed(futures):
-                    _handle_result(future.result())
-                    progress.advance(task)
-            progress.update(task, status="Done")
-    else:
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            futures = {
-                pool.submit(_scan_one_tile, args): args
-                for args in scan_args
-            }
-            for future in as_completed(futures):
-                _handle_result(future.result())
+        zones_dict.setdefault(zone, []).append(ti)
 
     if console is not None:
         total_matched = sum(len(t) for t in zones_dict.values())
@@ -706,21 +556,11 @@ def gather_tile_infos(
             f"zone {z}: {len(t)}" for z, t in sorted(zones_dict.items())
         )
         console.print(f"  {total_matched} tiles in {len(zones_dict)} zone(s): {zone_summary}")
-        if skipped:
-            console.print(f"  [dim]{skipped} tiles skipped (missing files or non-UTM)[/dim]")
+        if n_missing:
+            console.print(f"  [dim]{n_missing} tiles skipped (missing files)[/dim]")
         if total_matched == 0:
             console.print(f"  [dim]Expected embeddings in: {base_emb}/[/dim]")
             console.print(f"  [dim]Expected landmasks in:  {base_lm}/[/dim]")
-        if all_warnings:
-            console.print(
-                f"  [yellow]{len(all_warnings)} grid mismatch warning(s) "
-                f"(computed vs landmask):[/yellow]"
-            )
-            for w in all_warnings:
-                console.print(f"    [yellow]{w}[/yellow]")
-    else:
-        for w in all_warnings:
-            logger.warning(w)
 
     return zones_dict
 
