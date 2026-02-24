@@ -4,14 +4,14 @@ This module provides tools for building and reading Zarr v3 stores that
 consolidate all tiles within a UTM zone into a single store per year.
 This enables efficient spatial subsetting and cloud-native access.
 
-Store layout (sharded, uncompressed):
+Store layout (uncompressed):
     utm{zone:02d}_{year}.zarr/
-        embeddings    # int8    (northing, easting, band)  shards=(4096, 4096, 128) chunks=(256, 256, 128)
-        scales        # float32 (northing, easting)        shards=(4096, 4096)      chunks=(256, 256)
+        embeddings    # int8    (northing, easting, band)  chunks=(1024, 1024, 128)
+        scales        # float32 (northing, easting)        chunks=(1024, 1024)
 
 NaN in scales indicates no-data (water or no coverage).
 Embeddings are high-entropy quantised values; compression gives negligible
-benefit so we store uncompressed and rely on sharding to reduce file count.
+benefit so we store uncompressed.
 """
 
 import logging
@@ -27,24 +27,6 @@ logger = logging.getLogger(__name__)
 
 # Number of embedding bands in Tessera
 N_BANDS = 128
-
-# Shard / inner-chunk spatial sizes (pixels).  The shard is the on-disk file
-# unit; inner chunks give fine-grained random access within a shard.
-SHARD_PX = 4096
-INNER_CHUNK_PX = 256
-
-# Zarr async concurrency — higher values improve throughput for sharded
-# stores where many inner chunks are fetched per shard read.
-_zarr_configured = False
-
-def _configure_zarr():
-    """Set zarr global config on first use (idempotent)."""
-    global _zarr_configured
-    if _zarr_configured:
-        return
-    import zarr
-    zarr.config.set({"async.concurrency": 128})
-    _zarr_configured = True
 
 # Bands used for the RGB preview array (indices into the 128-band embedding)
 RGB_PREVIEW_BANDS = (0, 1, 2)
@@ -158,7 +140,7 @@ def compute_stretch_from_store(
     emb_arr = store["embeddings"]
     scales_arr = store["scales"]
     emb_shape = emb_arr.shape
-    chunk_h = chunk_w = SHARD_PX
+    chunk_h, chunk_w = emb_arr.chunks[:2]
     n_rows = math.ceil(emb_shape[0] / chunk_h)
     n_cols = math.ceil(emb_shape[1] / chunk_w)
     total_chunks = n_rows * n_cols
@@ -494,7 +476,6 @@ def create_zone_store(
         zarr.Group root of the created store
     """
     import zarr
-    _configure_zarr()
 
     store_path = output_dir / _store_name(zone_grid.zone, zone_grid.year)
 
@@ -506,16 +487,11 @@ def create_zone_store(
 
     store = zarr.open_group(store_path, mode="w", zarr_format=3)
 
-    # Sharded, uncompressed arrays.  Embeddings are high-entropy quantised
-    # int8 values where zstd gives negligible benefit; we disable compression
-    # for all arrays and use sharding to keep the file count low.
-
     # Create embeddings array: int8 (northing, easting, band)
     store.create_array(
         "embeddings",
         shape=(zone_grid.height_px, zone_grid.width_px, N_BANDS),
-        shards=(SHARD_PX, SHARD_PX, N_BANDS),
-        chunks=(INNER_CHUNK_PX, INNER_CHUNK_PX, N_BANDS),
+        chunks=(1024, 1024, N_BANDS),
         dtype=np.int8,
         fill_value=np.int8(0),
         compressors=None,
@@ -526,8 +502,7 @@ def create_zone_store(
     store.create_array(
         "scales",
         shape=(zone_grid.height_px, zone_grid.width_px),
-        shards=(SHARD_PX, SHARD_PX),
-        chunks=(INNER_CHUNK_PX, INNER_CHUNK_PX),
+        chunks=(1024, 1024),
         dtype=np.float32,
         fill_value=np.float32("nan"),
         compressors=None,
@@ -539,8 +514,7 @@ def create_zone_store(
         store.create_array(
             "rgb",
             shape=(zone_grid.height_px, zone_grid.width_px, 4),
-            shards=(SHARD_PX, SHARD_PX, 4),
-            chunks=(INNER_CHUNK_PX, INNER_CHUNK_PX, 4),
+            chunks=(1024, 1024, 4),
             dtype=np.uint8,
             fill_value=np.uint8(0),
             compressors=None,
@@ -552,15 +526,14 @@ def create_zone_store(
         store.create_array(
             "pca_rgb",
             shape=(zone_grid.height_px, zone_grid.width_px, 4),
-            shards=(SHARD_PX, SHARD_PX, 4),
-            chunks=(INNER_CHUNK_PX, INNER_CHUNK_PX, 4),
+            chunks=(1024, 1024, 4),
             dtype=np.uint8,
             fill_value=np.uint8(0),
             compressors=None,
             dimension_names=["northing", "easting", "rgba"],
         )
 
-    # Create coordinate arrays (small, no sharding needed)
+    # Create coordinate arrays
     easting_coords = (
         zone_grid.origin_easting
         + (np.arange(zone_grid.width_px) + 0.5) * zone_grid.pixel_size
@@ -1239,21 +1212,11 @@ def build_zone_stores(
             include_pca=pca,
         )
 
-        # Write tiles grouped by shard.  Each shard is assembled in memory
-        # from its constituent tiles and written once, avoiding the
-        # read-modify-write amplification of incremental shard updates.
-        # Shard writes are parallelised with bounded concurrency to limit
-        # peak memory (~2 GB per shard buffer).
+        # Write tiles in parallel (each tile writes to a non-overlapping
+        # region; file I/O and zarr chunk writes release the GIL)
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        shard_groups = _group_tiles_by_shard(tile_infos, zone_grid)
-        n_shards = len(shard_groups)
-        # Cap concurrent shard writers to avoid excessive memory
-        # (~2 GB per shard buffer for embeddings)
-        shard_workers = min(workers, max(1, min(n_shards, 4)))
-
         errors = 0
-        tiles_written = 0
         if console is not None:
             with Progress(
                 SpinnerColumn(),
@@ -1266,54 +1229,48 @@ def build_zone_stores(
                 console=console,
             ) as progress:
                 task = progress.add_task(
-                    f"Writing zone {zone_num} ({shard_workers} shard writers, {n_shards} shards)",
-                    total=n_shards,
+                    f"Writing zone {zone_num} ({workers} threads)",
+                    total=len(tile_infos),
                     status="starting...",
                 )
 
-                with ThreadPoolExecutor(max_workers=shard_workers) as pool:
+                with ThreadPoolExecutor(max_workers=workers) as pool:
                     futures = {
-                        pool.submit(
-                            _write_shard_batch, store, sk, stiles, zone_grid
-                        ): sk
-                        for sk, stiles in shard_groups.items()
+                        pool.submit(_write_single_tile, store, ti, zone_grid): ti
+                        for ti in tile_infos
                     }
                     for future in as_completed(futures):
-                        sk = futures[future]
+                        ti = futures[future]
                         try:
-                            n = future.result()
-                            tiles_written += n
+                            future.result()
                         except Exception as e:
                             logger.warning(
-                                f"Failed to write shard {sk}: {e}"
+                                f"Failed to write tile ({ti.lon}, {ti.lat}): {e}"
                             )
                             errors += 1
                         progress.update(
                             task,
-                            status=f"shard {sk} ({tiles_written} tiles)",
+                            status=f"({ti.lon:.2f}, {ti.lat:.2f})",
                         )
                         progress.advance(task)
 
                 status = "done"
                 if errors:
-                    status = f"done ({errors} shard errors)"
+                    status = f"done ({errors} errors)"
                 progress.update(task, status=status)
         else:
-            with ThreadPoolExecutor(max_workers=shard_workers) as pool:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = {
-                    pool.submit(
-                        _write_shard_batch, store, sk, stiles, zone_grid
-                    ): sk
-                    for sk, stiles in shard_groups.items()
+                    pool.submit(_write_single_tile, store, ti, zone_grid): ti
+                    for ti in tile_infos
                 }
                 for future in as_completed(futures):
-                    sk = futures[future]
+                    ti = futures[future]
                     try:
-                        n = future.result()
-                        tiles_written += n
+                        future.result()
                     except Exception as e:
                         logger.warning(
-                            f"Failed to write shard {sk}: {e}"
+                            f"Failed to write tile ({ti.lon}, {ti.lat}): {e}"
                         )
                         errors += 1
 
@@ -1364,14 +1321,17 @@ def build_zone_stores(
     return created_stores
 
 
-def _read_tile_data(
+def _write_single_tile(
+    store: "zarr.Group",
     tile_info: TileInfo,
     zone_grid: ZoneGrid,
-) -> Tuple[np.ndarray, np.ndarray, int, int]:
-    """Read a single tile from disk and return its data and pixel offset.
+) -> None:
+    """Read a single tile's data and write it into the zone store.
 
-    Returns:
-        (embedding_int8, scales, row_start, col_start)
+    Args:
+        store: Zarr group (root of zone store)
+        tile_info: Tile metadata
+        zone_grid: Zone grid specification
     """
     # Read embedding (int8)
     embedding = np.load(tile_info.embedding_path)
@@ -1408,121 +1368,7 @@ def _read_tile_data(
             f"exceeds zone grid ({zone_grid.height_px}, {zone_grid.width_px})"
         )
 
-    return embedding, scales, row_start, col_start
-
-
-def _write_single_tile(
-    store: "zarr.Group",
-    tile_info: TileInfo,
-    zone_grid: ZoneGrid,
-) -> None:
-    """Read a single tile's data and write it into the zone store."""
-    embedding, scales, row_start, col_start = _read_tile_data(tile_info, zone_grid)
     write_tile_to_store(store, embedding, scales, row_start, col_start)
-
-
-def _group_tiles_by_shard(
-    tile_infos: List[TileInfo],
-    zone_grid: ZoneGrid,
-) -> Dict[Tuple[int, int], List[TileInfo]]:
-    """Group tiles by which shard(s) they overlap.
-
-    A tile that straddles a shard boundary appears in multiple groups.
-
-    Returns:
-        Dict mapping (shard_row, shard_col) to list of TileInfo.
-    """
-    from collections import defaultdict
-
-    shard_tiles: Dict[Tuple[int, int], List[TileInfo]] = defaultdict(list)
-
-    for ti in tile_infos:
-        row_start, col_start = tile_pixel_offset(ti, zone_grid)
-        h, w = ti.height, ti.width
-
-        sr_min = row_start // SHARD_PX
-        sr_max = (row_start + h - 1) // SHARD_PX
-        sc_min = col_start // SHARD_PX
-        sc_max = (col_start + w - 1) // SHARD_PX
-
-        for sr in range(sr_min, sr_max + 1):
-            for sc in range(sc_min, sc_max + 1):
-                shard_tiles[(sr, sc)].append(ti)
-
-    return dict(shard_tiles)
-
-
-def _write_shard_batch(
-    store: "zarr.Group",
-    shard_key: Tuple[int, int],
-    tile_infos: List[TileInfo],
-    zone_grid: ZoneGrid,
-) -> int:
-    """Read all tiles for one shard, assemble in memory, and write once.
-
-    This avoids the read-modify-write amplification that occurs when
-    writing tiles incrementally to a sharded zarr array.  Each shard
-    (SHARD_PX × SHARD_PX) is assembled as a numpy buffer and written
-    in a single zarr slice assignment.
-
-    Returns:
-        Number of tiles successfully written.
-    """
-    sr, sc = shard_key
-    shard_r0 = sr * SHARD_PX
-    shard_c0 = sc * SHARD_PX
-    shard_r1 = min(shard_r0 + SHARD_PX, zone_grid.height_px)
-    shard_c1 = min(shard_c0 + SHARD_PX, zone_grid.width_px)
-    sh = shard_r1 - shard_r0
-    sw = shard_c1 - shard_c0
-
-    emb_buf = np.zeros((sh, sw, N_BANDS), dtype=np.int8)
-    scales_buf = np.full((sh, sw), np.float32("nan"), dtype=np.float32)
-
-    written = 0
-    for ti in tile_infos:
-        try:
-            embedding, scales, row_start, col_start = _read_tile_data(ti, zone_grid)
-        except Exception as e:
-            logger.warning(f"Failed to read tile ({ti.lon}, {ti.lat}): {e}")
-            continue
-
-        h, w = embedding.shape[:2]
-
-        # Clip to the shard region
-        tr0 = max(row_start, shard_r0)
-        tc0 = max(col_start, shard_c0)
-        tr1 = min(row_start + h, shard_r1)
-        tc1 = min(col_start + w, shard_c1)
-
-        if tr0 >= tr1 or tc0 >= tc1:
-            continue
-
-        # Offsets into the tile arrays
-        tile_r0 = tr0 - row_start
-        tile_c0 = tc0 - col_start
-        tile_r1 = tr1 - row_start
-        tile_c1 = tc1 - col_start
-
-        # Offsets into the shard buffer
-        buf_r0 = tr0 - shard_r0
-        buf_c0 = tc0 - shard_c0
-        buf_r1 = tr1 - shard_r0
-        buf_c1 = tc1 - shard_c0
-
-        emb_buf[buf_r0:buf_r1, buf_c0:buf_c1, :] = embedding[
-            tile_r0:tile_r1, tile_c0:tile_c1, :
-        ]
-        scales_buf[buf_r0:buf_r1, buf_c0:buf_c1] = scales[
-            tile_r0:tile_r1, tile_c0:tile_c1
-        ]
-        written += 1
-
-    # Single shard-aligned write — no read-modify-write amplification
-    store["embeddings"][shard_r0:shard_r1, shard_c0:shard_c1, :] = emb_buf
-    store["scales"][shard_r0:shard_r1, shard_c0:shard_c1] = scales_buf
-
-    return written
 
 
 # =============================================================================
@@ -1591,9 +1437,7 @@ def write_rgb_pass(
     rgb_arr = store["rgb"]
 
     emb_shape = emb_arr.shape
-    # Iterate at shard granularity to avoid read-modify-write
-    # amplification on sharded arrays.
-    chunk_h = chunk_w = SHARD_PX
+    chunk_h, chunk_w = emb_arr.chunks[:2]
     n_rows = math.ceil(emb_shape[0] / chunk_h)
     n_cols = math.ceil(emb_shape[1] / chunk_w)
     total_chunks = n_rows * n_cols
@@ -1672,7 +1516,6 @@ def add_rgb_to_existing_store(
         console: Optional Rich Console for progress
     """
     import zarr
-    _configure_zarr()
 
     store = zarr.open_group(str(store_path), mode="r+")
 
@@ -1684,8 +1527,7 @@ def add_rgb_to_existing_store(
         store.create_array(
             "rgb",
             shape=(emb_shape[0], emb_shape[1], 4),
-            shards=(SHARD_PX, SHARD_PX, 4),
-            chunks=(INNER_CHUNK_PX, INNER_CHUNK_PX, 4),
+            chunks=(1024, 1024, 4),
             dtype=np.uint8,
             fill_value=np.uint8(0),
             compressors=None,
@@ -1847,7 +1689,7 @@ def compute_pca_basis(
     emb_arr = store["embeddings"]
     scales_arr = store["scales"]
     emb_shape = emb_arr.shape
-    chunk_h = chunk_w = SHARD_PX
+    chunk_h, chunk_w = emb_arr.chunks[:2]
     n_rows = math.ceil(emb_shape[0] / chunk_h)
     n_cols = math.ceil(emb_shape[1] / chunk_w)
     total_chunks = n_rows * n_cols
@@ -2095,7 +1937,7 @@ def write_pca_pass(
     pca_rgb_arr = store["pca_rgb"]
 
     emb_shape = emb_arr.shape
-    chunk_h = chunk_w = SHARD_PX
+    chunk_h, chunk_w = emb_arr.chunks[:2]
     n_rows = math.ceil(emb_shape[0] / chunk_h)
     n_cols = math.ceil(emb_shape[1] / chunk_w)
     total_chunks = n_rows * n_cols
@@ -2172,7 +2014,6 @@ def add_pca_to_existing_store(
         console: Optional Rich Console for progress
     """
     import zarr
-    _configure_zarr()
 
     store = zarr.open_group(str(store_path), mode="r+")
 
@@ -2184,8 +2025,7 @@ def add_pca_to_existing_store(
         store.create_array(
             "pca_rgb",
             shape=(emb_shape[0], emb_shape[1], 4),
-            shards=(SHARD_PX, SHARD_PX, 4),
-            chunks=(INNER_CHUNK_PX, INNER_CHUNK_PX, 4),
+            chunks=(1024, 1024, 4),
             dtype=np.uint8,
             fill_value=np.uint8(0),
             compressors=None,
@@ -2262,7 +2102,6 @@ def read_region_from_zone(
         where embeddings is (H, W, 128) int8 and scales is (H, W) float32
     """
     import zarr
-    _configure_zarr()
 
     store = zarr.open_group(str(path), mode="r")
     attrs = dict(store.attrs)
