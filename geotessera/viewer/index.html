@@ -1098,9 +1098,8 @@
   // ─── Store loading ────────────────────────────────────────────
 
   function resolveStoreUrl(name) {
-    // Use relative URL so all fetches are same-origin
     const base = window.location.pathname.replace(/[^/]*$/, '');
-    return base + name;
+    return window.location.origin + base + name;
   }
 
   async function doLoadStore() {
