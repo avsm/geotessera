@@ -28,53 +28,6 @@ logger = logging.getLogger(__name__)
 # Number of embedding bands in Tessera
 N_BANDS = 128
 
-# ---------------------------------------------------------------------------
-# Zarr codec pipeline: use zarrs (Rust) if available, else default Python.
-# Only used for reads — zarrs has issues with partial writes to non-existent
-# chunks (read-modify-write on sparse stores), so writes use zarr-python.
-# ---------------------------------------------------------------------------
-_ZARRS_AVAILABLE: Optional[bool] = None
-
-
-def _has_zarrs() -> bool:
-    """Check (once) whether the zarrs Rust package is importable."""
-    global _ZARRS_AVAILABLE
-    if _ZARRS_AVAILABLE is None:
-        try:
-            import zarrs  # noqa: F401
-            _ZARRS_AVAILABLE = True
-        except ImportError:
-            _ZARRS_AVAILABLE = False
-    return _ZARRS_AVAILABLE
-
-
-_last_pipeline: Optional[str] = None
-
-
-def _configure_zarr_pipeline(*, read_only: bool = False):
-    """Configure zarr codec pipeline, using zarrs (Rust) for reads only.
-
-    Args:
-        read_only: If True, activate zarrs Rust pipeline when available.
-                   If False, ensure the default zarr-python pipeline is used
-                   (safe for partial chunk writes to sparse stores).
-    """
-    global _last_pipeline
-    import zarr
-
-    if read_only and _has_zarrs():
-        target = "zarrs.ZarrsCodecPipeline"
-        label = "zarrs (Rust)"
-    else:
-        target = "zarr.codecs.pipeline.BatchedCodecPipeline"
-        label = "zarr-python (Python)"
-
-    zarr.config.set({"codec_pipeline.path": target})
-    if _last_pipeline != target:
-        _last_pipeline = target
-        logger.info("zarr codec pipeline: %s", label)
-
-
 # Bands used for the RGB preview array (indices into the 128-band embedding)
 RGB_PREVIEW_BANDS = (0, 1, 2)
 
@@ -523,7 +476,7 @@ def create_zone_store(
         zarr.Group root of the created store
     """
     import zarr
-    _configure_zarr_pipeline()
+
 
     store_path = output_dir / _store_name(zone_grid.zone, zone_grid.year)
 
@@ -1750,7 +1703,7 @@ def add_rgb_to_existing_store(
         console: Optional Rich Console for progress
     """
     import zarr
-    _configure_zarr_pipeline()
+
 
     store = zarr.open_group(str(store_path), mode="r+")
 
@@ -2249,7 +2202,7 @@ def add_pca_to_existing_store(
         console: Optional Rich Console for progress
     """
     import zarr
-    _configure_zarr_pipeline()
+
 
     store = zarr.open_group(str(store_path), mode="r+")
 
@@ -2338,7 +2291,6 @@ def read_region_from_zone(
         where embeddings is (H, W, 128) int8 and scales is (H, W) float32
     """
     import zarr
-    _configure_zarr_pipeline(read_only=True)
 
     store = zarr.open_group(str(path), mode="r")
     attrs = dict(store.attrs)
