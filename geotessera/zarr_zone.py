@@ -476,11 +476,16 @@ def _read_single_tile(
 def _scan_one_tile(args):
     """Scan a single tile's landmask for CRS info. Runs in a worker process.
 
-    Returns serialisable tuple or None if invalid.
+    Returns serialisable tuple or None if files are missing or tile is invalid.
     """
     import rasterio
 
     tile_year, tile_lon, tile_lat, emb_path, scales_path, landmask_path = args
+
+    # Check all three files exist
+    if not (os.path.exists(emb_path) and os.path.exists(scales_path)
+            and os.path.exists(landmask_path)):
+        return None
 
     try:
         with rasterio.open(landmask_path) as src:
@@ -583,8 +588,8 @@ def gather_tile_infos(
 ) -> Dict[int, List[TileInfo]]:
     """Gather tile metadata from local files and group by UTM zone.
 
-    Iterates all tiles for the given year, checks files exist locally,
-    reads CRS info from each landmask (in parallel), and groups by zone.
+    Iterates all tiles for the given year, scans each tile in parallel
+    (checking file existence and reading CRS info), and groups by zone.
     """
     from concurrent.futures import ProcessPoolExecutor, as_completed
     import multiprocessing
@@ -626,11 +631,10 @@ def gather_tile_infos(
                 f"(skipped {before - len(tiles):,})"
             )
 
-    # Check which tiles have all three files on disk
+    # Build scan arguments with file paths
     base_emb = str(registry._embeddings_dir / EMBEDDINGS_DIR_NAME)
     base_lm = str(registry._embeddings_dir / LANDMASKS_DIR_NAME)
     scan_args = []
-    n_missing = 0
 
     for tile_year, tile_lon, tile_lat in tiles:
         emb_rel, scales_rel = tile_to_embedding_paths(tile_lon, tile_lat, tile_year)
@@ -639,25 +643,9 @@ def gather_tile_infos(
         landmask_path = os.path.join(
             base_lm, tile_to_landmask_filename(tile_lon, tile_lat)
         )
-        if (
-            os.path.exists(emb_path)
-            and os.path.exists(scales_path)
-            and os.path.exists(landmask_path)
-        ):
-            scan_args.append(
-                (tile_year, tile_lon, tile_lat, emb_path, scales_path, landmask_path)
-            )
-        else:
-            n_missing += 1
-
-    if console is not None:
-        console.print(
-            f"  {len(scan_args):,} tiles with files on disk"
-            + (f" ({n_missing:,} missing)" if n_missing else "")
+        scan_args.append(
+            (tile_year, tile_lon, tile_lat, emb_path, scales_path, landmask_path)
         )
-        if n_missing > 0 and len(scan_args) == 0:
-            console.print(f"  [dim]Expected embeddings in: {base_emb}/[/dim]")
-            console.print(f"  [dim]Expected landmasks in:  {base_lm}/[/dim]")
 
     # Scan landmasks in parallel to get CRS info and group by zone
     zones_dict: Dict[int, List[TileInfo]] = {}
@@ -718,9 +706,11 @@ def gather_tile_infos(
             f"zone {z}: {len(t)}" for z, t in sorted(zones_dict.items())
         )
         console.print(f"  {total_matched} tiles in {len(zones_dict)} zone(s): {zone_summary}")
-        total_skipped = skipped + n_missing
-        if total_skipped:
-            console.print(f"  [dim]{total_skipped} tiles skipped (missing files or non-UTM)[/dim]")
+        if skipped:
+            console.print(f"  [dim]{skipped} tiles skipped (missing files or non-UTM)[/dim]")
+        if total_matched == 0:
+            console.print(f"  [dim]Expected embeddings in: {base_emb}/[/dim]")
+            console.print(f"  [dim]Expected landmasks in:  {base_lm}/[/dim]")
         if all_warnings:
             console.print(
                 f"  [yellow]{len(all_warnings)} grid mismatch warning(s) "
