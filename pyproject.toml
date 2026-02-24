@@ -40,6 +40,9 @@ dependencies = [
     "dask"
 ]
 
+[project.optional-dependencies]
+fast = ["zarrs"]
+
 [project.urls]
 Homepage = "https://github.com/ucam-eo/geotessera"
 Documentation = "https://geotessera.readthedocs.io"
