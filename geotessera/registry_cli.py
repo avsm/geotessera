@@ -2652,10 +2652,10 @@ def zarr_build_command(args):
         console.print(f"  Zones: {', '.join(str(z) for z in zone_list)}")
     if args.dry_run:
         console.print("  [dim](dry run)[/dim]")
-    if args.no_rgb:
-        console.print("  [dim](skipping RGB preview)[/dim]")
-    if args.no_pca:
-        console.print("  [dim](skipping PCA preview)[/dim]")
+    if args.rgb:
+        console.print("  [green]+RGB preview[/green]")
+    if args.pca:
+        console.print("  [green]+PCA preview[/green]")
 
     # Create registry pointing at local data
     registry = Registry(
@@ -2680,8 +2680,8 @@ def zarr_build_command(args):
         geotessera_version=gt_version,
         dataset_version=args.dataset_version,
         console=console,
-        rgb=not args.no_rgb,
-        pca=not args.no_pca,
+        rgb=args.rgb,
+        pca=args.pca,
         workers=args.workers,
     )
 
@@ -3114,9 +3114,9 @@ Directory Structure:
         help="Number of threads for parallel I/O (default: cpu_count, max 16)",
     )
     zarr_build_parser.add_argument(
-        "--no-rgb",
+        "--rgb",
         action="store_true",
-        help="Skip RGB preview generation during build",
+        help="Generate RGB preview array during build (slow, can add later with --rgb-only)",
     )
     zarr_build_parser.add_argument(
         "--rgb-only",
@@ -3125,9 +3125,9 @@ Directory Structure:
         "(scans existing .zarr stores in output dir)",
     )
     zarr_build_parser.add_argument(
-        "--no-pca",
+        "--pca",
         action="store_true",
-        help="Skip PCA preview generation during build",
+        help="Generate PCA preview array during build (slow, can add later with --pca-only)",
     )
     zarr_build_parser.add_argument(
         "--pca-only",
