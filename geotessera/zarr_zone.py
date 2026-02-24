@@ -472,12 +472,10 @@ def gather_tile_infos(
     year: int,
     zones: Optional[List[int]] = None,
     console: Optional["rich.console.Console"] = None,
-    workers: Optional[int] = None,
 ) -> Dict[int, List[TileInfo]]:
-    """Gather tile metadata from local files and group by UTM zone.
+    """Gather tile metadata and group by UTM zone.
 
-    Computes grid info deterministically from coordinates (no file I/O
-    needed for metadata), checks file existence, and groups by zone.
+    Computes grid info deterministically from coordinates (no file I/O).
     """
     from rasterio.transform import Affine
     from .registry import (
@@ -515,11 +513,14 @@ def gather_tile_infos(
                 f"(skipped {before - len(tiles):,})"
             )
 
-    # Build TileInfos using computed grid (no file I/O for metadata)
+    # Build TileInfos using computed grid (no file I/O)
+    from pyproj import Transformer as ProjTransformer
+
     base_emb = str(registry._embeddings_dir / EMBEDDINGS_DIR_NAME)
     base_lm = str(registry._embeddings_dir / LANDMASKS_DIR_NAME)
     zones_dict: Dict[int, List[TileInfo]] = {}
-    n_missing = 0
+    transformer_cache: Dict[int, ProjTransformer] = {}
+    pixel_size = 10.0
 
     for tile_year, tile_lon, tile_lat in tiles:
         emb_rel, scales_rel = tile_to_embedding_paths(tile_lon, tile_lat, tile_year)
@@ -529,17 +530,38 @@ def gather_tile_infos(
             base_lm, tile_to_landmask_filename(tile_lon, tile_lat)
         )
 
-        # Check all three files exist
-        if not (os.path.exists(emb_path) and os.path.exists(scales_path)
-                and os.path.exists(landmask_path)):
-            n_missing += 1
+        # Compute EPSG and zone from coordinates
+        zone_num = int(math.floor((tile_lon + 180) / 6)) + 1
+        zone_num = max(1, min(60, zone_num))
+        if zone_set is not None and zone_num not in zone_set:
             continue
+        is_south = tile_lat < 0
+        epsg = 32700 + zone_num if is_south else 32600 + zone_num
 
-        # Compute grid from coordinates (no rasterio needed)
-        epsg, tf_tuple, height, width = compute_tile_grid(tile_lon, tile_lat)
-        zone = epsg_to_utm_zone(epsg)
-        if zone_set is not None and zone not in zone_set:
-            continue
+        # Reuse cached transformer for this EPSG
+        if epsg not in transformer_cache:
+            transformer_cache[epsg] = ProjTransformer.from_crs(
+                "EPSG:4326", f"EPSG:{epsg}", always_xy=True
+            )
+        proj = transformer_cache[epsg]
+
+        # Project tile corners to UTM
+        west, east = tile_lon - 0.05, tile_lon + 0.05
+        south, north = tile_lat - 0.05, tile_lat + 0.05
+        ul_e, ul_n = proj.transform(west, north)
+        ur_e, _ = proj.transform(east, north)
+        ll_e, ll_n = proj.transform(west, south)
+        _, ur_n = proj.transform(east, north)
+        lr_e, lr_n = proj.transform(east, south)
+
+        origin_e = min(ul_e, ll_e)
+        origin_n = max(ul_n, ur_n)
+        max_e = max(ur_e, lr_e)
+        min_n = min(ll_n, lr_n)
+
+        width = round((max_e - origin_e) / pixel_size)
+        height = round((origin_n - min_n) / pixel_size)
+        tf_tuple = (pixel_size, 0.0, origin_e, 0.0, -pixel_size, origin_n)
 
         ti = TileInfo(
             lon=tile_lon, lat=tile_lat, year=tile_year, epsg=epsg,
@@ -548,7 +570,7 @@ def gather_tile_infos(
             landmask_path=landmask_path,
             embedding_path=emb_path, scales_path=scales_path,
         )
-        zones_dict.setdefault(zone, []).append(ti)
+        zones_dict.setdefault(zone_num, []).append(ti)
 
     if console is not None:
         total_matched = sum(len(t) for t in zones_dict.values())
@@ -556,11 +578,6 @@ def gather_tile_infos(
             f"zone {z}: {len(t)}" for z, t in sorted(zones_dict.items())
         )
         console.print(f"  {total_matched} tiles in {len(zones_dict)} zone(s): {zone_summary}")
-        if n_missing:
-            console.print(f"  [dim]{n_missing} tiles skipped (missing files)[/dim]")
-        if total_matched == 0:
-            console.print(f"  [dim]Expected embeddings in: {base_emb}/[/dim]")
-            console.print(f"  [dim]Expected landmasks in:  {base_lm}/[/dim]")
 
     return zones_dict
 
@@ -600,7 +617,7 @@ def build_zone_stores(
     output_dir = Path(output_dir)
 
     zones_dict = gather_tile_infos(
-        registry, year, zones=zones, console=console, workers=workers,
+        registry, year, zones=zones, console=console,
     )
 
     if not zones_dict:
