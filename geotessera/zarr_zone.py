@@ -1306,6 +1306,19 @@ def add_pca_to_existing_store(
 PYRAMID_LEVELS = 8  # level 0 = full-res, levels 1..7 = 2x coarser each
 
 
+def _coarsen_strip(strip: np.ndarray) -> np.ndarray:
+    """Coarsen a uint8 strip by 2x in both spatial dims via mean.
+
+    Trims to even dimensions, reshapes into 2x2 blocks, averages in
+    float32 (not float64) to keep memory low, and casts back to uint8.
+    """
+    h, w, c = strip.shape
+    h2 = h - (h % 2)
+    w2 = w - (w % 2)
+    reshaped = strip[:h2, :w2, :].reshape(h2 // 2, 2, w2 // 2, 2, c)
+    return reshaped.mean(axis=(1, 3), dtype=np.float32).astype(np.uint8)
+
+
 def build_preview_pyramid(
     store: "zarr.Group",
     preview_name: str,
@@ -1318,20 +1331,22 @@ def build_preview_pyramid(
     iteratively coarsened copies at ``{preview_name}_pyramid/{level}``
     for levels 1 through PYRAMID_LEVELS-1.
 
-    Each level halves both spatial dimensions using mean downsampling.
-    When *workers* > 1 the chunk writes for each level are parallelised
-    across a thread pool.
+    Each level halves both spatial dimensions using 2x2 mean downsampling.
+    Processing is done in horizontal strips (aligned to chunk boundaries)
+    so that memory usage stays bounded regardless of array size.
+
+    When *workers* > 1, strips are read/coarsened/written in parallel
+    via a thread pool.
 
     Args:
         store: Zarr group opened in ``r+`` mode.
         preview_name: Name of the source array (``"rgb"`` or ``"pca_rgb"``).
-        workers: Number of threads for parallel chunk writes.
+        workers: Number of threads for parallel strip processing.
         console: Optional Rich Console for progress display.
 
     Returns:
         Number of pyramid levels written (0 if the source array is missing).
     """
-    import xarray as xr
     from concurrent.futures import ThreadPoolExecutor
 
     # --- Validate source array exists ---
@@ -1344,8 +1359,7 @@ def build_preview_pyramid(
         )
         return 0
 
-    # --- Read full-res data and store transform ---
-    full_data = np.asarray(src_arr[:])
+    # --- Store transform for per-level metadata ---
     attrs = dict(store.attrs)
     transform = list(attrs["transform"])
     base_pixel_size = transform[0]
@@ -1359,15 +1373,11 @@ def build_preview_pyramid(
 
     pyramid_group = store.create_group(pyramid_name)
 
-    # --- Iteratively coarsen ---
-    src_h, src_w = full_data.shape[:2]
-    current = xr.DataArray(
-        full_data,
-        dims=["northing", "easting", "rgba"],
-    )
+    src_h, src_w = src_arr.shape[:2]
     levels_written = 0
     num_levels = PYRAMID_LEVELS - 1  # levels 1..7
 
+    # --- Progress bar ---
     if console is not None:
         from rich.progress import (
             Progress, SpinnerColumn, BarColumn, TextColumn,
@@ -1384,27 +1394,6 @@ def build_preview_pyramid(
     else:
         progress = None
 
-    def _write_chunks(arr, data, chunk_h, chunk_w):
-        """Write array data in chunks, optionally in parallel."""
-        h, w = data.shape[:2]
-        slices = []
-        for r0 in range(0, h, chunk_h):
-            for c0 in range(0, w, chunk_w):
-                r1 = min(r0 + chunk_h, h)
-                c1 = min(c0 + chunk_w, w)
-                slices.append((r0, r1, c0, c1))
-
-        def _write_one(s):
-            r0, r1, c0, c1 = s
-            arr[r0:r1, c0:c1, :] = data[r0:r1, c0:c1, :]
-
-        if workers > 1 and len(slices) > 1:
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                list(pool.map(_write_one, slices))
-        else:
-            for s in slices:
-                _write_one(s)
-
     if progress is not None:
         progress.start()
         ptask = progress.add_task(
@@ -1412,35 +1401,32 @@ def build_preview_pyramid(
             status=f"level 1 ({src_h // 2}x{src_w // 2}px)",
         )
 
+    # Each level reads from the previous level's zarr array (never the
+    # full array in memory).  Level 1 reads from the source preview.
+    prev_arr = src_arr
+
     try:
         for level in range(1, PYRAMID_LEVELS):
-            h, w = current.shape[0], current.shape[1]
+            ph, pw = prev_arr.shape[:2]
 
-            # Need at least 2 pixels in each spatial dim to coarsen
-            if h < 2 or w < 2:
+            if ph < 2 or pw < 2:
                 logger.info(
                     "build_preview_pyramid: stopping at level %d "
                     "(array too small: %dx%d)",
-                    level, h, w,
+                    level, ph, pw,
                 )
                 break
 
-            current = (
-                current
-                .coarsen(northing=2, easting=2, boundary="trim")
-                .mean()
-                .astype(np.uint8)
-            )
-
-            ch, cw = current.shape[0], current.shape[1]
+            # Output dimensions (trim odd source pixels)
+            oh = ph // 2
+            ow = pw // 2
             level_pixel_size = base_pixel_size * (2 ** level)
-            chunk_h = min(1024, ch)
-            chunk_w = min(1024, cw)
+            chunk_h = min(1024, oh)
+            chunk_w = min(1024, ow)
 
-            # Create array in pyramid group
-            arr = pyramid_group.create_array(
+            out_arr = pyramid_group.create_array(
                 str(level),
-                shape=(ch, cw, 4),
+                shape=(oh, ow, 4),
                 chunks=(chunk_h, chunk_w, 4),
                 dtype=np.uint8,
                 fill_value=np.uint8(0),
@@ -1448,25 +1434,52 @@ def build_preview_pyramid(
                 dimension_names=["northing", "easting", "rgba"],
             )
 
-            # Write chunks (parallel when workers > 1)
-            _write_chunks(arr, current.values, chunk_h, chunk_w)
+            # Process in strips: read 2*chunk_h source rows, coarsen to
+            # chunk_h output rows.  Each strip is ~2*chunk_h*pw*4 bytes
+            # uint8 + float32 intermediate — typically <500 MB.
+            src_strip_h = 2 * chunk_h
+            pw_even = pw - (pw % 2)
+
+            def _process_strip(out_r0, _prev=prev_arr, _out=out_arr,
+                               _src_strip_h=src_strip_h, _pw_even=pw_even,
+                               _ph=ph):
+                src_r0 = out_r0 * 2
+                src_r1 = min(src_r0 + _src_strip_h, _ph)
+                actual = src_r1 - src_r0
+                actual -= actual % 2
+                if actual == 0:
+                    return
+                strip = np.asarray(_prev[src_r0:src_r0 + actual, :_pw_even, :])
+                coarsened = _coarsen_strip(strip)
+                _out[out_r0:out_r0 + coarsened.shape[0], :coarsened.shape[1], :] = coarsened
+
+            strip_starts = list(range(0, oh, chunk_h))
+
+            if workers > 1 and len(strip_starts) > 1:
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    list(pool.map(_process_strip, strip_starts))
+            else:
+                for s in strip_starts:
+                    _process_strip(s)
 
             # Per-level metadata
             level_transform = [
                 level_pixel_size, 0.0, origin_e,
                 0.0, -level_pixel_size, origin_n,
             ]
-            arr.attrs.update({
+            out_arr.attrs.update({
                 "level": level,
                 "pixel_size_m": level_pixel_size,
                 "transform": level_transform,
-                "shape": [ch, cw, 4],
+                "shape": [oh, ow, 4],
             })
 
+            # Next level reads from this level's zarr array
+            prev_arr = out_arr
             levels_written += 1
 
             if progress is not None:
-                next_h, next_w = ch // 2, cw // 2
+                next_h, next_w = oh // 2, ow // 2
                 status = (
                     f"level {level + 1} ({next_h}x{next_w}px)"
                     if level < num_levels else "done"
