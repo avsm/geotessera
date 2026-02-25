@@ -1279,6 +1279,163 @@ def add_pca_to_existing_store(
 
 
 # =============================================================================
+# Preview pyramids (multi-resolution overviews)
+# =============================================================================
+
+PYRAMID_LEVELS = 8  # level 0 = full-res, levels 1..7 = 2x coarser each
+
+
+def build_preview_pyramid(
+    store: "zarr.Group",
+    preview_name: str,
+    console: Optional["rich.console.Console"] = None,
+) -> int:
+    """Build a multi-resolution pyramid from an existing preview array.
+
+    Reads ``store[preview_name]`` (full-res RGBA uint8) and creates
+    iteratively coarsened copies at ``{preview_name}_pyramid/{level}``
+    for levels 1 through PYRAMID_LEVELS-1.
+
+    Each level halves both spatial dimensions using mean downsampling.
+    Per-level attrs record the pixel size, transform, and shape so
+    readers can pick the appropriate resolution.
+
+    Args:
+        store: Zarr group opened in ``r+`` mode.
+        preview_name: Name of the source array (``"rgb"`` or ``"pca_rgb"``).
+        console: Optional Rich Console for progress display.
+
+    Returns:
+        Number of pyramid levels written (0 if the source array is missing).
+    """
+    import xarray as xr
+
+    # --- Validate source array exists ---
+    try:
+        src_arr = store[preview_name]
+    except KeyError:
+        logger.warning(
+            "build_preview_pyramid: source array %r not found in store",
+            preview_name,
+        )
+        return 0
+
+    # --- Read full-res data and store transform ---
+    full_data = np.asarray(src_arr[:])
+    attrs = dict(store.attrs)
+    transform = list(attrs["transform"])
+    base_pixel_size = transform[0]
+    origin_e = transform[2]
+    origin_n = transform[5]
+
+    # --- Delete existing pyramid group if present ---
+    pyramid_name = f"{preview_name}_pyramid"
+    if pyramid_name in store:
+        del store[pyramid_name]
+
+    pyramid_group = store.create_group(pyramid_name)
+
+    # --- Set up progress bar if console available ---
+    progress_ctx = None
+    progress_obj = None
+    progress_task = None
+    num_levels = PYRAMID_LEVELS - 1  # levels 1..7
+
+    if console is not None:
+        from rich.progress import (
+            Progress, SpinnerColumn, BarColumn, TextColumn,
+            MofNCompleteColumn, TimeElapsedColumn,
+        )
+        progress_obj = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(), MofNCompleteColumn(), TimeElapsedColumn(),
+            console=console,
+        )
+        progress_ctx = progress_obj.__enter__()
+        progress_task = progress_obj.add_task(
+            f"Building {preview_name} pyramid", total=num_levels,
+        )
+
+    # --- Iteratively coarsen ---
+    current = xr.DataArray(
+        full_data,
+        dims=["northing", "easting", "rgba"],
+    )
+    levels_written = 0
+
+    try:
+        for level in range(1, PYRAMID_LEVELS):
+            h, w = current.shape[0], current.shape[1]
+
+            # Need at least 2 pixels in each spatial dim to coarsen
+            if h < 2 or w < 2:
+                logger.info(
+                    "build_preview_pyramid: stopping at level %d "
+                    "(array too small: %dx%d)",
+                    level, h, w,
+                )
+                break
+
+            current = (
+                current
+                .coarsen(northing=2, easting=2, boundary="trim")
+                .mean()
+                .astype(np.uint8)
+            )
+
+            ch, cw = current.shape[0], current.shape[1]
+            level_pixel_size = base_pixel_size * (2 ** level)
+
+            # Write the coarsened array
+            arr = pyramid_group.create_array(
+                str(level),
+                shape=(ch, cw, 4),
+                chunks=(min(1024, ch), min(1024, cw), 4),
+                dtype=np.uint8,
+                fill_value=np.uint8(0),
+                compressors=None,
+                dimension_names=["northing", "easting", "rgba"],
+            )
+            arr[:] = current.values
+
+            # Per-level metadata
+            level_transform = [
+                level_pixel_size, 0.0, origin_e,
+                0.0, -level_pixel_size, origin_n,
+            ]
+            arr.attrs.update({
+                "level": level,
+                "pixel_size_m": level_pixel_size,
+                "transform": level_transform,
+                "shape": [ch, cw, 4],
+            })
+
+            levels_written += 1
+
+            if progress_obj is not None:
+                progress_obj.advance(progress_task)
+    finally:
+        if progress_ctx is not None:
+            progress_obj.__exit__(None, None, None)
+
+    # Store summary attrs on the pyramid group
+    pyramid_group.attrs.update({
+        "source": preview_name,
+        "num_levels": levels_written,
+        "base_pixel_size_m": base_pixel_size,
+    })
+
+    if console is not None:
+        console.print(
+            f"  [green]{preview_name} pyramid: "
+            f"{levels_written} levels written[/green]"
+        )
+
+    return levels_written
+
+
+# =============================================================================
 # Reading support
 # =============================================================================
 
