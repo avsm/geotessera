@@ -2676,7 +2676,7 @@ def zarr_build_command(args):
 
         for store_path in zarr_stores:
             console.print(f"\n  [cyan]{store_path.name}[/cyan]")
-            add_pyramids_to_existing_store(store_path, console=console)
+            add_pyramids_to_existing_store(store_path, workers=args.workers, console=console)
 
         console.print(f"\n[bold green]Pyramids added to {len(zarr_stores)} store(s)[/bold green]")
         return 0

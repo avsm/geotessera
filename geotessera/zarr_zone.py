@@ -23,6 +23,7 @@ benefit so we store uncompressed.
 import logging
 import math
 import os
+from contextlib import nullcontext as _nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -776,9 +777,9 @@ def build_zone_stores(
         if pyramid:
             for preview_name in ["rgb", "pca_rgb"]:
                 if preview_name in store:
-                    if console is not None:
-                        console.print(f"  Building {preview_name} pyramid...")
-                    levels = build_preview_pyramid(store, preview_name, console=console)
+                    levels = build_preview_pyramid(
+                        store, preview_name, workers=workers, console=console,
+                    )
                     if levels > 0:
                         store.attrs.update({
                             f"has_{preview_name}_pyramid": True,
@@ -1309,6 +1310,7 @@ PYRAMID_LEVELS = 8  # level 0 = full-res, levels 1..7 = 2x coarser each
 def build_preview_pyramid(
     store: "zarr.Group",
     preview_name: str,
+    workers: int = 1,
     console: Optional["rich.console.Console"] = None,
 ) -> int:
     """Build a multi-resolution pyramid from an existing preview array.
@@ -1318,18 +1320,20 @@ def build_preview_pyramid(
     for levels 1 through PYRAMID_LEVELS-1.
 
     Each level halves both spatial dimensions using mean downsampling.
-    Per-level attrs record the pixel size, transform, and shape so
-    readers can pick the appropriate resolution.
+    When *workers* > 1 the chunk writes for each level are parallelised
+    across a thread pool.
 
     Args:
         store: Zarr group opened in ``r+`` mode.
         preview_name: Name of the source array (``"rgb"`` or ``"pca_rgb"``).
+        workers: Number of threads for parallel chunk writes.
         console: Optional Rich Console for progress display.
 
     Returns:
         Number of pyramid levels written (0 if the source array is missing).
     """
     import xarray as xr
+    from concurrent.futures import ThreadPoolExecutor
 
     # --- Validate source array exists ---
     try:
@@ -1356,10 +1360,13 @@ def build_preview_pyramid(
 
     pyramid_group = store.create_group(pyramid_name)
 
-    # --- Set up progress bar if console available ---
-    progress_ctx = None
-    progress_obj = None
-    progress_task = None
+    # --- Iteratively coarsen ---
+    src_h, src_w = full_data.shape[:2]
+    current = xr.DataArray(
+        full_data,
+        dims=["northing", "easting", "rgba"],
+    )
+    levels_written = 0
     num_levels = PYRAMID_LEVELS - 1  # levels 1..7
 
     if console is not None:
@@ -1367,25 +1374,46 @@ def build_preview_pyramid(
             Progress, SpinnerColumn, BarColumn, TextColumn,
             MofNCompleteColumn, TimeElapsedColumn,
         )
-        progress_obj = Progress(
+        progress = Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(), MofNCompleteColumn(), TimeElapsedColumn(),
+            TextColumn("·"),
+            TextColumn("[dim]{task.fields[status]}[/dim]"),
             console=console,
         )
-        progress_ctx = progress_obj.__enter__()
-        progress_task = progress_obj.add_task(
-            f"Building {preview_name} pyramid", total=num_levels,
-        )
+    else:
+        progress = None
 
-    # --- Iteratively coarsen ---
-    current = xr.DataArray(
-        full_data,
-        dims=["northing", "easting", "rgba"],
-    )
-    levels_written = 0
+    def _write_chunks(arr, data, chunk_h, chunk_w):
+        """Write array data in chunks, optionally in parallel."""
+        h, w = data.shape[:2]
+        slices = []
+        for r0 in range(0, h, chunk_h):
+            for c0 in range(0, w, chunk_w):
+                r1 = min(r0 + chunk_h, h)
+                c1 = min(c0 + chunk_w, w)
+                slices.append((r0, r1, c0, c1))
 
-    try:
+        def _write_one(s):
+            r0, r1, c0, c1 = s
+            arr[r0:r1, c0:c1, :] = data[r0:r1, c0:c1, :]
+
+        if workers > 1 and len(slices) > 1:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                list(pool.map(_write_one, slices))
+        else:
+            for s in slices:
+                _write_one(s)
+
+    ctx = progress if progress is not None else _nullcontext()
+    with ctx:
+        if progress is not None:
+            ptask = progress.add_task(
+                f"  {preview_name} pyramid", total=num_levels,
+                status=f"level 1 ({src_h // 2}x{src_w // 2}px)",
+            )
+
         for level in range(1, PYRAMID_LEVELS):
             h, w = current.shape[0], current.shape[1]
 
@@ -1407,18 +1435,22 @@ def build_preview_pyramid(
 
             ch, cw = current.shape[0], current.shape[1]
             level_pixel_size = base_pixel_size * (2 ** level)
+            chunk_h = min(1024, ch)
+            chunk_w = min(1024, cw)
 
-            # Write the coarsened array
+            # Create array in pyramid group
             arr = pyramid_group.create_array(
                 str(level),
                 shape=(ch, cw, 4),
-                chunks=(min(1024, ch), min(1024, cw), 4),
+                chunks=(chunk_h, chunk_w, 4),
                 dtype=np.uint8,
                 fill_value=np.uint8(0),
                 compressors=None,
                 dimension_names=["northing", "easting", "rgba"],
             )
-            arr[:] = current.values
+
+            # Write chunks (parallel when workers > 1)
+            _write_chunks(arr, current.values, chunk_h, chunk_w)
 
             # Per-level metadata
             level_transform = [
@@ -1434,11 +1466,13 @@ def build_preview_pyramid(
 
             levels_written += 1
 
-            if progress_obj is not None:
-                progress_obj.advance(progress_task)
-    finally:
-        if progress_ctx is not None:
-            progress_obj.__exit__(None, None, None)
+            if progress is not None:
+                next_h, next_w = ch // 2, cw // 2
+                status = (
+                    f"level {level + 1} ({next_h}x{next_w}px)"
+                    if level < num_levels else "done"
+                )
+                progress.update(ptask, advance=1, status=status)
 
     # Store summary attrs on the pyramid group
     pyramid_group.attrs.update({
@@ -1447,17 +1481,12 @@ def build_preview_pyramid(
         "base_pixel_size_m": base_pixel_size,
     })
 
-    if console is not None:
-        console.print(
-            f"  [green]{preview_name} pyramid: "
-            f"{levels_written} levels written[/green]"
-        )
-
     return levels_written
 
 
 def add_pyramids_to_existing_store(
     store_path: Path,
+    workers: Optional[int] = None,
     console: Optional["rich.console.Console"] = None,
 ) -> None:
     """Add multi-resolution pyramids for all existing preview arrays.
@@ -1467,11 +1496,18 @@ def add_pyramids_to_existing_store(
     preview that exists, :func:`build_preview_pyramid` is called and the
     store-level attributes are updated with pyramid metadata.
 
+    When *workers* > 1, chunk writes within each pyramid level are
+    parallelised across a thread pool.
+
     Args:
         store_path: Path to the ``.zarr`` directory.
+        workers: Thread count for parallel chunk writes (default: auto).
         console: Optional Rich Console for progress display.
     """
     import zarr
+
+    if workers is None:
+        workers = _default_workers()
 
     store = zarr.open_group(str(store_path), mode="r+")
     attrs = dict(store.attrs)
@@ -1495,10 +1531,9 @@ def add_pyramids_to_existing_store(
                     f"rebuilding...[/yellow]"
                 )
 
-        if console is not None:
-            console.print(f"  Building {preview_name} pyramid...")
-
-        levels = build_preview_pyramid(store, preview_name, console)
+        levels = build_preview_pyramid(
+            store, preview_name, workers=workers, console=console,
+        )
 
         if levels > 0:
             store.attrs.update({
