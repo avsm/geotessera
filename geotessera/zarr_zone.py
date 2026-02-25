@@ -23,7 +23,6 @@ benefit so we store uncompressed.
 import logging
 import math
 import os
-from contextlib import nullcontext as _nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -1406,14 +1405,14 @@ def build_preview_pyramid(
             for s in slices:
                 _write_one(s)
 
-    ctx = progress if progress is not None else _nullcontext()
-    with ctx:
-        if progress is not None:
-            ptask = progress.add_task(
-                f"  {preview_name} pyramid", total=num_levels,
-                status=f"level 1 ({src_h // 2}x{src_w // 2}px)",
-            )
+    if progress is not None:
+        progress.start()
+        ptask = progress.add_task(
+            f"  {preview_name} pyramid", total=num_levels,
+            status=f"level 1 ({src_h // 2}x{src_w // 2}px)",
+        )
 
+    try:
         for level in range(1, PYRAMID_LEVELS):
             h, w = current.shape[0], current.shape[1]
 
@@ -1473,6 +1472,9 @@ def build_preview_pyramid(
                     if level < num_levels else "done"
                 )
                 progress.update(ptask, advance=1, status=status)
+    finally:
+        if progress is not None:
+            progress.stop()
 
     # Store summary attrs on the pyramid group
     pyramid_group.attrs.update({
