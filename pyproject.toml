@@ -37,7 +37,8 @@ dependencies = [
     "xarray",
     "rioxarray",
     "zarr",
-    "dask"
+    "dask",
+    "pystac",
 ]
 
 [project.urls]

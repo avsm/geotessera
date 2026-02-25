@@ -2846,6 +2846,254 @@ def serve_command(args):
     return 0
 
 
+# ---------------------------------------------------------------------------
+# stac-index command
+# ---------------------------------------------------------------------------
+
+
+def _store_bbox_wgs84(attrs: dict) -> list[float]:
+    """Compute the WGS84 bounding box [west, south, east, north] from store attrs.
+
+    Uses the affine *transform*, grid *shape* (from scales array dims stored in
+    attrs), and *crs_epsg* to reproject the four UTM corners to WGS84.
+    """
+    from pyproj import Transformer
+
+    transform = attrs["transform"]
+    pixel_size = transform[0]
+    origin_easting = transform[2]
+    origin_northing = transform[5]
+    width_px = attrs["grid_width"]
+    height_px = attrs["grid_height"]
+    epsg = attrs["crs_epsg"]
+
+    # Four UTM corners
+    e_min = origin_easting
+    e_max = origin_easting + width_px * pixel_size
+    n_max = origin_northing
+    n_min = origin_northing - height_px * pixel_size
+
+    corners_e = [e_min, e_max, e_max, e_min]
+    corners_n = [n_max, n_max, n_min, n_min]
+
+    transformer = Transformer.from_crs(f"EPSG:{epsg}", "EPSG:4326", always_xy=True)
+    lons, lats = transformer.transform(corners_e, corners_n)
+
+    return [min(lons), min(lats), max(lons), max(lats)]
+
+
+def _zarr_store_to_stac_item(
+    store_path: Path, zarr_dir: Path
+) -> "pystac.Item | None":
+    """Open a single Zarr store and return a pystac Item, or None on failure."""
+    import zarr
+    import pystac
+    from datetime import datetime, timezone
+
+    try:
+        store = zarr.open_group(str(store_path), mode="r")
+        attrs = dict(store.attrs)
+    except Exception as e:
+        logger.warning("Skipping %s: cannot open (%s)", store_path.name, e)
+        return None
+
+    # Required attributes
+    required = ["utm_zone", "crs_epsg", "transform", "year"]
+    missing = [k for k in required if k not in attrs]
+    if missing:
+        logger.warning("Skipping %s: missing attrs %s", store_path.name, missing)
+        return None
+
+    # Read grid dimensions from the scales array
+    try:
+        scales_shape = store["scales"].shape
+        attrs["grid_height"] = scales_shape[0]
+        attrs["grid_width"] = scales_shape[1]
+    except Exception as e:
+        logger.warning("Skipping %s: cannot read scales shape (%s)", store_path.name, e)
+        return None
+
+    # Compute bounding box
+    try:
+        bbox = _store_bbox_wgs84(attrs)
+    except Exception as e:
+        logger.warning("Skipping %s: bbox computation failed (%s)", store_path.name, e)
+        return None
+
+    year = attrs["year"]
+    item_id = store_path.name.removesuffix(".zarr")
+    dt = datetime(year, 1, 1, tzinfo=timezone.utc)
+
+    # Build WGS84 polygon from bbox
+    west, south, east, north = bbox
+    geometry = {
+        "type": "Polygon",
+        "coordinates": [[
+            [west, south],
+            [east, south],
+            [east, north],
+            [west, north],
+            [west, south],
+        ]],
+    }
+
+    # Determine number of bands
+    try:
+        n_bands = store["embeddings"].shape[2]
+    except Exception:
+        n_bands = 128
+
+    properties = {
+        "utm_zone": attrs["utm_zone"],
+        "crs_epsg": attrs["crs_epsg"],
+        "pixel_size_m": attrs.get("pixel_size_m", attrs["transform"][0]),
+        "grid_width": attrs["grid_width"],
+        "grid_height": attrs["grid_height"],
+        "n_bands": n_bands,
+        "has_rgb_preview": attrs.get("has_rgb_preview", False),
+        "has_pca_preview": attrs.get("has_pca_preview", False),
+        "geotessera_version": attrs.get("geotessera_version", "unknown"),
+    }
+
+    item = pystac.Item(
+        id=item_id,
+        geometry=geometry,
+        bbox=bbox,
+        datetime=dt,
+        properties=properties,
+    )
+
+    # Asset href is a placeholder — will be updated in stac_index_command
+    # once we know the item's JSON output location
+    item.add_asset(
+        "zarr",
+        pystac.Asset(
+            href=store_path.name,
+            media_type="application/x-zarr-v3",
+            roles=["data"],
+            title="Zarr v3 embedding store",
+        ),
+    )
+
+    return item
+
+
+def stac_index_command(args):
+    """Scan a directory of Zarr stores and generate a static STAC catalog."""
+    import pystac
+    from datetime import datetime, timezone
+
+    zarr_dir = Path(args.zarr_dir).resolve()
+    output_dir = Path(args.output_dir).resolve() if args.output_dir else zarr_dir
+
+    if not zarr_dir.is_dir():
+        console.print(f"[red]Error:[/red] {zarr_dir} is not a directory")
+        return 1
+
+    # Discover .zarr stores matching utm{ZZ}_{YYYY}.zarr
+    import re
+    store_pattern = re.compile(r"^utm(\d{2})_(\d{4})\.zarr$")
+    store_paths = sorted(
+        p for p in zarr_dir.iterdir()
+        if p.is_dir() and store_pattern.match(p.name)
+    )
+
+    if not store_paths:
+        console.print(f"[red]Error:[/red] No utm*_*.zarr stores found in {zarr_dir}")
+        return 1
+
+    console.print(f"Found {len(store_paths)} Zarr store(s) in {zarr_dir}")
+
+    # Build items grouped by year
+    items_by_year: dict[int, list["pystac.Item"]] = defaultdict(list)
+    skipped = 0
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Reading store metadata", total=len(store_paths))
+        for sp in store_paths:
+            item = _zarr_store_to_stac_item(sp, zarr_dir)
+            if item is not None:
+                year = item.datetime.year
+                # Fix asset href to be relative to the item's JSON location
+                # Item JSON will be at: output_dir/geotessera-{year}/{item.id}/{item.id}.json
+                item_json_dir = output_dir / f"geotessera-{year}" / item.id
+                zarr_asset = item.assets["zarr"]
+                zarr_asset.href = os.path.relpath(sp, item_json_dir)
+                items_by_year[year].append(item)
+            else:
+                skipped += 1
+            progress.advance(task)
+
+    if not items_by_year:
+        console.print("[red]Error:[/red] No valid stores found")
+        return 1
+
+    if skipped:
+        console.print(f"[yellow]Skipped {skipped} store(s) with errors[/yellow]")
+
+    # Create root catalog
+    catalog = pystac.Catalog(
+        id="geotessera",
+        title="Geotessera Embedding Stores",
+        description="Static STAC catalog of Geotessera Zarr v3 embedding stores",
+    )
+
+    # Create one collection per year
+    for year in sorted(items_by_year):
+        items = items_by_year[year]
+
+        # Union bounding box
+        all_bboxes = [it.bbox for it in items]
+        extent_bbox = [
+            min(b[0] for b in all_bboxes),
+            min(b[1] for b in all_bboxes),
+            max(b[2] for b in all_bboxes),
+            max(b[3] for b in all_bboxes),
+        ]
+
+        spatial_extent = pystac.SpatialExtent(bboxes=[extent_bbox])
+        temporal_extent = pystac.TemporalExtent(intervals=[
+            [
+                datetime(year, 1, 1, tzinfo=timezone.utc),
+                datetime(year, 12, 31, 23, 59, 59, tzinfo=timezone.utc),
+            ]
+        ])
+
+        collection = pystac.Collection(
+            id=f"geotessera-{year}",
+            title=f"Geotessera {year}",
+            description=f"Geotessera embedding stores for {year}",
+            extent=pystac.Extent(spatial=spatial_extent, temporal=temporal_extent),
+        )
+
+        for item in items:
+            collection.add_item(item)
+
+        catalog.add_child(collection)
+
+    # Normalize hrefs and save
+    catalog.normalize_hrefs(str(output_dir))
+    catalog.save(catalog_type=pystac.CatalogType.SELF_CONTAINED)
+
+    # Summary
+    total_items = sum(len(v) for v in items_by_year.values())
+    console.print(
+        f"\n{emoji('✅ ')}STAC catalog written to {output_dir}\n"
+        f"  {len(items_by_year)} collection(s), {total_items} item(s)"
+    )
+    for year in sorted(items_by_year):
+        zones = sorted(it.properties["utm_zone"] for it in items_by_year[year])
+        console.print(f"  {year}: UTM zones {zones}")
+
+    return 0
+
+
 def main():
     """Main entry point for the geotessera-registry CLI tool."""
     # Configure logging with rich handler
@@ -3203,6 +3451,23 @@ Directory Structure:
         help="Parquet files to check for duplicates (output from file-scan command)",
     )
     file_check_parser.set_defaults(func=file_check_command)
+
+    # Stac-index command
+    stac_index_parser = subparsers.add_parser(
+        "stac-index",
+        help="Generate a static STAC catalog from a directory of Zarr stores",
+    )
+    stac_index_parser.add_argument(
+        "zarr_dir",
+        help="Directory containing utm*_*.zarr stores",
+    )
+    stac_index_parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Output directory for STAC JSON files (default: same as zarr_dir)",
+    )
+    stac_index_parser.set_defaults(func=stac_index_command)
 
     args = parser.parse_args()
 
