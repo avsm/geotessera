@@ -820,7 +820,7 @@ def _sample_chunk_stats(
     c0, c1 = cj * chunk_w, min(cj * chunk_w + chunk_w, emb_shape[1])
 
     scales_chunk = np.asarray(scales_arr[r0:r1, c0:c1])
-    valid = ~np.isnan(scales_chunk) & (scales_chunk != 0)
+    valid = np.isfinite(scales_chunk) & (scales_chunk != 0)
     if not np.any(valid):
         return None
 
@@ -965,6 +965,23 @@ def compute_pca_basis(
         }
 
     all_data = np.concatenate(samples, axis=0)
+
+    # Remove rows with NaN or inf (can arise from inf scales values)
+    finite_mask = np.isfinite(all_data).all(axis=1)
+    if not finite_mask.all():
+        n_bad = int((~finite_mask).sum())
+        all_data = all_data[finite_mask]
+        if console is not None:
+            console.print(f"  PCA: dropped {n_bad} non-finite samples")
+        if all_data.shape[0] == 0:
+            components = np.eye(n_components, N_BANDS, dtype=np.float32)
+            return {
+                "components": components,
+                "mean": np.zeros(N_BANDS, dtype=np.float32),
+                "p_low": np.zeros(n_components, dtype=np.float32),
+                "p_high": np.ones(n_components, dtype=np.float32),
+                "explained_variance_ratio": np.zeros(n_components, dtype=np.float32),
+            }
 
     if all_data.shape[0] > max_total_samples:
         idx = rng.choice(all_data.shape[0], max_total_samples, replace=False)
