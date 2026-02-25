@@ -607,6 +607,7 @@ def build_zone_stores(
     console: Optional["rich.console.Console"] = None,
     rgb: bool = True,
     pca: bool = True,
+    pyramid: bool = False,
     workers: Optional[int] = None,
 ) -> List[Path]:
     """Build zone-wide Zarr stores from local tile data.
@@ -765,6 +766,20 @@ def build_zone_stores(
             })
             if console is not None:
                 console.print(f"  [green]PCA preview: {pca_written} chunks written[/green]")
+
+        if pyramid:
+            for preview_name in ["rgb", "pca_rgb"]:
+                if preview_name in store:
+                    if console is not None:
+                        console.print(f"  Building {preview_name} pyramid...")
+                    levels = build_preview_pyramid(store, preview_name, console=console)
+                    if levels > 0:
+                        store.attrs.update({
+                            f"has_{preview_name}_pyramid": True,
+                            f"{preview_name}_pyramid_levels": levels + 1,
+                        })
+                        if console is not None:
+                            console.print(f"  [green]{preview_name} pyramid: {levels} levels[/green]")
 
         created_stores.append(output_dir / store_name)
 

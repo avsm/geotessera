@@ -2525,7 +2525,7 @@ def file_check_command(args):
 
 def zarr_build_command(args):
     """Build zone-wide Zarr stores from local tile data."""
-    from .zarr_zone import build_zone_stores, add_rgb_to_existing_store, add_pca_to_existing_store
+    from .zarr_zone import build_zone_stores, add_rgb_to_existing_store, add_pca_to_existing_store, add_pyramids_to_existing_store
     from .registry import Registry
 
     base_dir = args.base_dir
@@ -2633,6 +2633,54 @@ def zarr_build_command(args):
         console.print(f"\n[bold green]PCA preview added to {len(zarr_stores)} store(s)[/bold green]")
         return 0
 
+    # Handle --pyramid-only mode: add pyramids to existing stores
+    if args.pyramid_only:
+        zarr_dir = Path(output_dir)
+        if not zarr_dir.is_dir():
+            console.print(f"[red]Error: directory not found: {zarr_dir}[/red]")
+            return 1
+
+        zone_filter = None
+        if args.zones:
+            try:
+                zone_filter = {int(z.strip()) for z in args.zones.split(",")}
+            except ValueError:
+                console.print("[red]Error: --zones must be comma-separated integers[/red]")
+                return 1
+
+        def _store_matches_pyr(p):
+            if zone_filter is None:
+                return True
+            try:
+                zone_num = int(p.name.split("_")[0].replace("utm", ""))
+                return zone_num in zone_filter
+            except (ValueError, IndexError):
+                return True
+
+        zarr_stores = sorted(
+            p for p in zarr_dir.iterdir()
+            if p.is_dir() and p.name.endswith(".zarr") and _store_matches_pyr(p)
+        )
+
+        if not zarr_stores:
+            console.print(f"[yellow]No .zarr stores found in {zarr_dir}[/yellow]")
+            return 1
+
+        console.print(
+            f"[bold]Adding pyramids to existing stores[/bold]\n"
+            f"  Directory: {zarr_dir}\n"
+            f"  Stores: {len(zarr_stores)}"
+        )
+        if zone_filter:
+            console.print(f"  Zones: {', '.join(str(z) for z in sorted(zone_filter))}")
+
+        for store_path in zarr_stores:
+            console.print(f"\n  [cyan]{store_path.name}[/cyan]")
+            add_pyramids_to_existing_store(store_path, console=console)
+
+        console.print(f"\n[bold green]Pyramids added to {len(zarr_stores)} store(s)[/bold green]")
+        return 0
+
     # Parse zone filter
     zone_list = None
     if args.zones:
@@ -2696,6 +2744,7 @@ def zarr_build_command(args):
         console=console,
         rgb=args.rgb,
         pca=args.pca,
+        pyramid=args.pyramid,
         workers=args.workers,
     )
 
@@ -3406,6 +3455,17 @@ Directory Structure:
         "--pca-only",
         action="store_true",
         help="Add PCA preview to existing stores without rebuilding "
+        "(scans existing .zarr stores in output dir)",
+    )
+    zarr_build_parser.add_argument(
+        "--pyramid",
+        action="store_true",
+        help="Generate multi-resolution pyramids for preview arrays during build",
+    )
+    zarr_build_parser.add_argument(
+        "--pyramid-only",
+        action="store_true",
+        help="Add pyramids to existing stores without rebuilding "
         "(scans existing .zarr stores in output dir)",
     )
     zarr_build_parser.set_defaults(func=zarr_build_command)
