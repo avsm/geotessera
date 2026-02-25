@@ -1435,6 +1435,63 @@ def build_preview_pyramid(
     return levels_written
 
 
+def add_pyramids_to_existing_store(
+    store_path: Path,
+    console: Optional["rich.console.Console"] = None,
+) -> None:
+    """Add multi-resolution pyramids for all existing preview arrays.
+
+    Opens the store at *store_path* in ``r+`` mode and checks which preview
+    arrays are present (``has_rgb_preview``, ``has_pca_preview``).  For each
+    preview that exists, :func:`build_preview_pyramid` is called and the
+    store-level attributes are updated with pyramid metadata.
+
+    Args:
+        store_path: Path to the ``.zarr`` directory.
+        console: Optional Rich Console for progress display.
+    """
+    import zarr
+
+    store = zarr.open_group(str(store_path), mode="r+")
+    attrs = dict(store.attrs)
+
+    # Map preview array names to their corresponding attr flag
+    previews = [
+        ("rgb", "has_rgb_preview"),
+        ("pca_rgb", "has_pca_preview"),
+    ]
+
+    for preview_name, attr_flag in previews:
+        if not attrs.get(attr_flag, False):
+            continue
+
+        # Check whether pyramid already exists
+        pyramid_attr = f"has_{preview_name}_pyramid"
+        if attrs.get(pyramid_attr, False):
+            if console is not None:
+                console.print(
+                    f"  [yellow]{preview_name} pyramid already exists, "
+                    f"rebuilding...[/yellow]"
+                )
+
+        if console is not None:
+            console.print(f"  Building {preview_name} pyramid...")
+
+        levels = build_preview_pyramid(store, preview_name, console)
+
+        if levels > 0:
+            store.attrs.update({
+                pyramid_attr: True,
+                f"{preview_name}_pyramid_levels": levels + 1,  # includes level 0
+            })
+
+            if console is not None:
+                console.print(
+                    f"  [green]{preview_name} pyramid: "
+                    f"{levels + 1} total levels (including full-res)[/green]"
+                )
+
+
 # =============================================================================
 # Reading support
 # =============================================================================
