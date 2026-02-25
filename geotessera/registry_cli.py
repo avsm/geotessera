@@ -2854,32 +2854,30 @@ def serve_command(args):
 def _store_bbox_wgs84(attrs: dict) -> list[float]:
     """Compute the WGS84 bounding box [west, south, east, north] from store attrs.
 
-    Uses the affine *transform*, grid *shape* (from scales array dims stored in
-    attrs), and *crs_epsg* to reproject the four UTM corners to WGS84.
+    Each store covers exactly one UTM zone, so longitude is determined directly
+    from the zone number.  Latitude is derived by reprojecting the northing
+    extremes at the zone's central meridian.
     """
     from pyproj import Transformer
 
+    utm_zone = attrs["utm_zone"]
+    west = (utm_zone - 1) * 6 - 180
+    east = utm_zone * 6 - 180
+
     transform = attrs["transform"]
     pixel_size = transform[0]
-    origin_easting = transform[2]
     origin_northing = transform[5]
-    width_px = attrs["grid_width"]
     height_px = attrs["grid_height"]
     epsg = attrs["crs_epsg"]
 
-    # Four UTM corners
-    e_min = origin_easting
-    e_max = origin_easting + width_px * pixel_size
     n_max = origin_northing
     n_min = origin_northing - height_px * pixel_size
 
-    corners_e = [e_min, e_max, e_max, e_min]
-    corners_n = [n_max, n_max, n_min, n_min]
-
+    # Reproject northing at the central meridian (500 000 m false easting)
     transformer = Transformer.from_crs(f"EPSG:{epsg}", "EPSG:4326", always_xy=True)
-    lons, lats = transformer.transform(corners_e, corners_n)
+    _, lats = transformer.transform([500_000, 500_000], [n_min, n_max])
 
-    return [min(lons), min(lats), max(lons), max(lats)]
+    return [west, min(lats), east, max(lats)]
 
 
 def _zarr_store_to_stac_item(
