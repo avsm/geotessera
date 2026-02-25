@@ -167,3 +167,49 @@ Verify that the CLI help text mentions zarr as a format option:
 
   $ geotessera download --help | grep -i zarr | head -1
   *zarr* (glob)
+
+Test: Pyramid Building on Preview Arrays
+-----------------------------------------
+
+Build a zone store with RGB from the Cambridge tiles:
+
+  $ geotessera-registry zarr-build \
+  >   "$TESTDIR/cb_tiles_zarr" \
+  >   --output-dir "$TESTDIR/zarr_pyramid_test" \
+  >   --year 2024 \
+  >   --rgb 2>&1 | grep -E '(RGB preview|Zone)' | head -3 | sed 's/ *$//'
+  * (glob)
+  * (glob)
+  * (glob)
+
+Add pyramids to the store:
+
+  $ geotessera-registry zarr-build \
+  >   "$TESTDIR/cb_tiles_zarr" \
+  >   --output-dir "$TESTDIR/zarr_pyramid_test" \
+  >   --pyramid-only 2>&1 | grep -E '(pyramid|Pyramids)' | head -3 | sed 's/ *$//'
+  * (glob)
+  * (glob)
+  * (glob)
+
+Verify pyramid structure exists in the zarr store:
+
+  $ ZARR_STORE=$(find "$TESTDIR/zarr_pyramid_test" -name "*.zarr" -type d | head -1)
+  $ uv run python -c "
+  > import zarr
+  > store = zarr.open_group('$ZARR_STORE', mode='r')
+  > attrs = dict(store.attrs)
+  > print(f'has_rgb_pyramid: {attrs.get(\"has_rgb_pyramid\", False)}')
+  > pyramid = store['rgb_pyramid']
+  > levels = sorted(k for k in pyramid.keys())
+  > print(f'levels: {levels}')
+  > level1 = pyramid['1']
+  > full_h, full_w = store['rgb'].shape[:2]
+  > l1_h, l1_w = level1.shape[:2]
+  > print(f'full: {full_h}x{full_w}, level1: {l1_h}x{l1_w}')
+  > print(f'halved: {l1_h == full_h // 2 and l1_w == full_w // 2}')
+  > "
+  has_rgb_pyramid: True
+  levels: * (glob)
+  full: *x*, level1: *x* (glob)
+  halved: True
