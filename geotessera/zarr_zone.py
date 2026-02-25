@@ -441,6 +441,9 @@ def _read_single_tile(
     scales = np.load(tile_info.scales_path)
     scales = apply_landmask_to_scales(scales, tile_info.landmask_path)
 
+    # Treat inf scales as no-data (same as NaN/water)
+    scales[~np.isfinite(scales)] = np.float32("nan")
+
     # Zero out embeddings where scales are NaN (water/no-data)
     embedding[np.isnan(scales)] = 0
 
@@ -783,7 +786,7 @@ def compute_rgb_chunk(
     """Compute an RGBA uint8 preview from embedding + scales."""
     h, w = scales.shape[:2]
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
-    valid = ~np.isnan(scales) & (scales != 0)
+    valid = np.isfinite(scales) & (scales != 0)
     scales_safe = np.where(valid, scales, 0.0)
 
     for i, band_idx in enumerate(band_indices):
@@ -1055,7 +1058,7 @@ def compute_pca_chunk(
     h, w = scales.shape[:2]
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
 
-    valid = ~np.isnan(scales) & (scales != 0)
+    valid = np.isfinite(scales) & (scales != 0)
     if not np.any(valid):
         return rgba
 
@@ -1136,7 +1139,7 @@ def write_preview_pass(
         c0, c1 = cj * chunk_w, min(cj * chunk_w + chunk_w, emb_shape[1])
 
         scales_chunk = np.asarray(scales_arr[r0:r1, c0:c1])
-        if np.all(np.isnan(scales_chunk) | (scales_chunk == 0)):
+        if np.all(~np.isfinite(scales_chunk) | (scales_chunk == 0)):
             return False
 
         emb_chunk = np.asarray(emb_arr[r0:r1, c0:c1, :])
