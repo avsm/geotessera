@@ -6,8 +6,14 @@ This enables efficient spatial subsetting and cloud-native access.
 
 Store layout (uncompressed):
     utm{zone:02d}_{year}.zarr/
-        embeddings    # int8    (northing, easting, band)  chunks=(1024, 1024, 128)
-        scales        # float32 (northing, easting)        chunks=(1024, 1024)
+        embeddings        # int8    (northing, easting, band)  chunks=(1024, 1024, 128)
+        scales            # float32 (northing, easting)        chunks=(1024, 1024)
+        rgb               # uint8   (northing, easting, rgba)  chunks=(1024, 1024, 4)  [optional]
+        pca_rgb           # uint8   (northing, easting, rgba)  chunks=(1024, 1024, 4)  [optional]
+        rgb_pyramid/      # multi-resolution pyramid of rgb    [optional]
+            1/ .. 7/      # uint8, each level 2x coarsened
+        pca_rgb_pyramid/  # multi-resolution pyramid of pca_rgb [optional]
+            1/ .. 7/      # uint8, each level 2x coarsened
 
 NaN in scales indicates no-data (water or no coverage).
 Embeddings are high-entropy quantised values; compression gives negligible
