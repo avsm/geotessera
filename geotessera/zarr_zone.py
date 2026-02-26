@@ -1781,6 +1781,80 @@ def build_mercator_pyramid(
     return result
 
 
+def add_mercator_pyramids_to_existing_store(
+    store_path: Path,
+    max_zoom: int = 12,
+    workers: Optional[int] = None,
+    console: Optional["rich.console.Console"] = None,
+) -> None:
+    """Add Web Mercator pyramids for all existing preview arrays.
+
+    Opens the store at *store_path* in ``r+`` mode, removes any old UTM
+    pyramid groups (``rgb_pyramid``, ``pca_rgb_pyramid``) and their attrs,
+    then builds Mercator pyramids via :func:`build_mercator_pyramid`.
+
+    The *workers* parameter is accepted for API compatibility but unused;
+    ndpyramid handles parallelism internally.
+
+    Args:
+        store_path: Path to the ``.zarr`` directory.
+        max_zoom: Maximum zoom level for Mercator pyramids (default 12).
+        workers: Unused (kept for API compatibility).
+        console: Optional Rich Console for progress display.
+    """
+    import zarr
+
+    store = zarr.open_group(str(store_path), mode="r+")
+    attrs = dict(store.attrs)
+
+    # --- Remove old UTM pyramid groups if present ---
+    for old_group in ["rgb_pyramid", "pca_rgb_pyramid"]:
+        if old_group in store:
+            del store[old_group]
+            if console is not None:
+                console.print(f"  [yellow]Removed old {old_group}[/yellow]")
+
+    # --- Remove old pyramid attrs ---
+    old_attrs = [
+        "has_rgb_pyramid", "rgb_pyramid_levels",
+        "has_pca_rgb_pyramid", "pca_rgb_pyramid_levels",
+    ]
+    current_attrs = dict(store.attrs)
+    new_attrs = {k: v for k, v in current_attrs.items() if k not in old_attrs}
+    if len(new_attrs) < len(current_attrs):
+        store.attrs.clear()
+        store.attrs.update(new_attrs)
+        if console is not None:
+            console.print("  [yellow]Cleared old pyramid attrs[/yellow]")
+
+    # --- Build Mercator pyramids for each preview ---
+    previews = [
+        ("rgb", "has_rgb_preview"),
+        ("pca_rgb", "has_pca_preview"),
+    ]
+
+    for preview_name, attr_flag in previews:
+        if not attrs.get(attr_flag, False):
+            continue
+
+        result = build_mercator_pyramid(
+            store, preview_name, max_zoom=max_zoom, console=console,
+        )
+
+        if result and result.get("levels_written", 0) > 0:
+            store.attrs.update({
+                f"has_{preview_name}_mercator": True,
+                f"{preview_name}_mercator_zoom_range": result["zoom_range"],
+            })
+
+            if console is not None:
+                zmin, zmax = result["zoom_range"]
+                console.print(
+                    f"  [green]{preview_name} mercator pyramid: "
+                    f"zoom {zmin}–{zmax}[/green]"
+                )
+
+
 def add_pyramids_to_existing_store(
     store_path: Path,
     workers: Optional[int] = None,
