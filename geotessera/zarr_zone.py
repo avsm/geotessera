@@ -1391,16 +1391,63 @@ def _utm_array_to_xarray(
     return xda
 
 
-def _mercator_tile_transform(dim: int):
-    """Return the Affine transform for a Web Mercator grid of *dim* × *dim* px.
+def _utm_bounds_to_mercator_tiles(
+    epsg: int,
+    origin_e: float,
+    origin_n: float,
+    pixel_size: float,
+    h: int,
+    w: int,
+    zoom: int,
+) -> Tuple[int, int, int, int]:
+    """Compute which XYZ tiles at *zoom* overlap the UTM data extent.
 
-    Covers the full EPSG:3857 extent (-20037508.34 … +20037508.34).
+    Returns ``(tile_x_min, tile_y_min, tile_x_max, tile_y_max)`` where
+    ``tile_x_max`` and ``tile_y_max`` are exclusive (like a Python range).
     """
-    from rasterio.transform import Affine
+    from pyproj import Transformer
 
-    extent = 20_037_508.342_789_244  # half-circumference of Earth in metres
-    res = 2 * extent / dim
-    return Affine(res, 0.0, -extent, 0.0, -res, extent)
+    # Four corners of the UTM extent
+    corners_utm = [
+        (origin_e, origin_n),
+        (origin_e + w * pixel_size, origin_n),
+        (origin_e, origin_n - h * pixel_size),
+        (origin_e + w * pixel_size, origin_n - h * pixel_size),
+    ]
+
+    # Also add mid-edge points for better bounding at high latitudes
+    mid_e = origin_e + w * pixel_size / 2
+    mid_n = origin_n - h * pixel_size / 2
+    corners_utm += [
+        (mid_e, origin_n),
+        (mid_e, origin_n - h * pixel_size),
+        (origin_e, mid_n),
+        (origin_e + w * pixel_size, mid_n),
+    ]
+
+    transformer = Transformer.from_crs(
+        f"EPSG:{epsg}", "EPSG:3857", always_xy=True
+    )
+    corners_3857 = [transformer.transform(e, n) for e, n in corners_utm]
+
+    xs = [c[0] for c in corners_3857]
+    ys = [c[1] for c in corners_3857]
+
+    extent = 20_037_508.342_789_244
+    tile_size_m = 2 * extent / (2**zoom)  # one tile in metres
+
+    tx_min = int(math.floor((min(xs) + extent) / tile_size_m))
+    tx_max = int(math.ceil((max(xs) + extent) / tile_size_m))
+    ty_min = int(math.floor((extent - max(ys)) / tile_size_m))
+    ty_max = int(math.ceil((extent - min(ys)) / tile_size_m))
+
+    max_tiles = 2**zoom
+    tx_min = max(0, tx_min)
+    tx_max = min(max_tiles, tx_max)
+    ty_min = max(0, ty_min)
+    ty_max = min(max_tiles, ty_max)
+
+    return tx_min, ty_min, tx_max, ty_max
 
 
 def build_mercator_pyramid(
@@ -1416,6 +1463,12 @@ def build_mercator_pyramid(
     the source UTM CRS to EPSG:3857.  Processing one level at a time and
     coarsening before reprojection keeps peak memory usage low even for
     very large source arrays (hundreds of thousands of pixels per side).
+
+    The output at each level is **cropped to the XYZ tiles that overlap
+    the source data**, rather than covering the full world.  Per-level
+    ``tile_offset_x`` / ``tile_offset_y`` attributes record which global
+    XYZ tile the array's top-left corner corresponds to, so the client
+    can map ``(z, x, y)`` requests to the correct array position.
 
     Results are stored as ``{preview_name}_mercator/{zoom}`` with 256×256
     chunk size (one chunk = one XYZ map tile).
@@ -1437,6 +1490,7 @@ def build_mercator_pyramid(
     import zarr
     from pyproj import Transformer
     from rasterio.enums import Resampling
+    from rasterio.transform import Affine as RioAffine
 
     # --- Validate source array exists ---
     try:
@@ -1508,16 +1562,49 @@ def build_mercator_pyramid(
     # (potentially tens of GB) into memory for every level.
     equatorial_circumference = 40_075_016.686
     cos_lat = math.cos(math.radians(center_lat))
+    extent = 20_037_508.342_789_244
 
     levels_written = 0
     tile_bounds = {}
 
     for i in range(num_levels):
         zoom = zoom_min + i
-        # ndpyramid convention: level 0 = coarsest
-        ndp_level = i
 
-        # Target resolution at this zoom level
+        # --- Compute cropped output extent for this zoom ---
+        tx_min, ty_min, tx_max, ty_max = _utm_bounds_to_mercator_tiles(
+            epsg, origin_e, origin_n, pixel_size, h, w, zoom
+        )
+        n_tiles_x = tx_max - tx_min
+        n_tiles_y = ty_max - ty_min
+        out_h = n_tiles_y * 256
+        out_w = n_tiles_x * 256
+
+        # Skip levels where the output would exceed 4 GB (Mercator
+        # distortion at high latitudes can make fine levels enormous).
+        out_bytes = out_h * out_w * nc
+        max_output_bytes = 4 * 1024**3
+        if out_bytes > max_output_bytes:
+            actual_max = zoom - 1
+            if console is not None:
+                console.print(
+                    f"  [yellow]z{zoom}: output {out_h}x{out_w}x{nc} "
+                    f"= {out_bytes / 1024**3:.1f} GB exceeds 4 GB limit, "
+                    f"capping at z{actual_max}[/yellow]"
+                )
+            zoom_max = actual_max
+            break
+
+        # Pixel resolution at this zoom level (metres/pixel in EPSG:3857)
+        pixel_res = 2 * extent / (2**zoom * 256)
+
+        # Affine transform for the cropped output region
+        out_west = -extent + tx_min * 256 * pixel_res
+        out_north = extent - ty_min * 256 * pixel_res
+        dst_transform = RioAffine(
+            pixel_res, 0.0, out_west, 0.0, -pixel_res, out_north
+        )
+
+        # Target resolution at this zoom level (adjusted for latitude)
         target_res = equatorial_circumference * cos_lat / (256 * 2**zoom)
 
         # How much coarser is the target than the source?
@@ -1552,7 +1639,8 @@ def build_mercator_pyramid(
             if console is not None:
                 console.print(
                     f"  [dim]  z{zoom}: coarsen {coarsen_factor}x → "
-                    f"{ch}×{cw} then reproject[/dim]"
+                    f"{ch}×{cw} then reproject "
+                    f"({n_tiles_x}×{n_tiles_y} tiles)[/dim]"
                 )
 
             # Compute the coarsened array into memory (small)
@@ -1561,20 +1649,18 @@ def build_mercator_pyramid(
         else:
             if console is not None:
                 console.print(
-                    f"  [dim]  z{zoom}: reproject at native res[/dim]"
+                    f"  [dim]  z{zoom}: reproject at native res "
+                    f"({n_tiles_x}×{n_tiles_y} tiles)[/dim]"
                 )
             # Fine enough — compute the source into memory
             level_input = src_da.compute()
 
-        # --- Reproject to Web Mercator at this zoom level ---
-        dim = 2**ndp_level * 256  # output grid size
-        dst_transform = _mercator_tile_transform(dim)
-
+        # --- Reproject to Web Mercator (cropped to data extent) ---
         level_ds = level_input.to_dataset(name=preview_name)
         reprojected_ds = level_ds[preview_name].rio.reproject(
             "EPSG:3857",
             resampling=Resampling.average,
-            shape=(dim, dim),
+            shape=(out_h, out_w),
             transform=dst_transform,
         )
 
@@ -1583,7 +1669,8 @@ def build_mercator_pyramid(
         if level_data.ndim == 3 and level_data.shape[0] == nc:
             level_data = np.transpose(level_data, (1, 2, 0))
 
-        # Ensure uint8
+        # Ensure uint8 — NaN pixels (outside source extent) become 0
+        np.nan_to_num(level_data, copy=False, nan=0.0)
         level_data = np.clip(level_data, 0, 255).astype(np.uint8)
 
         # Free intermediate arrays
@@ -1595,9 +1682,6 @@ def build_mercator_pyramid(
         chunk_y = min(256, ly)
         chunk_x = min(256, lx)
 
-        n_tiles_y = math.ceil(ly / 256)
-        n_tiles_x = math.ceil(lx / 256)
-
         out_arr = mercator_group.create_array(
             str(zoom),
             shape=level_data.shape,
@@ -1608,17 +1692,21 @@ def build_mercator_pyramid(
         )
         out_arr[:] = level_data
 
-        # Per-level attrs
+        # Per-level attrs — include tile offset for client mapping
         out_arr.attrs.update({
             "zoom": zoom,
             "shape": list(level_data.shape),
             "n_tiles_y": n_tiles_y,
             "n_tiles_x": n_tiles_x,
+            "tile_offset_x": tx_min,
+            "tile_offset_y": ty_min,
         })
 
         tile_bounds[zoom] = {
             "n_tiles_y": n_tiles_y,
             "n_tiles_x": n_tiles_x,
+            "tile_offset_x": tx_min,
+            "tile_offset_y": ty_min,
             "shape": list(level_data.shape),
         }
         levels_written += 1
@@ -1627,7 +1715,8 @@ def build_mercator_pyramid(
             console.print(
                 f"  [green]zoom {zoom}: "
                 f"{ly}x{lx}x{lc} "
-                f"({n_tiles_y}x{n_tiles_x} tiles)[/green]"
+                f"({n_tiles_y}x{n_tiles_x} tiles, "
+                f"offset {tx_min},{ty_min})[/green]"
             )
 
         del level_data
