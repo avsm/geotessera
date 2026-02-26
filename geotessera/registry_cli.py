@@ -2758,6 +2758,55 @@ def zarr_build_command(args):
     return 0
 
 
+def global_preview_command(args):
+    """Build global EPSG:4326 preview store from per-zone UTM stores."""
+    from .zarr_zone import build_global_preview
+
+    zarr_dir = Path(args.zarr_dir)
+    output_path = Path(args.output)
+    year = args.year
+    num_levels = args.levels
+
+    # Parse zones into list of ints
+    zones = None
+    if args.zones:
+        try:
+            zones = [int(z.strip()) for z in args.zones.split(",")]
+        except ValueError:
+            console.print("[red]Error: --zones must be comma-separated integers[/red]")
+            return 1
+
+    # Parse preview into list of names
+    if args.preview == "both":
+        preview_names = ["rgb", "pca_rgb"]
+    else:
+        preview_names = [args.preview]
+
+    console.print(
+        f"[bold]Building global preview store[/bold]\n"
+        f"  Input:   {zarr_dir}\n"
+        f"  Output:  {output_path}\n"
+        f"  Year:    {year}\n"
+        f"  Levels:  {num_levels}\n"
+        f"  Preview: {', '.join(preview_names)}"
+    )
+    if zones:
+        console.print(f"  Zones:   {', '.join(str(z) for z in zones)}")
+
+    result = build_global_preview(
+        zarr_dir=zarr_dir,
+        output_path=output_path,
+        year=year,
+        zones=zones,
+        num_levels=num_levels,
+        preview_names=preview_names,
+        console=console,
+    )
+
+    console.print(f"\n[bold green]Global preview store written to {result}[/bold green]")
+    return 0
+
+
 def serve_command(args):
     """Serve Zarr stores with a browser-based embedding viewer."""
     import http.server
@@ -3469,6 +3518,49 @@ Directory Structure:
         "(scans existing .zarr stores in output dir)",
     )
     zarr_build_parser.set_defaults(func=zarr_build_command)
+
+    # Global-preview command
+    global_preview_parser = subparsers.add_parser(
+        "global-preview",
+        help="Build global EPSG:4326 preview store from per-zone UTM stores",
+    )
+    global_preview_parser.add_argument(
+        "zarr_dir",
+        type=Path,
+        help="Directory containing utm*_YYYY.zarr stores",
+    )
+    global_preview_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Output path for global preview store",
+    )
+    global_preview_parser.add_argument(
+        "--year",
+        type=int,
+        default=2025,
+        help="Year to process (default: 2025)",
+    )
+    global_preview_parser.add_argument(
+        "--zones",
+        type=str,
+        default=None,
+        help="Comma-separated UTM zones to include (default: all)",
+    )
+    global_preview_parser.add_argument(
+        "--levels",
+        type=int,
+        default=7,
+        help="Number of multiscale levels (default: 7)",
+    )
+    global_preview_parser.add_argument(
+        "--preview",
+        type=str,
+        default="rgb",
+        choices=["rgb", "pca_rgb", "both"],
+        help="Which preview arrays to include (default: rgb)",
+    )
+    global_preview_parser.set_defaults(func=global_preview_command)
 
     # Serve command
     serve_parser = subparsers.add_parser(

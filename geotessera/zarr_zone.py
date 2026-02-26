@@ -1872,3 +1872,21 @@ def read_region_from_zone(
     scales = store["scales"][row_start:row_end, col_start:col_end]
 
     return np.asarray(embeddings), np.asarray(scales), attrs
+
+
+def build_global_preview(
+    zarr_dir: Path,
+    output_path: Path,
+    year: int,
+    zones: Optional[List[int]] = None,
+    num_levels: int = 7,
+    preview_names: Optional[List[str]] = None,
+    console: Optional["rich.console.Console"] = None,
+) -> Path:
+    """Build global EPSG:4326 preview store from per-zone UTM stores.
+
+    Reprojects each zone's rgb (and/or pca_rgb) array from UTM to WGS84,
+    writes into a single global zarr store with zarr-conventions/multiscales
+    metadata for use with @carbonplan/zarr-layer.
+    """
+    raise NotImplementedError("global-preview not yet implemented")
