@@ -1303,7 +1303,11 @@ def add_pca_to_existing_store(
 # Preview pyramids (multi-resolution overviews)
 # =============================================================================
 
-PYRAMID_LEVELS = 8  # level 0 = full-res, levels 1..7 = 2x coarser each
+PYRAMID_LEVELS = 5  # level 0 = full-res, levels 1..4 = 2x coarser each
+# At base=10m this gives L4=160m/px.  A 1024-chunk at L4 covers ~164km,
+# so a typical UTM zone (~600x1200km) needs ~4x8 chunks — plenty coarse
+# for zoomed-out overview tiles.  Deeper levels produce sub-chunk arrays
+# that waste storage with no visual benefit.
 
 
 def _coarsen_strip(strip: np.ndarray) -> np.ndarray:
@@ -1497,6 +1501,284 @@ def build_preview_pyramid(
     })
 
     return levels_written
+
+
+# -----------------------------------------------------------------------------
+# Web Mercator pyramids (ndpyramid-based)
+# -----------------------------------------------------------------------------
+
+
+def _compute_mercator_zoom_range(
+    pixel_size_m: float, center_lat: float, max_zoom: int = 12
+) -> Tuple[int, int]:
+    """Compute the Web Mercator zoom range for a given pixel size and latitude.
+
+    The finest zoom level is chosen so that the tile pixel size roughly
+    matches the source data's native pixel size at the given latitude.
+
+    Args:
+        pixel_size_m: Native pixel size in metres (e.g. 10.0).
+        center_lat: Latitude of the dataset centre in degrees.
+        max_zoom: Hard cap on the finest zoom level (default 12).
+
+    Returns:
+        ``(coarsest_zoom, finest_zoom)`` tuple.
+    """
+    equatorial_circumference = 40_075_016.686  # metres
+    cos_lat = math.cos(math.radians(center_lat))
+    finest = math.ceil(
+        math.log2(equatorial_circumference * cos_lat / (256 * pixel_size_m))
+    )
+    finest = min(finest, max_zoom)
+    coarsest = max(0, finest - 6)
+    return coarsest, finest
+
+
+def _utm_array_to_xarray(
+    store: "zarr.Group", array_name: str
+) -> "xarray.DataArray":
+    """Wrap a UTM zarr preview array as a georeferenced xarray DataArray.
+
+    Reads the full array data, constructs pixel-centre coordinates from
+    the store's affine transform, and attaches CRS metadata via rioxarray.
+
+    The returned DataArray has dims ``('band', 'y', 'x')`` — the order
+    required by rioxarray / rasterio for reprojection.
+
+    Args:
+        store: Zarr group containing the array and transform/CRS attrs.
+        array_name: Name of the preview array (e.g. ``"rgb"``).
+
+    Returns:
+        Georeferenced xarray DataArray ready for reprojection.
+    """
+    import rioxarray  # noqa: F401 — registers .rio accessor
+    import xarray as xr
+    from affine import Affine
+
+    arr = store[array_name]
+    data = np.asarray(arr[:])  # (northing, easting, band) uint8
+
+    attrs = dict(store.attrs)
+    transform = list(attrs["transform"])
+    epsg = int(attrs["crs_epsg"])
+
+    # Affine: [pixel_size, 0, origin_e, 0, -pixel_size, origin_n]
+    pixel_size = transform[0]
+    origin_e = transform[2]
+    origin_n = transform[5]
+
+    h, w, nc = data.shape
+
+    # Pixel-centre coordinates
+    x_coords = origin_e + (np.arange(w) + 0.5) * pixel_size
+    y_coords = origin_n - (np.arange(h) + 0.5) * pixel_size  # northing decreases
+
+    # Transpose to (band, y, x) as required by rioxarray
+    data_byx = np.transpose(data, (2, 0, 1))
+
+    da = xr.DataArray(
+        data_byx,
+        dims=["band", "y", "x"],
+        coords={
+            "y": y_coords,
+            "x": x_coords,
+        },
+    )
+    da = da.rio.write_crs(f"EPSG:{epsg}")
+    da = da.rio.write_transform(Affine(*transform))
+    da = da.rio.set_spatial_dims(x_dim="x", y_dim="y")
+
+    return da
+
+
+def build_mercator_pyramid(
+    store: "zarr.Group",
+    preview_name: str,
+    max_zoom: int = 12,
+    console: Optional["rich.console.Console"] = None,
+) -> dict:
+    """Build a Web Mercator pyramid from a UTM preview array using ndpyramid.
+
+    Reprojects ``store[preview_name]`` into EPSG:3857 at multiple zoom
+    levels and stores the results as ``{preview_name}_mercator/{zoom}``
+    with 256x256 chunk size (one chunk = one XYZ map tile).
+
+    Args:
+        store: Zarr group opened in ``r+`` mode.
+        preview_name: Name of the source array (``"rgb"`` or ``"pca_rgb"``).
+        max_zoom: Maximum zoom level to produce (default 12).
+        console: Optional Rich Console for status messages.
+
+    Returns:
+        Dict with ``zoom_range``, ``tile_bounds``, ``levels_written``
+        (empty dict if the source array is missing).
+    """
+    import rioxarray  # noqa: F401 — registers .rio accessor
+    import xarray as xr
+    import zarr
+    from ndpyramid import pyramid_reproject
+    from pyproj import Transformer
+
+    # --- Validate source array exists ---
+    try:
+        src_arr = store[preview_name]
+    except KeyError:
+        logger.warning(
+            "build_mercator_pyramid: source array %r not found in store",
+            preview_name,
+        )
+        return {}
+
+    # --- Compute centre lat/lon from UTM ---
+    attrs = dict(store.attrs)
+    transform = list(attrs["transform"])
+    epsg = int(attrs["crs_epsg"])
+    pixel_size_m = float(attrs.get("pixel_size_m", transform[0]))
+
+    h, w = src_arr.shape[:2]
+    origin_e = transform[2]
+    origin_n = transform[5]
+    pixel_size = transform[0]
+
+    center_e = origin_e + (w / 2) * pixel_size
+    center_n = origin_n - (h / 2) * pixel_size
+
+    transformer = Transformer.from_crs(
+        f"EPSG:{epsg}", "EPSG:4326", always_xy=True
+    )
+    center_lon, center_lat = transformer.transform(center_e, center_n)
+
+    if console is not None:
+        console.print(
+            f"  [dim]Centre: {center_lat:.4f}N, {center_lon:.4f}E "
+            f"(EPSG:{epsg})[/dim]"
+        )
+
+    # --- Compute zoom range ---
+    zoom_min, zoom_max = _compute_mercator_zoom_range(
+        pixel_size_m, center_lat, max_zoom
+    )
+    num_levels = zoom_max - zoom_min + 1
+
+    if console is not None:
+        console.print(
+            f"  [dim]Zoom range: {zoom_min}–{zoom_max} "
+            f"({num_levels} levels)[/dim]"
+        )
+
+    # --- Delete existing mercator group if present ---
+    mercator_name = f"{preview_name}_mercator"
+    if mercator_name in store:
+        del store[mercator_name]
+
+    mercator_group = store.create_group(mercator_name)
+
+    # --- Wrap UTM array as xarray DataArray ---
+    da = _utm_array_to_xarray(store, preview_name)
+    nc = da.shape[0]  # number of bands (band is first dim)
+    ds = da.to_dataset(name=preview_name)
+
+    if console is not None:
+        console.print(
+            f"  [dim]Reprojecting {preview_name} "
+            f"({h}x{w}x{nc}) to Web Mercator...[/dim]"
+        )
+
+    # --- Run ndpyramid reprojection ---
+    dt = pyramid_reproject(
+        ds,
+        levels=num_levels,
+        pixels_per_tile=256,
+        resampling="average",
+    )
+
+    # --- Write each level to zarr ---
+    levels_written = 0
+    tile_bounds = {}
+
+    for i in range(num_levels):
+        zoom = zoom_min + i
+        level_key = str(i)  # ndpyramid uses 0-indexed keys
+
+        level_ds = dt[level_key].ds
+        level_da = level_ds[preview_name]
+
+        # ndpyramid outputs (band, y, x) — transpose to (y, x, band)
+        level_dims = level_da.dims
+        if level_dims[0] == "band" or (
+            len(level_dims) == 3 and level_dims[0] != "y"
+        ):
+            level_data = np.transpose(level_da.values, (1, 2, 0))
+        else:
+            level_data = level_da.values
+
+        # Ensure uint8 output
+        level_data = np.clip(level_data, 0, 255).astype(np.uint8)
+
+        ly, lx = level_data.shape[:2]
+        lc = level_data.shape[2] if level_data.ndim == 3 else 1
+        chunk_y = min(256, ly)
+        chunk_x = min(256, lx)
+
+        n_tiles_y = math.ceil(ly / 256)
+        n_tiles_x = math.ceil(lx / 256)
+
+        out_arr = mercator_group.create_array(
+            str(zoom),
+            shape=level_data.shape,
+            chunks=(chunk_y, chunk_x, lc),
+            dtype=np.uint8,
+            fill_value=np.uint8(0),
+            compressors=None,
+        )
+        out_arr[:] = level_data
+
+        # Per-level attrs
+        out_arr.attrs.update({
+            "zoom": zoom,
+            "shape": list(level_data.shape),
+            "n_tiles_y": n_tiles_y,
+            "n_tiles_x": n_tiles_x,
+        })
+
+        tile_bounds[zoom] = {
+            "n_tiles_y": n_tiles_y,
+            "n_tiles_x": n_tiles_x,
+            "shape": list(level_data.shape),
+        }
+        levels_written += 1
+
+        if console is not None:
+            console.print(
+                f"  [green]zoom {zoom}: "
+                f"{ly}x{lx}x{lc} "
+                f"({n_tiles_y}x{n_tiles_x} tiles)[/green]"
+            )
+
+    # --- Group-level attrs ---
+    mercator_group.attrs.update({
+        "zoom_min": zoom_min,
+        "zoom_max": zoom_max,
+        "num_levels": levels_written,
+        "center_lon": center_lon,
+        "center_lat": center_lat,
+        "projection": "EPSG:3857",
+    })
+
+    result = {
+        "zoom_range": (zoom_min, zoom_max),
+        "tile_bounds": tile_bounds,
+        "levels_written": levels_written,
+    }
+
+    if console is not None:
+        console.print(
+            f"  [bold green]{preview_name} mercator pyramid: "
+            f"{levels_written} levels (zoom {zoom_min}–{zoom_max})[/bold green]"
+        )
+
+    return result
 
 
 def add_pyramids_to_existing_store(
