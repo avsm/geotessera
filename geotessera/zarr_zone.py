@@ -1336,8 +1336,9 @@ def _utm_array_to_xarray(
 ) -> "xarray.DataArray":
     """Wrap a UTM zarr preview array as a georeferenced xarray DataArray.
 
-    Reads the full array data, constructs pixel-centre coordinates from
-    the store's affine transform, and attaches CRS metadata via rioxarray.
+    Uses dask to lazily reference the zarr array without loading it all
+    into memory.  Constructs pixel-centre coordinates from the store's
+    affine transform and attaches CRS metadata via rioxarray.
 
     The returned DataArray has dims ``('band', 'y', 'x')`` — the order
     required by rioxarray / rasterio for reprojection.
@@ -1347,46 +1348,47 @@ def _utm_array_to_xarray(
         array_name: Name of the preview array (e.g. ``"rgb"``).
 
     Returns:
-        Georeferenced xarray DataArray ready for reprojection.
+        Dask-backed georeferenced xarray DataArray ready for reprojection.
     """
+    import dask.array as da
     import rioxarray  # noqa: F401 — registers .rio accessor
     import xarray as xr
     from affine import Affine
 
     arr = store[array_name]
-    data = np.asarray(arr[:])  # (northing, easting, band) uint8
+    # Lazy dask array — no data loaded into memory yet
+    dask_arr = da.from_zarr(arr)  # (northing, easting, band)
 
-    attrs = dict(store.attrs)
-    transform = list(attrs["transform"])
-    epsg = int(attrs["crs_epsg"])
+    store_attrs = dict(store.attrs)
+    transform = list(store_attrs["transform"])
+    epsg = int(store_attrs["crs_epsg"])
 
-    # Affine: [pixel_size, 0, origin_e, 0, -pixel_size, origin_n]
     pixel_size = transform[0]
     origin_e = transform[2]
     origin_n = transform[5]
 
-    h, w, nc = data.shape
+    h, w, nc = arr.shape
 
     # Pixel-centre coordinates
     x_coords = origin_e + (np.arange(w) + 0.5) * pixel_size
-    y_coords = origin_n - (np.arange(h) + 0.5) * pixel_size  # northing decreases
+    y_coords = origin_n - (np.arange(h) + 0.5) * pixel_size
 
     # Transpose to (band, y, x) as required by rioxarray
-    data_byx = np.transpose(data, (2, 0, 1))
+    dask_byx = da.transpose(dask_arr, (2, 0, 1))
 
-    da = xr.DataArray(
-        data_byx,
+    xda = xr.DataArray(
+        dask_byx,
         dims=["band", "y", "x"],
         coords={
             "y": y_coords,
             "x": x_coords,
         },
     )
-    da = da.rio.write_crs(f"EPSG:{epsg}")
-    da = da.rio.write_transform(Affine(*transform))
-    da = da.rio.set_spatial_dims(x_dim="x", y_dim="y")
+    xda = xda.rio.write_crs(f"EPSG:{epsg}")
+    xda = xda.rio.write_transform(Affine(*transform))
+    xda = xda.rio.set_spatial_dims(x_dim="x", y_dim="y")
 
-    return da
+    return xda
 
 
 def build_mercator_pyramid(
