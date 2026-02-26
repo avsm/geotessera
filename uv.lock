@@ -700,8 +700,10 @@ dependencies = [
     { name = "scikit-learn" },
     { name = "sphinx", version = "9.0.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "sphinx", version = "9.1.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "topozarr" },
     { name = "typer" },
     { name = "xarray" },
+    { name = "xproj" },
     { name = "zarr" },
 ]
 
@@ -729,8 +731,10 @@ requires-dist = [
     { name = "scikit-image", specifier = ">=0.25.2" },
     { name = "scikit-learn", specifier = ">=1.7.1" },
     { name = "sphinx", specifier = ">=8.2.3" },
+    { name = "topozarr", specifier = ">=0.0.4" },
     { name = "typer" },
     { name = "xarray" },
+    { name = "xproj", specifier = ">=0.2.1" },
     { name = "zarr" },
 ]
 
@@ -3000,6 +3004,20 @@ wheels = [
 ]
 
 [[package]]
+name = "topozarr"
+version = "0.0.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "dask" },
+    { name = "xarray" },
+    { name = "xproj" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f0/1d/2857a9bafba94cefd9e618e32b5930555b931a1b5a41f1aa2c5b054abe7e/topozarr-0.0.4.tar.gz", hash = "sha256:05015b4a00ec38af61dade9437d8a8bcb4550e08de00cbee02b3dcbeb05c121b", size = 3886, upload-time = "2026-01-22T21:13:55.289Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6e/89/7932939d5bbe0bb3baa7ab7aef99039d3935f067b35a1fd6744ef963acd5/topozarr-0.0.4-py3-none-any.whl", hash = "sha256:d7c70f993e4728dd857e57d2b17f8929a357cdd7d55355d115b359774e561f57", size = 5608, upload-time = "2026-01-22T21:13:54.269Z" },
+]
+
+[[package]]
 name = "tornado"
 version = "6.5.4"
 source = { registry = "https://pypi.org/simple" }
@@ -3131,6 +3149,19 @@ complete = [
     { name = "seaborn" },
     { name = "sparse" },
     { name = "zarr" },
+]
+
+[[package]]
+name = "xproj"
+version = "0.2.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pyproj" },
+    { name = "xarray" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/48/33/8c2bcceedfa13122916b6a582eedf9581682dbee329d95bcfb4c69542ade/xproj-0.2.1.tar.gz", hash = "sha256:d520c7a0df402f6a5922108ed614c8ea0ce6b04bec12c91aceb75fe3c1d3c5c3", size = 31781, upload-time = "2025-07-07T09:05:48.022Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/05/b9/b6a9cf72aef69c3e6db869dcc130e19452a658366dac9377f9cd32a76b80/xproj-0.2.1-py3-none-any.whl", hash = "sha256:d762c540c1bc4abc5955b4034b409b9b2f7733c3e49285f3aeb71f9a2dd6bf34", size = 23837, upload-time = "2025-07-07T09:05:46.889Z" },
 ]
 
 [[package]]

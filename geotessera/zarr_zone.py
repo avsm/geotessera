@@ -1321,187 +1321,347 @@ def _write_global_store(
     num_levels: int,
     console: "rich.console.Console",
 ) -> None:
-    """Create global 4326 zarr store and reproject each zone into it."""
-    import gc
+    """Create global 4326 zarr store and reproject each zone into it.
 
-    import rioxarray  # noqa: F401 — registers .rio accessor
+    Two phases:
+      1. Reproject each zone's preview arrays from UTM to WGS84 using
+         windowed rasterio.warp.reproject() into a temporary level-0
+         zarr store.  Peak memory ≈ one strip of source + destination.
+      2. Open level-0 as a dask-backed xarray Dataset, use topozarr
+         to build coarsened pyramid levels, and write the final store.
+    """
+    import gc
+    import shutil
+    import tempfile
+
+    import dask.array as da
+    import rasterio.warp
+    import xarray as xr
+    import xproj  # noqa: F401 — registers .proj accessor
     import zarr
     from affine import Affine
+    from pyproj import Transformer
     from rasterio.enums import Resampling
+    from topozarr import create_pyramid
     from zarr.codecs import BloscCodec
 
     west, south, east, north = global_bounds
+    num_bands = 4
+    level0_w = int(math.ceil((east - west) / base_res))
+    level0_h = int(math.ceil((north - south) / base_res))
 
-    # ------------------------------------------------------------------
-    # 1. Create the output zarr store (format 3, write mode)
-    # ------------------------------------------------------------------
-    root = zarr.open_group(str(output_path), mode="w", zarr_format=3)
+    # ==================================================================
+    # Phase 1: Reproject zones into a temporary level-0 zarr store
+    # ==================================================================
+    tmp_dir = tempfile.mkdtemp(prefix="geotessera_global_")
+    tmp_store_path = os.path.join(tmp_dir, "level0.zarr")
 
     if console is not None:
         console.print(
-            f"  [dim]Creating global store at {output_path}[/dim]"
+            f"  [dim]Phase 1: Reprojecting zones into level-0 "
+            f"({level0_w}x{level0_h} @ {base_res}°)[/dim]"
         )
 
-    # ------------------------------------------------------------------
-    # 2. Build each level
-    # ------------------------------------------------------------------
+    tmp_root = zarr.open_group(tmp_store_path, mode="w", zarr_format=3)
+
     for preview_name in preview_names:
         if console is not None:
             console.print(
-                f"\n  [bold]Processing preview: {preview_name}[/bold]"
+                f"\n  [bold]Reprojecting: {preview_name}[/bold]"
             )
 
-        for level in range(num_levels):
-            scale_factor = 2 ** level
-            level_res = base_res * scale_factor
+        tmp_arr = tmp_root.create_array(
+            preview_name,
+            shape=(level0_h, level0_w, num_bands),
+            chunks=(512, 512, num_bands),
+            dtype=np.uint8,
+            fill_value=np.uint8(0),
+            compressors=BloscCodec(cname="zstd", clevel=3),
+        )
 
-            level_w = int(math.ceil((east - west) / level_res))
-            level_h = int(math.ceil((north - south) / level_res))
-            num_bands = 4
+        for zone_num, zinfo in sorted(zone_infos.items()):
+            store_path = zinfo["store_path"]
+            zone_store = zarr.open_group(str(store_path), mode="r")
+
+            if preview_name not in zone_store:
+                continue
+
+            src_arr = zone_store[preview_name]
+            src_h, src_w, _ = src_arr.shape
+            src_epsg = zinfo["epsg"]
+            src_transform = zinfo["transform"]
+            src_pixel = src_transform[0]
+            src_origin_e = src_transform[2]
+            src_origin_n = src_transform[5]
+
+            to_utm = Transformer.from_crs(
+                "EPSG:4326", f"EPSG:{src_epsg}", always_xy=True,
+            )
+
+            zlon_min, zlat_min, zlon_max, zlat_max = (
+                zinfo["bounds_4326"]
+            )
+            zone_col_start = max(
+                0, int(math.floor((zlon_min - west) / base_res))
+            )
+            zone_col_end = min(
+                level0_w,
+                int(math.ceil((zlon_max - west) / base_res)),
+            )
+            zone_strip_w = zone_col_end - zone_col_start
+            if zone_strip_w <= 0:
+                continue
+
+            zone_row_start = max(
+                0, int(math.floor((north - zlat_max) / base_res))
+            )
+            zone_row_end = min(
+                level0_h,
+                int(math.ceil((north - zlat_min) / base_res)),
+            )
+            if zone_row_end <= zone_row_start:
+                continue
 
             if console is not None:
                 console.print(
-                    f"  [dim]Level {level}: {level_w}x{level_h} "
-                    f"(res={level_res:.6f}deg)[/dim]"
+                    f"    Zone {zone_num:02d} "
+                    f"(src {src_h}x{src_w}, "
+                    f"dst rows {zone_row_start}-{zone_row_end}, "
+                    f"cols {zone_col_start}-{zone_col_end})"
                 )
 
-            # Create zarr array for this level
-            arr_path = f"{level}/{preview_name}"
-            arr = root.create_array(
-                arr_path,
-                shape=(level_h, level_w, num_bands),
-                chunks=(512, 512, num_bands),
-                dtype=np.uint8,
-                fill_value=np.uint8(0),
-                compressors=BloscCodec(cname="zstd", clevel=3),
-                dimension_names=["lat", "lon", "band"],
-            )
+            strip_height = 2048
+            strips_written = 0
 
-            # --------------------------------------------------------------
-            # 3. For each zone, reproject into the level array
-            # --------------------------------------------------------------
-            for zone_num, zinfo in sorted(zone_infos.items()):
-                store_path = zinfo["store_path"]
-                zone_store = zarr.open_group(str(store_path), mode="r")
+            for strip_start in range(
+                zone_row_start, zone_row_end, strip_height
+            ):
+                strip_end = min(
+                    strip_start + strip_height, zone_row_end
+                )
+                strip_h = strip_end - strip_start
 
-                # Check that the preview array exists in this zone
-                if preview_name not in zone_store:
+                dst_north = north - strip_start * base_res
+                dst_west = west + zone_col_start * base_res
+
+                dst_transform = Affine(
+                    base_res, 0, dst_west,
+                    0, -base_res, dst_north,
+                )
+
+                # Back-project corners + midpoint to UTM to find
+                # the source window we need
+                dst_east = west + zone_col_end * base_res
+                dst_south = north - strip_end * base_res
+                sample_lons = [
+                    dst_west, dst_east, dst_west, dst_east,
+                    (dst_west + dst_east) / 2,
+                ]
+                sample_lats = [
+                    dst_north, dst_north, dst_south, dst_south,
+                    (dst_north + dst_south) / 2,
+                ]
+                try:
+                    utm_xs, utm_ys = to_utm.transform(
+                        sample_lons, sample_lats
+                    )
+                except Exception:
                     continue
 
-                # Load zone preview as georeferenced xarray DataArray
-                src_da = _utm_array_to_xarray(zone_store, preview_name)
+                if any(
+                    not math.isfinite(v)
+                    for v in list(utm_xs) + list(utm_ys)
+                ):
+                    continue
 
-                # For coarser levels, coarsen the source first
-                coarsen_factor = min(2 ** level, 8)
-                if coarsen_factor > 1:
-                    src_coarsened = src_da.coarsen(
-                        y=coarsen_factor, x=coarsen_factor, boundary="trim"
-                    ).mean()
-                    src_coarsened = src_coarsened.rio.write_crs(src_da.rio.crs)
-                    # Update transform for coarsened resolution
-                    old_t = src_da.rio.transform()
-                    new_t = Affine(
-                        old_t.a * coarsen_factor, old_t.b, old_t.c,
-                        old_t.d, old_t.e * coarsen_factor, old_t.f,
+                pad = 16
+                r_min = max(0, int(
+                    (src_origin_n - max(utm_ys)) / src_pixel
+                ) - pad)
+                r_max = min(src_h, int(math.ceil(
+                    (src_origin_n - min(utm_ys)) / src_pixel
+                )) + pad)
+                c_min = max(0, int(
+                    (min(utm_xs) - src_origin_e) / src_pixel
+                ) - pad)
+                c_max = min(src_w, int(math.ceil(
+                    (max(utm_xs) - src_origin_e) / src_pixel
+                )) + pad)
+
+                if r_max <= r_min or c_max <= c_min:
+                    continue
+
+                window = np.asarray(
+                    src_arr[r_min:r_max, c_min:c_max, :]
+                )
+                if not window.any():
+                    del window
+                    continue
+
+                src_data = np.transpose(
+                    window.astype(np.float32), (2, 0, 1)
+                )
+                del window
+
+                win_transform = Affine(
+                    src_pixel, 0,
+                    src_origin_e + c_min * src_pixel,
+                    0, -src_pixel,
+                    src_origin_n - r_min * src_pixel,
+                )
+
+                dst_data = np.zeros(
+                    (num_bands, strip_h, zone_strip_w),
+                    dtype=np.float32,
+                )
+
+                try:
+                    rasterio.warp.reproject(
+                        source=src_data,
+                        destination=dst_data,
+                        src_transform=win_transform,
+                        src_crs=f"EPSG:{src_epsg}",
+                        dst_transform=dst_transform,
+                        dst_crs="EPSG:4326",
+                        resampling=Resampling.average,
+                        src_nodata=0,
+                        dst_nodata=0,
                     )
-                    src_coarsened = src_coarsened.rio.write_transform(new_t)
-                    src_for_level = src_coarsened
-                else:
-                    src_for_level = src_da
-
-                if console is not None:
-                    console.print(
-                        f"    [dim]Zone {zone_num:02d} → level {level}[/dim]"
-                    )
-
-                # Process in lat strips of ~2048 rows to bound memory
-                strip_height = 2048
-                for strip_start in range(0, level_h, strip_height):
-                    strip_end = min(strip_start + strip_height, level_h)
-                    strip_h = strip_end - strip_start
-                    strip_north = north - strip_start * level_res
-                    strip_south = north - strip_end * level_res
-
-                    strip_transform = Affine(
-                        level_res, 0, west,
-                        0, -level_res, strip_north,
-                    )
-
-                    try:
-                        reprojected = src_for_level.rio.reproject(
-                            "EPSG:4326",
-                            resampling=Resampling.average,
-                            shape=(strip_h, level_w),
-                            transform=strip_transform,
-                            nodata=0,
+                except Exception as exc:
+                    if console is not None:
+                        console.print(
+                            f"      [yellow]strip {strip_start}-"
+                            f"{strip_end}: {exc}[/yellow]"
                         )
-                    except Exception as exc:
-                        # Skip strips where reprojection fails (e.g. zone
-                        # does not intersect this strip at all)
-                        logger.debug(
-                            "Zone %02d level %d strip %d-%d reproject "
-                            "failed: %s",
-                            zone_num, level, strip_start, strip_end, exc,
-                        )
-                        continue
+                    del src_data, dst_data
+                    continue
 
-                    data = reprojected.values  # (bands, H, W)
-                    data = np.nan_to_num(data, nan=0.0)
-                    data = np.clip(data, 0, 255).astype(np.uint8)
-                    data = np.transpose(data, (1, 2, 0))  # (H, W, bands)
+                del src_data
+                dst_data = np.nan_to_num(dst_data, nan=0.0)
+                dst_data = np.clip(dst_data, 0, 255).astype(np.uint8)
+                out = np.transpose(dst_data, (1, 2, 0))
+                del dst_data
 
-                    # Only write non-empty regions
-                    mask = data.any(axis=2)
-                    if not mask.any():
-                        continue
+                mask = out.any(axis=2)
+                if not mask.any():
+                    del out, mask
+                    continue
 
-                    cols = np.any(mask, axis=0)
-                    col_indices = np.where(cols)[0]
-                    c_min = (col_indices[0] // 512) * 512
-                    c_max = min(
-                        ((col_indices[-1] // 512) + 1) * 512, level_w
-                    )
+                tmp_arr[
+                    strip_start:strip_end,
+                    zone_col_start:zone_col_end,
+                    :,
+                ] = out
 
-                    arr[strip_start:strip_end, c_min:c_max, :] = (
-                        data[:, c_min:c_max, :]
-                    )
-
-                    del reprojected, data, mask
-                    gc.collect()
-
-                del src_da, src_for_level
+                strips_written += 1
+                del out, mask
                 gc.collect()
 
-    # ------------------------------------------------------------------
-    # 4. Write multiscales metadata
-    # ------------------------------------------------------------------
-    level_metas = []
-    for level in range(num_levels):
-        scale_factor = 2 ** level
-        level_res = base_res * scale_factor
-        level_metas.append({
-            "asset": str(level),
-            "transform": {
-                "scale": [level_res, level_res],
-                "translation": [west, south],
+            if console is not None:
+                console.print(
+                    f"      {strips_written} strips written"
+                )
+
+    # ==================================================================
+    # Phase 2: Use topozarr to build pyramid from level-0
+    # ==================================================================
+    if console is not None:
+        console.print(
+            f"\n  [bold]Phase 2: Building {num_levels}-level pyramid "
+            f"with topozarr[/bold]"
+        )
+
+    # Open the temporary level-0 as dask-backed xarray
+    for preview_name in preview_names:
+        level0_zarr = zarr.open_array(
+            os.path.join(tmp_store_path, preview_name), mode="r"
+        )
+
+        dask_arr = da.from_zarr(level0_zarr, chunks=(512, 512, num_bands))
+
+        lat_coords = north - (np.arange(level0_h) + 0.5) * base_res
+        lon_coords = west + (np.arange(level0_w) + 0.5) * base_res
+
+        ds = xr.Dataset(
+            {
+                preview_name: xr.DataArray(
+                    dask_arr,
+                    dims=["lat", "lon", "band"],
+                    coords={
+                        "lat": lat_coords,
+                        "lon": lon_coords,
+                    },
+                ),
             },
-        })
+        )
+        ds = ds.proj.assign_crs(spatial_ref_crs={"EPSG": 4326})
 
-    root.attrs.update({
-        "multiscales": {
-            "layout": level_metas,
-            "resampling_method": "average",
-            "crs": "EPSG:4326",
-        },
-    })
+        pyramid = create_pyramid(
+            ds,
+            levels=num_levels,
+            x_dim="lon",
+            y_dim="lat",
+            method="mean",
+            target_chunk_bytes=512 * 512 * num_bands,  # ~1 MB chunks
+            target_shard_bytes=None,  # no sharding
+        )
 
-    # ------------------------------------------------------------------
-    # 5. Consolidate metadata (avoids per-level metadata fetches)
-    # ------------------------------------------------------------------
+        # topozarr sets non-spatial dims to chunk=1, but for 4-band
+        # RGBA that means 4x the fetches.  Override encoding + dask
+        # chunks to keep band=num_bands.
+        for path, var_enc in pyramid.encoding.items():
+            for var_name, enc in var_enc.items():
+                if "chunks" in enc:
+                    chunks = list(enc["chunks"])
+                    lvl_ds = pyramid.dt[path].dataset
+                    if var_name in lvl_ds:
+                        da_var = lvl_ds[var_name]
+                        for i, dim in enumerate(da_var.dims):
+                            if dim == "band":
+                                chunks[i] = int(da_var.sizes["band"])
+                        enc["chunks"] = tuple(chunks)
+                enc["compressors"] = BloscCodec(cname="zstd", clevel=3)
+
+            # Rechunk DataTree node so dask chunks match encoding
+            node = pyramid.dt[path]
+            rechunked = node.to_dataset().chunk({"band": num_bands})
+            pyramid.dt[path] = rechunked
+
+        if console is not None:
+            for idx in range(num_levels):
+                lvl_ds = pyramid.dt[f"/{idx}"].dataset
+                shape = lvl_ds[preview_name].shape
+                console.print(
+                    f"  [dim]Level {idx}: "
+                    f"{shape[1]}x{shape[0]}x{shape[2]}[/dim]"
+                )
+
+        # Patch CRS into multiscales for zarr-layer compatibility
+        attrs = dict(pyramid.dt.attrs)
+        if "multiscales" in attrs:
+            attrs["multiscales"]["crs"] = "EPSG:4326"
+            pyramid.dt.attrs = attrs
+
+        if console is not None:
+            console.print(
+                f"  [dim]Writing pyramid to {output_path}[/dim]"
+            )
+
+        pyramid.dt.to_zarr(
+            str(output_path),
+            mode="w",
+            encoding=pyramid.encoding,
+            zarr_format=3,
+        )
+
+    # Consolidate metadata
     zarr.consolidate_metadata(str(output_path))
 
+    # Clean up temporary store
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+
     # ------------------------------------------------------------------
-    # 6. Print summary
+    # Print summary
     # ------------------------------------------------------------------
     if console is not None:
         console.print(

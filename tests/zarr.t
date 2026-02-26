@@ -168,49 +168,53 @@ Verify that the CLI help text mentions zarr as a format option:
   $ geotessera download --help | grep -i zarr | head -1
   *zarr* (glob)
 
-Test: Mercator Pyramid Building on Preview Arrays
---------------------------------------------------
+Test: Global Preview Store Structure
+-------------------------------------
 
 Build a zone store with RGB from the Cambridge tiles:
 
   $ geotessera-registry zarr-build \
   >   "$TESTDIR/cb_tiles_zarr" \
-  >   --output-dir "$TESTDIR/zarr_mercator_test" \
+  >   --output-dir "$TESTDIR/zarr_global_test" \
   >   --year 2024 \
   >   --rgb 2>&1 | grep -E '(RGB preview|Zone)' | head -3 | sed 's/ *$//'
   * (glob)
   * (glob)
   * (glob)
 
-Add mercator pyramids to the store:
+Build global preview store from the zone store:
 
-  $ geotessera-registry zarr-build \
-  >   "$TESTDIR/cb_tiles_zarr" \
-  >   --output-dir "$TESTDIR/zarr_mercator_test" \
-  >   --pyramid-only 2>&1 | grep -E '(mercator|Mercator|Pyramids)' | head -5 | sed 's/ *$//'
+  $ geotessera-registry global-preview \
+  >   "$TESTDIR/zarr_global_test" \
+  >   --output "$TESTDIR/zarr_global_test/global_rgb_2024.zarr" \
+  >   --year 2024 \
+  >   --levels 3 \
+  >   --preview rgb 2>&1 | grep -E '(Global|levels|store written)' | head -3 | sed 's/ *$//'
   * (glob)
   * (glob)
   * (glob)
 
-Verify mercator pyramid structure exists in the zarr store:
+Verify global preview store structure has multiscales metadata:
 
-  $ ZARR_STORE=$(find "$TESTDIR/zarr_mercator_test" -name "*.zarr" -type d | head -1)
   $ uv run python -c "
-  > import zarr
-  > store = zarr.open_group('$ZARR_STORE', mode='r')
-  > attrs = dict(store.attrs)
-  > print(f'has_rgb_mercator: {attrs.get(\"has_rgb_mercator\", False)}')
-  > zoom_range = attrs.get('rgb_mercator_zoom_range', None)
-  > print(f'zoom_range: {zoom_range}')
-  > mercator = store['rgb_mercator']
-  > levels = sorted(k for k in mercator.keys())
-  > print(f'levels: {levels}')
-  > first_level = mercator[levels[0]]
-  > print(f'first_level_shape: {first_level.shape}')
-  > print(f'first_level_chunks: {first_level.chunks}')
+  > import json
+  > with open('$TESTDIR/zarr_global_test/global_rgb_2024.zarr/zarr.json') as f:
+  >     meta = json.load(f)
+  > ms = meta['attributes']['multiscales']
+  > print(f'crs: {ms[\"crs\"]}')
+  > print(f'num_levels: {len(ms[\"layout\"])}')
+  > print(f'has_consolidated: {\"consolidated_metadata\" in meta}')
+  > cm = meta['consolidated_metadata']['metadata']
+  > has_rgb = any('rgb' in k for k in cm)
+  > print(f'has_rgb_arrays: {has_rgb}')
+  > first_arr = [v for k, v in cm.items() if 'rgb' in k][0]
+  > has_blosc = any(c.get('name') == 'blosc' for c in first_arr.get('codecs', []))
+  > print(f'has_blosc: {has_blosc}')
+  > print(f'dimension_names: {first_arr.get(\"dimension_names\")}')
   > "
-  has_rgb_mercator: True
-  zoom_range: * (glob)
-  levels: * (glob)
-  first_level_shape: * (glob)
-  first_level_chunks: * (glob)
+  crs: EPSG:4326
+  num_levels: 3
+  has_consolidated: True
+  has_rgb_arrays: True
+  has_blosc: True
+  dimension_names: ['lat', 'lon', 'band']
