@@ -2106,4 +2106,189 @@ def _write_global_store(
     console: "rich.console.Console",
 ) -> None:
     """Create global 4326 zarr store and reproject each zone into it."""
-    console.print("[yellow]_write_global_store not yet implemented")
+    import gc
+
+    import rioxarray  # noqa: F401 — registers .rio accessor
+    import zarr
+    from affine import Affine
+    from rasterio.enums import Resampling
+
+    west, south, east, north = global_bounds
+
+    # ------------------------------------------------------------------
+    # 1. Create the output zarr store (format 3, write mode)
+    # ------------------------------------------------------------------
+    root = zarr.open_group(str(output_path), mode="w", zarr_format=3)
+
+    if console is not None:
+        console.print(
+            f"  [dim]Creating global store at {output_path}[/dim]"
+        )
+
+    # ------------------------------------------------------------------
+    # 2. Build each level
+    # ------------------------------------------------------------------
+    for preview_name in preview_names:
+        if console is not None:
+            console.print(
+                f"\n  [bold]Processing preview: {preview_name}[/bold]"
+            )
+
+        for level in range(num_levels):
+            scale_factor = 2 ** level
+            level_res = base_res * scale_factor
+
+            level_w = int(math.ceil((east - west) / level_res))
+            level_h = int(math.ceil((north - south) / level_res))
+            num_bands = 4
+
+            if console is not None:
+                console.print(
+                    f"  [dim]Level {level}: {level_w}x{level_h} "
+                    f"(res={level_res:.6f}deg)[/dim]"
+                )
+
+            # Create zarr array for this level
+            arr_path = f"{level}/{preview_name}"
+            arr = root.create_array(
+                arr_path,
+                shape=(level_h, level_w, num_bands),
+                chunks=(512, 512, num_bands),
+                dtype=np.uint8,
+                fill_value=np.uint8(0),
+                compressors=None,
+            )
+            arr.attrs["_ARRAY_DIMENSIONS"] = ["lat", "lon", "band"]
+
+            # --------------------------------------------------------------
+            # 3. For each zone, reproject into the level array
+            # --------------------------------------------------------------
+            for zone_num, zinfo in sorted(zone_infos.items()):
+                store_path = zinfo["store_path"]
+                zone_store = zarr.open_group(str(store_path), mode="r")
+
+                # Check that the preview array exists in this zone
+                if preview_name not in zone_store:
+                    continue
+
+                # Load zone preview as georeferenced xarray DataArray
+                src_da = _utm_array_to_xarray(zone_store, preview_name)
+
+                # For coarser levels, coarsen the source first
+                coarsen_factor = min(2 ** level, 8)
+                if coarsen_factor > 1:
+                    src_coarsened = src_da.coarsen(
+                        y=coarsen_factor, x=coarsen_factor, boundary="trim"
+                    ).mean()
+                    src_coarsened = src_coarsened.rio.write_crs(src_da.rio.crs)
+                    # Update transform for coarsened resolution
+                    old_t = src_da.rio.transform()
+                    new_t = Affine(
+                        old_t.a * coarsen_factor, old_t.b, old_t.c,
+                        old_t.d, old_t.e * coarsen_factor, old_t.f,
+                    )
+                    src_coarsened = src_coarsened.rio.write_transform(new_t)
+                    src_for_level = src_coarsened
+                else:
+                    src_for_level = src_da
+
+                if console is not None:
+                    console.print(
+                        f"    [dim]Zone {zone_num:02d} → level {level}[/dim]"
+                    )
+
+                # Process in lat strips of ~2048 rows to bound memory
+                strip_height = 2048
+                for strip_start in range(0, level_h, strip_height):
+                    strip_end = min(strip_start + strip_height, level_h)
+                    strip_h = strip_end - strip_start
+                    strip_north = north - strip_start * level_res
+                    strip_south = north - strip_end * level_res
+
+                    strip_transform = Affine(
+                        level_res, 0, west,
+                        0, -level_res, strip_north,
+                    )
+
+                    try:
+                        reprojected = src_for_level.rio.reproject(
+                            "EPSG:4326",
+                            resampling=Resampling.average,
+                            shape=(num_bands, strip_h, level_w),
+                            transform=strip_transform,
+                            nodata=0,
+                        )
+                    except Exception:
+                        # Skip strips where reprojection fails (e.g. zone
+                        # does not intersect this strip at all)
+                        continue
+
+                    data = reprojected.values  # (bands, H, W)
+                    data = np.nan_to_num(data, nan=0.0)
+                    data = np.clip(data, 0, 255).astype(np.uint8)
+                    data = np.transpose(data, (1, 2, 0))  # (H, W, bands)
+
+                    # Only write non-empty regions
+                    mask = data.any(axis=2)
+                    if not mask.any():
+                        continue
+
+                    cols = np.any(mask, axis=0)
+                    col_indices = np.where(cols)[0]
+                    c_min = (col_indices[0] // 512) * 512
+                    c_max = min(
+                        ((col_indices[-1] // 512) + 1) * 512, level_w
+                    )
+
+                    arr[strip_start:strip_end, c_min:c_max, :] = (
+                        data[:, c_min:c_max, :]
+                    )
+
+                    del reprojected, data, mask
+                    gc.collect()
+
+                del src_da, src_for_level
+                gc.collect()
+
+    # ------------------------------------------------------------------
+    # 4. Write multiscales metadata
+    # ------------------------------------------------------------------
+    level_metas = []
+    for level in range(num_levels):
+        scale_factor = 2 ** level
+        level_res = base_res * scale_factor
+        level_metas.append({
+            "asset": str(level),
+            "transform": {
+                "scale": [level_res, level_res],
+                "translation": [west, south],
+            },
+        })
+
+    root.attrs.update({
+        "multiscales": {
+            "layout": level_metas,
+            "resampling_method": "average",
+            "crs": "EPSG:4326",
+        },
+    })
+
+    # ------------------------------------------------------------------
+    # 5. Print summary
+    # ------------------------------------------------------------------
+    if console is not None:
+        console.print(
+            f"\n  [bold green]Global store written to {output_path}[/bold green]"
+        )
+        console.print(
+            f"  [dim]{num_levels} levels, "
+            f"{len(preview_names)} preview(s): {preview_names}[/dim]"
+        )
+        console.print(
+            f"  [dim]Bounds: lon [{west:.4f}, {east:.4f}], "
+            f"lat [{south:.4f}, {north:.4f}][/dim]"
+        )
+        console.print(
+            f"  [dim]Base resolution: {base_res}deg, "
+            f"zones: {sorted(zone_infos.keys())}[/dim]"
+        )
