@@ -1510,8 +1510,9 @@ def _write_global_store(
                     src_origin_n - r_min * src_pixel,
                 )
 
-                dst_data = np.zeros(
+                dst_data = np.full(
                     (num_bands, strip_h, zone_strip_w),
+                    np.nan,
                     dtype=np.float32,
                 )
 
@@ -1524,8 +1525,6 @@ def _write_global_store(
                         dst_transform=dst_transform,
                         dst_crs="EPSG:4326",
                         resampling=Resampling.average,
-                        src_nodata=0,
-                        dst_nodata=0,
                     )
                 except Exception as exc:
                     if console is not None:
