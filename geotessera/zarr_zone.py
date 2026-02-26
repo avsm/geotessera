@@ -776,16 +776,17 @@ def build_zone_stores(
         if pyramid:
             for preview_name in ["rgb", "pca_rgb"]:
                 if preview_name in store:
-                    levels = build_preview_pyramid(
-                        store, preview_name, workers=workers, console=console,
+                    result = build_mercator_pyramid(
+                        store, preview_name, console=console,
                     )
-                    if levels > 0:
+                    if result and result.get("levels_written", 0) > 0:
                         store.attrs.update({
-                            f"has_{preview_name}_pyramid": True,
-                            f"{preview_name}_pyramid_levels": levels + 1,
+                            f"has_{preview_name}_mercator": True,
+                            f"{preview_name}_mercator_zoom_range": result["zoom_range"],
                         })
                         if console is not None:
-                            console.print(f"  [green]{preview_name} pyramid: {levels} levels[/green]")
+                            zmin, zmax = result["zoom_range"]
+                            console.print(f"  [green]{preview_name} mercator: z={zmin}-{zmax}[/green]")
 
         created_stores.append(output_dir / store_name)
 

@@ -2525,7 +2525,7 @@ def file_check_command(args):
 
 def zarr_build_command(args):
     """Build zone-wide Zarr stores from local tile data."""
-    from .zarr_zone import build_zone_stores, add_rgb_to_existing_store, add_pca_to_existing_store, add_pyramids_to_existing_store
+    from .zarr_zone import build_zone_stores, add_rgb_to_existing_store, add_pca_to_existing_store, add_mercator_pyramids_to_existing_store
     from .registry import Registry
 
     base_dir = args.base_dir
@@ -2676,7 +2676,7 @@ def zarr_build_command(args):
 
         for store_path in zarr_stores:
             console.print(f"\n  [cyan]{store_path.name}[/cyan]")
-            add_pyramids_to_existing_store(store_path, workers=args.workers, console=console)
+            add_mercator_pyramids_to_existing_store(store_path, console=console)
 
         console.print(f"\n[bold green]Pyramids added to {len(zarr_stores)} store(s)[/bold green]")
         return 0
