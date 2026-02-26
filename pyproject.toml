@@ -39,6 +39,7 @@ dependencies = [
     "zarr",
     "dask",
     "pystac",
+    "ndpyramid",
 ]
 
 [project.urls]
