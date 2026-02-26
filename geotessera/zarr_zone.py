@@ -1656,6 +1656,14 @@ def _write_global_store(
     # Consolidate metadata
     zarr.consolidate_metadata(str(output_path))
 
+    # Re-apply root attributes after consolidation (consolidate_metadata
+    # may overwrite the root zarr.json, dropping custom attributes like
+    # multiscales that were set on the datatree).
+    root = zarr.open_group(str(output_path), mode="r+", zarr_format=3)
+    if not root.attrs.get("multiscales") and attrs.get("multiscales"):
+        root.attrs.update(attrs)
+        logger.info("Re-applied multiscales attributes after consolidation")
+
     # Clean up temporary store
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
