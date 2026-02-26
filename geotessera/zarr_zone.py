@@ -9,11 +9,6 @@ Store layout (uncompressed):
         embeddings        # int8    (northing, easting, band)  chunks=(1024, 1024, 128)
         scales            # float32 (northing, easting)        chunks=(1024, 1024)
         rgb               # uint8   (northing, easting, rgba)  chunks=(1024, 1024, 4)  [optional]
-        pca_rgb           # uint8   (northing, easting, rgba)  chunks=(1024, 1024, 4)  [optional]
-        rgb_mercator/     # Web Mercator pyramid of rgb         [optional]
-            {zoom}/       # uint8 (y, x, band), 256x256 chunks
-        pca_rgb_mercator/ # Web Mercator pyramid of pca_rgb     [optional]
-            {zoom}/       # uint8 (y, x, band), 256x256 chunks
 
 NaN in scales indicates no-data (water or no coverage).
 Embeddings are high-entropy quantised values; compression gives negligible
@@ -288,7 +283,6 @@ def create_zone_store(
     geotessera_version: str = "unknown",
     dataset_version: str = "v1",
     include_rgb: bool = False,
-    include_pca: bool = False,
 ) -> "zarr.Group":
     """Create a new Zarr v3 store for a UTM zone."""
     import zarr
@@ -321,7 +315,7 @@ def create_zone_store(
     )
 
     # Optional preview arrays
-    for name in (["rgb"] if include_rgb else []) + (["pca_rgb"] if include_pca else []):
+    for name in (["rgb"] if include_rgb else []):
         store.create_array(
             name,
             shape=(zone_grid.height_px, zone_grid.width_px, 4),
@@ -613,8 +607,6 @@ def build_zone_stores(
     dataset_version: str = "v1",
     console: Optional["rich.console.Console"] = None,
     rgb: bool = True,
-    pca: bool = True,
-    pyramid: bool = False,
     workers: Optional[int] = None,
 ) -> List[Path]:
     """Build zone-wide Zarr stores from local tile data.
@@ -679,7 +671,7 @@ def build_zone_stores(
             zone_grid, output_dir,
             geotessera_version=geotessera_version,
             dataset_version=dataset_version,
-            include_rgb=rgb, include_pca=pca,
+            include_rgb=rgb,
         )
 
         # Write tiles: read each tile from disk, write directly to store
@@ -744,50 +736,6 @@ def build_zone_stores(
             })
             if console is not None:
                 console.print(f"  [green]RGB preview: {written} chunks written[/green]")
-
-        if pca:
-            pca_basis = compute_pca_basis(store, workers=workers, console=console)
-            if console is not None:
-                evr = pca_basis["explained_variance_ratio"]
-                console.print(
-                    f"  PCA explained variance: "
-                    f"[{evr[0]:.1%}, {evr[1]:.1%}, {evr[2]:.1%}] "
-                    f"(total {evr.sum():.1%})"
-                )
-            pca_written = write_preview_pass(
-                store, "pca_rgb",
-                lambda emb, sc: compute_pca_chunk(emb, sc, pca_basis),
-                workers=workers, console=console, label="Writing PCA preview",
-            )
-            store.attrs.update({
-                "has_pca_preview": True,
-                "pca_explained_variance": pca_basis["explained_variance_ratio"].tolist(),
-                "pca_components": pca_basis["components"].tolist(),
-                "pca_mean": pca_basis["mean"].tolist(),
-                "pca_medians": pca_basis["pc_medians"].tolist(),
-                "pca_iqrs": pca_basis["pc_iqrs"].tolist(),
-                "pca_stretch": {
-                    "min": pca_basis["p_low"].tolist(),
-                    "max": pca_basis["p_high"].tolist(),
-                },
-            })
-            if console is not None:
-                console.print(f"  [green]PCA preview: {pca_written} chunks written[/green]")
-
-        if pyramid:
-            for preview_name in ["rgb", "pca_rgb"]:
-                if preview_name in store:
-                    result = build_mercator_pyramid(
-                        store, preview_name, console=console,
-                    )
-                    if result and result.get("levels_written", 0) > 0:
-                        store.attrs.update({
-                            f"has_{preview_name}_mercator": True,
-                            f"{preview_name}_mercator_zoom_range": result["zoom_range"],
-                        })
-                        if console is not None:
-                            zmin, zmax = result["zoom_range"]
-                            console.print(f"  [green]{preview_name} mercator: z={zmin}-{zmax}[/green]")
 
         created_stores.append(output_dir / store_name)
 
@@ -908,218 +856,9 @@ def compute_stretch_from_store(
     return {"min": stretch_min, "max": stretch_max}
 
 
-# =============================================================================
-# PCA preview
-# =============================================================================
-
-
-def _randomized_svd(
-    data: np.ndarray,
-    n_components: int,
-    n_oversamples: int = 10,
-    n_power_iter: int = 2,
-    rng: Optional[np.random.Generator] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Randomized SVD (Halko-Martinsson-Tropp) for low-rank approximation."""
-    if rng is None:
-        rng = np.random.default_rng(42)
-    n_samples, n_features = data.shape
-    k = n_components + n_oversamples
-
-    omega = rng.standard_normal((n_features, k)).astype(np.float32)
-    Y = data @ omega
-
-    for _ in range(n_power_iter):
-        Y = data @ (data.T @ Y)
-
-    Q, _ = np.linalg.qr(Y)
-    B = Q.T @ data
-    U_hat, S, Vt = np.linalg.svd(B, full_matrices=False)
-    U = Q @ U_hat
-
-    return U[:, :n_components], S[:n_components], Vt[:n_components]
-
-
-def compute_pca_basis(
-    store: "zarr.Group",
-    n_components: int = 3,
-    max_per_chunk: int = 5000,
-    max_total_samples: int = 200_000,
-    chunk_sample_fraction: float = 0.25,
-    workers: int = 8,
-    console: Optional["rich.console.Console"] = None,
-) -> dict:
-    """Compute PCA basis from an existing store using parallel reads."""
-    emb_arr = store["embeddings"]
-    scales_arr = store["scales"]
-    emb_shape = emb_arr.shape
-    chunk_h, chunk_w = emb_arr.chunks[:2]
-    n_rows = math.ceil(emb_shape[0] / chunk_h)
-    n_cols = math.ceil(emb_shape[1] / chunk_w)
-    total_chunks = n_rows * n_cols
-
-    # Sample a subset of chunks — PCA on 128 dims converges with ~50-100K samples
-    all_chunk_indices = [(ci, cj) for ci in range(n_rows) for cj in range(n_cols)]
-    rng = np.random.default_rng(42)
-
-    n_to_sample = max(4, int(total_chunks * chunk_sample_fraction))
-    if n_to_sample < total_chunks:
-        sampled = rng.choice(len(all_chunk_indices), n_to_sample, replace=False)
-        chunk_indices = [all_chunk_indices[i] for i in sampled]
-    else:
-        chunk_indices = all_chunk_indices
-
-    results = _run_parallel(
-        lambda idx: _sample_chunk_stats(
-            emb_arr, scales_arr, idx[0], idx[1],
-            chunk_h, chunk_w, emb_shape,
-            max_per_chunk=max_per_chunk,
-        ),
-        chunk_indices, workers, console,
-        label=f"Sampling for PCA ({len(chunk_indices)}/{total_chunks} chunks)",
-    )
-
-    samples = [r for _, r in results if r is not None]
-    if not samples:
-        components = np.eye(n_components, N_BANDS, dtype=np.float32)
-        return {
-            "components": components,
-            "mean": np.zeros(N_BANDS, dtype=np.float32),
-            "p_low": np.zeros(n_components, dtype=np.float32),
-            "p_high": np.ones(n_components, dtype=np.float32),
-            "explained_variance_ratio": np.zeros(n_components, dtype=np.float32),
-        }
-
-    all_data = np.concatenate(samples, axis=0)
-
-    # Remove rows with NaN or inf (can arise from inf scales values)
-    finite_mask = np.isfinite(all_data).all(axis=1)
-    if not finite_mask.all():
-        n_bad = int((~finite_mask).sum())
-        all_data = all_data[finite_mask]
-        if console is not None:
-            console.print(f"  PCA: dropped {n_bad} non-finite samples")
-        if all_data.shape[0] == 0:
-            components = np.eye(n_components, N_BANDS, dtype=np.float32)
-            return {
-                "components": components,
-                "mean": np.zeros(N_BANDS, dtype=np.float32),
-                "p_low": np.zeros(n_components, dtype=np.float32),
-                "p_high": np.ones(n_components, dtype=np.float32),
-                "explained_variance_ratio": np.zeros(n_components, dtype=np.float32),
-            }
-
-    if all_data.shape[0] > max_total_samples:
-        idx = rng.choice(all_data.shape[0], max_total_samples, replace=False)
-        all_data = all_data[idx]
-
-    if console is not None:
-        console.print(
-            f"  PCA: {all_data.shape[0]} samples from {len(chunk_indices)} chunks, "
-            f"computing randomized SVD..."
-        )
-
-    mean = all_data.mean(axis=0)
-    centred = all_data - mean
-
-    U, S, Vt = _randomized_svd(centred, n_components, rng=rng)
-    components = Vt.astype(np.float32)
-
-    total_var = np.sum(centred ** 2)
-    explained = (S ** 2) / total_var if total_var > 0 else np.zeros(n_components)
-
-    # Project samples and equalise each component's spread so all three
-    # channels use the full [0, 255] range independently.  Without this,
-    # PC1 dominates and the image is biased toward one colour.
-    projected = centred @ components.T  # (N, 3)
-
-    # Per-component standardisation: shift to median, scale by IQR
-    for i in range(n_components):
-        pc = projected[:, i]
-        median = np.median(pc)
-        q25, q75 = np.percentile(pc, [25, 75])
-        iqr = q75 - q25
-        if iqr > 0:
-            projected[:, i] = (pc - median) / iqr
-
-    # Now all components have comparable spread; compute stretch percentiles
-    p_low = np.percentile(projected, 1, axis=0).astype(np.float32)
-    p_high = np.percentile(projected, 99, axis=0).astype(np.float32)
-
-    for i in range(n_components):
-        if p_high[i] <= p_low[i]:
-            p_high[i] = p_low[i] + 1.0
-
-    # Store the per-component normalisation params so compute_pca_chunk
-    # can reproduce the same transform
-    pc_medians = np.array([
-        np.median(centred @ components[i]) for i in range(n_components)
-    ], dtype=np.float32)
-    pc_iqrs = np.array([
-        max(np.percentile(centred @ components[i], 75) -
-            np.percentile(centred @ components[i], 25), 1e-6)
-        for i in range(n_components)
-    ], dtype=np.float32)
-
-    return {
-        "components": components,
-        "mean": mean.astype(np.float32),
-        "p_low": p_low,
-        "p_high": p_high,
-        "pc_medians": pc_medians,
-        "pc_iqrs": pc_iqrs,
-        "explained_variance_ratio": explained.astype(np.float32),
-    }
-
-
-def compute_pca_chunk(
-    embedding_int8: np.ndarray,
-    scales: np.ndarray,
-    pca_basis: dict,
-) -> np.ndarray:
-    """Compute an RGBA uint8 PCA preview from embedding + scales."""
-    h, w = scales.shape[:2]
-    rgba = np.zeros((h, w, 4), dtype=np.uint8)
-
-    valid = np.isfinite(scales) & (scales != 0)
-    if not np.any(valid):
-        return rgba
-
-    components = pca_basis["components"]
-    mean = pca_basis["mean"]
-    p_low = pca_basis["p_low"]
-    p_high = pca_basis["p_high"]
-    pc_medians = pca_basis["pc_medians"]
-    pc_iqrs = pca_basis["pc_iqrs"]
-
-    scales_safe = np.where(valid, scales, 0.0)
-    float_emb = embedding_int8.astype(np.float32) * scales_safe[:, :, np.newaxis]
-
-    flat = float_emb.reshape(-1, N_BANDS)
-    valid_flat = valid.ravel()
-
-    # Project and apply per-component normalisation (same as basis computation)
-    projected = (flat - mean) @ components.T
-    for i in range(3):
-        projected[:, i] = (projected[:, i] - pc_medians[i]) / pc_iqrs[i]
-
-    # Stretch to [0, 1] using the percentiles computed on normalised data
-    for i in range(3):
-        projected[:, i] = (projected[:, i] - p_low[i]) / (p_high[i] - p_low[i])
-
-    projected = np.clip(projected, 0, 1) * 255
-    rgb_flat = projected.astype(np.uint8)
-
-    rgba_flat = rgba.reshape(-1, 4)
-    rgba_flat[:, :3] = rgb_flat[:, :3]
-    rgba_flat[~valid_flat, :3] = 0
-    rgba_flat[:, 3] = np.where(valid_flat, 255, 0).astype(np.uint8)
-
-    return rgba
-
 
 # =============================================================================
-# Generic preview pass (used for both RGB and PCA)
+# Generic preview pass
 # =============================================================================
 
 
@@ -1138,7 +877,7 @@ def write_preview_pass(
 
     Args:
         store: Zarr group with embeddings, scales, and the target array.
-        array_name: Name of the output array (e.g. "rgb" or "pca_rgb").
+        array_name: Name of the output array (e.g. "rgb").
         compute_fn: Callable(emb_int8, scales_f32) -> rgba_uint8.
         workers: Number of threads.
         console: Optional Rich Console for progress.
@@ -1181,7 +920,7 @@ def write_preview_pass(
 
 
 # =============================================================================
-# Standalone preview commands (--rgb-only, --pca-only)
+# Standalone preview commands (--rgb-only)
 # =============================================================================
 
 
@@ -1237,99 +976,6 @@ def add_rgb_to_existing_store(
     if console is not None:
         console.print(f"  [green]RGB preview: {written} chunks written[/green]")
 
-
-def add_pca_to_existing_store(
-    store_path: Path,
-    workers: Optional[int] = None,
-    console: Optional["rich.console.Console"] = None,
-) -> None:
-    """Add PCA RGB preview array to an existing Zarr store."""
-    import zarr
-
-    store = zarr.open_group(str(store_path), mode="r+")
-
-    try:
-        _ = store["pca_rgb"]
-    except KeyError:
-        emb_shape = store["embeddings"].shape
-        store.create_array(
-            "pca_rgb",
-            shape=(emb_shape[0], emb_shape[1], 4),
-            chunks=(1024, 1024, 4),
-            dtype=np.uint8,
-            fill_value=np.uint8(0),
-            compressors=None,
-            dimension_names=["northing", "easting", "rgba"],
-        )
-
-    if workers is None:
-        workers = _default_workers()
-
-    if console is not None:
-        console.print(f"  Pass 1: Computing PCA basis ({workers} threads)...")
-
-    pca_basis = compute_pca_basis(store, workers=workers, console=console)
-    if console is not None:
-        evr = pca_basis["explained_variance_ratio"]
-        console.print(
-            f"  PCA explained variance: "
-            f"[{evr[0]:.1%}, {evr[1]:.1%}, {evr[2]:.1%}] "
-            f"(total {evr.sum():.1%})"
-        )
-        console.print("  Pass 2: Writing PCA preview...")
-
-    written = write_preview_pass(
-        store, "pca_rgb",
-        lambda emb, sc: compute_pca_chunk(emb, sc, pca_basis),
-        workers=workers, console=console, label="Writing PCA preview",
-    )
-
-    store.attrs.update({
-        "has_pca_preview": True,
-        "pca_explained_variance": pca_basis["explained_variance_ratio"].tolist(),
-        "pca_components": pca_basis["components"].tolist(),
-        "pca_mean": pca_basis["mean"].tolist(),
-        "pca_medians": pca_basis["pc_medians"].tolist(),
-        "pca_iqrs": pca_basis["pc_iqrs"].tolist(),
-        "pca_stretch": {
-            "min": pca_basis["p_low"].tolist(),
-            "max": pca_basis["p_high"].tolist(),
-        },
-    })
-
-    if console is not None:
-        console.print(f"  [green]PCA preview: {written} chunks written[/green]")
-
-
-# -----------------------------------------------------------------------------
-# Web Mercator pyramids (rasterio-based, level-at-a-time)
-# -----------------------------------------------------------------------------
-
-
-def _compute_mercator_zoom_range(
-    pixel_size_m: float, center_lat: float, max_zoom: int = 12
-) -> Tuple[int, int]:
-    """Compute the Web Mercator zoom range for a given pixel size and latitude.
-
-    The finest zoom level is chosen so that the tile pixel size roughly
-    matches the source data's native pixel size at the given latitude.
-
-    Args:
-        pixel_size_m: Native pixel size in metres (e.g. 10.0).
-        center_lat: Latitude of the dataset centre in degrees.
-        max_zoom: Hard cap on the finest zoom level (default 12).
-
-    Returns:
-        ``(coarsest_zoom, finest_zoom)`` tuple.
-    """
-    equatorial_circumference = 40_075_016.686  # metres
-    cos_lat = math.cos(math.radians(center_lat))
-    finest = math.ceil(
-        math.log2(equatorial_circumference * cos_lat / (256 * pixel_size_m))
-    )
-    finest = min(finest, max_zoom)
-    coarsest = max(0, finest - 6)
-    return coarsest, finest
 
 
 def _utm_array_to_xarray(
@@ -1390,436 +1036,6 @@ def _utm_array_to_xarray(
     xda = xda.rio.set_spatial_dims(x_dim="x", y_dim="y")
 
     return xda
-
-
-def _utm_bounds_to_mercator_tiles(
-    epsg: int,
-    origin_e: float,
-    origin_n: float,
-    pixel_size: float,
-    h: int,
-    w: int,
-    zoom: int,
-) -> Tuple[int, int, int, int]:
-    """Compute which XYZ tiles at *zoom* overlap the UTM data extent.
-
-    Returns ``(tile_x_min, tile_y_min, tile_x_max, tile_y_max)`` where
-    ``tile_x_max`` and ``tile_y_max`` are exclusive (like a Python range).
-    """
-    from pyproj import Transformer
-
-    # Four corners of the UTM extent
-    corners_utm = [
-        (origin_e, origin_n),
-        (origin_e + w * pixel_size, origin_n),
-        (origin_e, origin_n - h * pixel_size),
-        (origin_e + w * pixel_size, origin_n - h * pixel_size),
-    ]
-
-    # Also add mid-edge points for better bounding at high latitudes
-    mid_e = origin_e + w * pixel_size / 2
-    mid_n = origin_n - h * pixel_size / 2
-    corners_utm += [
-        (mid_e, origin_n),
-        (mid_e, origin_n - h * pixel_size),
-        (origin_e, mid_n),
-        (origin_e + w * pixel_size, mid_n),
-    ]
-
-    transformer = Transformer.from_crs(
-        f"EPSG:{epsg}", "EPSG:3857", always_xy=True
-    )
-    corners_3857 = [transformer.transform(e, n) for e, n in corners_utm]
-
-    xs = [c[0] for c in corners_3857]
-    ys = [c[1] for c in corners_3857]
-
-    extent = 20_037_508.342_789_244
-    tile_size_m = 2 * extent / (2**zoom)  # one tile in metres
-
-    tx_min = int(math.floor((min(xs) + extent) / tile_size_m))
-    tx_max = int(math.ceil((max(xs) + extent) / tile_size_m))
-    ty_min = int(math.floor((extent - max(ys)) / tile_size_m))
-    ty_max = int(math.ceil((extent - min(ys)) / tile_size_m))
-
-    max_tiles = 2**zoom
-    tx_min = max(0, tx_min)
-    tx_max = min(max_tiles, tx_max)
-    ty_min = max(0, ty_min)
-    ty_max = min(max_tiles, ty_max)
-
-    return tx_min, ty_min, tx_max, ty_max
-
-
-def build_mercator_pyramid(
-    store: "zarr.Group",
-    preview_name: str,
-    max_zoom: int = 12,
-    console: Optional["rich.console.Console"] = None,
-) -> dict:
-    """Build a Web Mercator pyramid from a UTM preview array.
-
-    For each zoom level the source data is first coarsened (decimated) so
-    that its resolution roughly matches the target, then reprojected from
-    the source UTM CRS to EPSG:3857.  Processing one level at a time and
-    coarsening before reprojection keeps peak memory usage low even for
-    very large source arrays (hundreds of thousands of pixels per side).
-
-    The output at each level is **cropped to the XYZ tiles that overlap
-    the source data**, rather than covering the full world.  Per-level
-    ``tile_offset_x`` / ``tile_offset_y`` attributes record which global
-    XYZ tile the array's top-left corner corresponds to, so the client
-    can map ``(z, x, y)`` requests to the correct array position.
-
-    Results are stored as ``{preview_name}_mercator/{zoom}`` with 256×256
-    chunk size (one chunk = one XYZ map tile).
-
-    Args:
-        store: Zarr group opened in ``r+`` mode.
-        preview_name: Name of the source array (``"rgb"`` or ``"pca_rgb"``).
-        max_zoom: Maximum zoom level to produce (default 12).
-        console: Optional Rich Console for status messages.
-
-    Returns:
-        Dict with ``zoom_range``, ``tile_bounds``, ``levels_written``
-        (empty dict if the source array is missing).
-    """
-    import gc
-
-    import rioxarray  # noqa: F401 — registers .rio accessor
-    import xarray as xr
-    import zarr
-    from pyproj import Transformer
-    from rasterio.enums import Resampling
-    from rasterio.transform import Affine as RioAffine
-
-    # --- Validate source array exists ---
-    try:
-        src_arr = store[preview_name]
-    except KeyError:
-        logger.warning(
-            "build_mercator_pyramid: source array %r not found in store",
-            preview_name,
-        )
-        return {}
-
-    # --- Compute centre lat/lon from UTM ---
-    attrs = dict(store.attrs)
-    transform = list(attrs["transform"])
-    epsg = int(attrs["crs_epsg"])
-    pixel_size_m = float(attrs.get("pixel_size_m", transform[0]))
-
-    h, w = src_arr.shape[:2]
-    origin_e = transform[2]
-    origin_n = transform[5]
-    pixel_size = transform[0]
-
-    center_e = origin_e + (w / 2) * pixel_size
-    center_n = origin_n - (h / 2) * pixel_size
-
-    transformer = Transformer.from_crs(
-        f"EPSG:{epsg}", "EPSG:4326", always_xy=True
-    )
-    center_lon, center_lat = transformer.transform(center_e, center_n)
-
-    if console is not None:
-        console.print(
-            f"  [dim]Centre: {center_lat:.4f}N, {center_lon:.4f}E "
-            f"(EPSG:{epsg})[/dim]"
-        )
-
-    # --- Compute zoom range ---
-    zoom_min, zoom_max = _compute_mercator_zoom_range(
-        pixel_size_m, center_lat, max_zoom
-    )
-    num_levels = zoom_max - zoom_min + 1
-
-    if console is not None:
-        console.print(
-            f"  [dim]Zoom range: {zoom_min}–{zoom_max} "
-            f"({num_levels} levels)[/dim]"
-        )
-
-    # --- Delete existing mercator group if present ---
-    mercator_name = f"{preview_name}_mercator"
-    if mercator_name in store:
-        del store[mercator_name]
-
-    mercator_group = store.create_group(mercator_name)
-
-    # --- Wrap UTM array as lazy dask-backed xarray DataArray ---
-    src_da = _utm_array_to_xarray(store, preview_name)
-    nc = src_da.shape[0]  # number of bands (band is first dim)
-
-    if console is not None:
-        console.print(
-            f"  [dim]Reprojecting {preview_name} "
-            f"({h}x{w}x{nc}) to Web Mercator...[/dim]"
-        )
-
-    # --- Process each zoom level independently ---
-    # Coarsen the source to roughly match the target resolution before
-    # reprojecting.  This avoids loading the full-resolution source
-    # (potentially tens of GB) into memory for every level.
-    equatorial_circumference = 40_075_016.686
-    cos_lat = math.cos(math.radians(center_lat))
-    extent = 20_037_508.342_789_244
-
-    levels_written = 0
-    tile_bounds = {}
-
-    for i in range(num_levels):
-        zoom = zoom_min + i
-
-        # --- Compute cropped output extent for this zoom ---
-        tx_min, ty_min, tx_max, ty_max = _utm_bounds_to_mercator_tiles(
-            epsg, origin_e, origin_n, pixel_size, h, w, zoom
-        )
-        n_tiles_x = tx_max - tx_min
-        n_tiles_y = ty_max - ty_min
-        out_h = n_tiles_y * 256
-        out_w = n_tiles_x * 256
-
-        # Skip levels where the output would exceed 4 GB (Mercator
-        # distortion at high latitudes can make fine levels enormous).
-        out_bytes = out_h * out_w * nc
-        max_output_bytes = 4 * 1024**3
-        if out_bytes > max_output_bytes:
-            actual_max = zoom - 1
-            if console is not None:
-                console.print(
-                    f"  [yellow]z{zoom}: output {out_h}x{out_w}x{nc} "
-                    f"= {out_bytes / 1024**3:.1f} GB exceeds 4 GB limit, "
-                    f"capping at z{actual_max}[/yellow]"
-                )
-            zoom_max = actual_max
-            break
-
-        # Pixel resolution at this zoom level (metres/pixel in EPSG:3857)
-        pixel_res = 2 * extent / (2**zoom * 256)
-
-        # Affine transform for the cropped output region
-        out_west = -extent + tx_min * 256 * pixel_res
-        out_north = extent - ty_min * 256 * pixel_res
-        dst_transform = RioAffine(
-            pixel_res, 0.0, out_west, 0.0, -pixel_res, out_north
-        )
-
-        # Target resolution at this zoom level (adjusted for latitude)
-        target_res = equatorial_circumference * cos_lat / (256 * 2**zoom)
-
-        # How much coarser is the target than the source?
-        coarsen_factor = max(1, int(target_res / pixel_size_m))
-
-        if coarsen_factor > 1:
-            # Coarsen spatially — use dask lazy coarsen then compute
-            # Dims are (band, y, x); coarsen only y and x
-            coarsened = src_da.coarsen(
-                y=coarsen_factor, x=coarsen_factor, boundary="trim"
-            ).mean()
-
-            # Update the CRS and transform for the coarsened array
-            new_ps = pixel_size * coarsen_factor
-            new_origin_e = origin_e + (coarsen_factor - 1) * pixel_size / 2
-            new_origin_n = origin_n - (coarsen_factor - 1) * pixel_size / 2
-            ch = coarsened.sizes["y"]
-            cw = coarsened.sizes["x"]
-
-            y_coords = new_origin_n - (np.arange(ch) + 0.5) * new_ps
-            x_coords = new_origin_e + (np.arange(cw) + 0.5) * new_ps
-            coarsened = coarsened.assign_coords(y=y_coords, x=x_coords)
-
-            from affine import Affine as AffineT
-
-            coarsened = coarsened.rio.write_crs(f"EPSG:{epsg}")
-            coarsened = coarsened.rio.write_transform(
-                AffineT(new_ps, 0, new_origin_e, 0, -new_ps, new_origin_n)
-            )
-            coarsened = coarsened.rio.set_spatial_dims(x_dim="x", y_dim="y")
-
-            if console is not None:
-                console.print(
-                    f"  [dim]  z{zoom}: coarsen {coarsen_factor}x → "
-                    f"{ch}×{cw} then reproject "
-                    f"({n_tiles_x}×{n_tiles_y} tiles)[/dim]"
-                )
-
-            # Compute the coarsened array into memory (small)
-            level_input = coarsened.compute()
-            del coarsened
-        else:
-            if console is not None:
-                console.print(
-                    f"  [dim]  z{zoom}: reproject at native res "
-                    f"({n_tiles_x}×{n_tiles_y} tiles)[/dim]"
-                )
-            # Fine enough — compute the source into memory
-            level_input = src_da.compute()
-
-        # --- Reproject to Web Mercator (cropped to data extent) ---
-        level_ds = level_input.to_dataset(name=preview_name)
-        reprojected_ds = level_ds[preview_name].rio.reproject(
-            "EPSG:3857",
-            resampling=Resampling.average,
-            shape=(out_h, out_w),
-            transform=dst_transform,
-        )
-
-        # Transpose from (band, y, x) → (y, x, band) for zarr storage
-        level_data = reprojected_ds.values
-        if level_data.ndim == 3 and level_data.shape[0] == nc:
-            level_data = np.transpose(level_data, (1, 2, 0))
-
-        # Ensure uint8 — NaN pixels (outside source extent) become 0
-        np.nan_to_num(level_data, copy=False, nan=0.0)
-        level_data = np.clip(level_data, 0, 255).astype(np.uint8)
-
-        # Free intermediate arrays
-        del level_input, level_ds, reprojected_ds
-        gc.collect()
-
-        ly, lx = level_data.shape[:2]
-        lc = level_data.shape[2] if level_data.ndim == 3 else 1
-        chunk_y = min(256, ly)
-        chunk_x = min(256, lx)
-
-        out_arr = mercator_group.create_array(
-            str(zoom),
-            shape=level_data.shape,
-            chunks=(chunk_y, chunk_x, lc),
-            dtype=np.uint8,
-            fill_value=np.uint8(0),
-            compressors=None,
-        )
-        out_arr[:] = level_data
-
-        # Per-level attrs — include tile offset for client mapping
-        out_arr.attrs.update({
-            "zoom": zoom,
-            "shape": list(level_data.shape),
-            "n_tiles_y": n_tiles_y,
-            "n_tiles_x": n_tiles_x,
-            "tile_offset_x": tx_min,
-            "tile_offset_y": ty_min,
-        })
-
-        tile_bounds[zoom] = {
-            "n_tiles_y": n_tiles_y,
-            "n_tiles_x": n_tiles_x,
-            "tile_offset_x": tx_min,
-            "tile_offset_y": ty_min,
-            "shape": list(level_data.shape),
-        }
-        levels_written += 1
-
-        if console is not None:
-            console.print(
-                f"  [green]zoom {zoom}: "
-                f"{ly}x{lx}x{lc} "
-                f"({n_tiles_y}x{n_tiles_x} tiles, "
-                f"offset {tx_min},{ty_min})[/green]"
-            )
-
-        del level_data
-        gc.collect()
-
-    # --- Group-level attrs ---
-    mercator_group.attrs.update({
-        "zoom_min": zoom_min,
-        "zoom_max": zoom_max,
-        "num_levels": levels_written,
-        "center_lon": center_lon,
-        "center_lat": center_lat,
-        "projection": "EPSG:3857",
-    })
-
-    result = {
-        "zoom_range": (zoom_min, zoom_max),
-        "tile_bounds": tile_bounds,
-        "levels_written": levels_written,
-    }
-
-    if console is not None:
-        console.print(
-            f"  [bold green]{preview_name} mercator pyramid: "
-            f"{levels_written} levels (zoom {zoom_min}–{zoom_max})[/bold green]"
-        )
-
-    return result
-
-
-def add_mercator_pyramids_to_existing_store(
-    store_path: Path,
-    max_zoom: int = 12,
-    workers: Optional[int] = None,
-    console: Optional["rich.console.Console"] = None,
-) -> None:
-    """Add Web Mercator pyramids for all existing preview arrays.
-
-    Opens the store at *store_path* in ``r+`` mode, removes any old UTM
-    pyramid groups (``rgb_pyramid``, ``pca_rgb_pyramid``) and their attrs,
-    then builds Mercator pyramids via :func:`build_mercator_pyramid`.
-
-    The *workers* parameter is accepted for API compatibility but unused;
-    levels are processed sequentially to limit peak memory.
-
-    Args:
-        store_path: Path to the ``.zarr`` directory.
-        max_zoom: Maximum zoom level for Mercator pyramids (default 12).
-        workers: Unused (kept for API compatibility).
-        console: Optional Rich Console for progress display.
-    """
-    import zarr
-
-    store = zarr.open_group(str(store_path), mode="r+")
-    attrs = dict(store.attrs)
-
-    # --- Remove old UTM pyramid groups if present ---
-    for old_group in ["rgb_pyramid", "pca_rgb_pyramid"]:
-        if old_group in store:
-            del store[old_group]
-            if console is not None:
-                console.print(f"  [yellow]Removed old {old_group}[/yellow]")
-
-    # --- Remove old pyramid attrs ---
-    old_attrs = [
-        "has_rgb_pyramid", "rgb_pyramid_levels",
-        "has_pca_rgb_pyramid", "pca_rgb_pyramid_levels",
-    ]
-    current_attrs = dict(store.attrs)
-    new_attrs = {k: v for k, v in current_attrs.items() if k not in old_attrs}
-    if len(new_attrs) < len(current_attrs):
-        store.attrs.clear()
-        store.attrs.update(new_attrs)
-        if console is not None:
-            console.print("  [yellow]Cleared old pyramid attrs[/yellow]")
-
-    # --- Build Mercator pyramids for each preview ---
-    previews = [
-        ("rgb", "has_rgb_preview"),
-        ("pca_rgb", "has_pca_preview"),
-    ]
-
-    for preview_name, attr_flag in previews:
-        if not attrs.get(attr_flag, False):
-            continue
-
-        result = build_mercator_pyramid(
-            store, preview_name, max_zoom=max_zoom, console=console,
-        )
-
-        if result and result.get("levels_written", 0) > 0:
-            store.attrs.update({
-                f"has_{preview_name}_mercator": True,
-                f"{preview_name}_mercator_zoom_range": result["zoom_range"],
-            })
-
-            if console is not None:
-                zmin, zmax = result["zoom_range"]
-                console.print(
-                    f"  [green]{preview_name} mercator pyramid: "
-                    f"zoom {zmin}–{zmax}[/green]"
-                )
 
 
 # =============================================================================
@@ -1886,7 +1102,7 @@ def build_global_preview(
 ) -> Path:
     """Build global EPSG:4326 preview store from per-zone UTM stores.
 
-    Reprojects each zone's rgb (and/or pca_rgb) array from UTM to WGS84,
+    Reprojects each zone's rgb array from UTM to WGS84,
     writes into a single global zarr store with zarr-conventions/multiscales
     metadata for use with @carbonplan/zarr-layer.
 
@@ -1904,7 +1120,7 @@ def build_global_preview(
             all matching stores are used.
         num_levels: Number of resolution levels in the output pyramid.
         preview_names: List of preview array names to include (e.g.
-            ``["rgb", "pca_rgb"]``). Defaults to ``["rgb", "pca_rgb"]``.
+            ``["rgb"]``). Defaults to ``["rgb"]``.
         console: Optional Rich Console for status messages.
 
     Returns:
@@ -1914,7 +1130,7 @@ def build_global_preview(
     from pyproj import Transformer
 
     if preview_names is None:
-        preview_names = ["rgb", "pca_rgb"]
+        preview_names = ["rgb"]
 
     if console is not None:
         console.print(
@@ -2112,6 +1328,7 @@ def _write_global_store(
     import zarr
     from affine import Affine
     from rasterio.enums import Resampling
+    from zarr.codecs import BloscCodec
 
     west, south, east, north = global_bounds
 
@@ -2156,9 +1373,9 @@ def _write_global_store(
                 chunks=(512, 512, num_bands),
                 dtype=np.uint8,
                 fill_value=np.uint8(0),
-                compressors=None,
+                compressors=BloscCodec(cname="zstd", clevel=3),
+                dimension_names=["lat", "lon", "band"],
             )
-            arr.attrs["_ARRAY_DIMENSIONS"] = ["lat", "lon", "band"]
 
             # --------------------------------------------------------------
             # 3. For each zone, reproject into the level array
@@ -2214,13 +1431,18 @@ def _write_global_store(
                         reprojected = src_for_level.rio.reproject(
                             "EPSG:4326",
                             resampling=Resampling.average,
-                            shape=(num_bands, strip_h, level_w),
+                            shape=(strip_h, level_w),
                             transform=strip_transform,
                             nodata=0,
                         )
-                    except Exception:
+                    except Exception as exc:
                         # Skip strips where reprojection fails (e.g. zone
                         # does not intersect this strip at all)
+                        logger.debug(
+                            "Zone %02d level %d strip %d-%d reproject "
+                            "failed: %s",
+                            zone_num, level, strip_start, strip_end, exc,
+                        )
                         continue
 
                     data = reprojected.values  # (bands, H, W)
@@ -2274,7 +1496,12 @@ def _write_global_store(
     })
 
     # ------------------------------------------------------------------
-    # 5. Print summary
+    # 5. Consolidate metadata (avoids per-level metadata fetches)
+    # ------------------------------------------------------------------
+    zarr.consolidate_metadata(str(output_path))
+
+    # ------------------------------------------------------------------
+    # 6. Print summary
     # ------------------------------------------------------------------
     if console is not None:
         console.print(
