@@ -23,6 +23,7 @@ benefit so we store uncompressed.
 import logging
 import math
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -1888,5 +1889,221 @@ def build_global_preview(
     Reprojects each zone's rgb (and/or pca_rgb) array from UTM to WGS84,
     writes into a single global zarr store with zarr-conventions/multiscales
     metadata for use with @carbonplan/zarr-layer.
+
+    Steps:
+        1. Discover zone stores matching ``utm{ZZ}_{year}.zarr`` in *zarr_dir*.
+        2. Compute the union WGS84 bounding box across all discovered zones.
+        3. Determine global array dimensions at ~0.0001 deg resolution.
+        4. Delegate to :func:`_write_global_store` to create the output.
+
+    Args:
+        zarr_dir: Directory containing per-zone ``.zarr`` stores.
+        output_path: Path for the output global zarr store.
+        year: Year to filter zone store filenames.
+        zones: Optional list of UTM zone numbers to include. If *None*,
+            all matching stores are used.
+        num_levels: Number of resolution levels in the output pyramid.
+        preview_names: List of preview array names to include (e.g.
+            ``["rgb", "pca_rgb"]``). Defaults to ``["rgb", "pca_rgb"]``.
+        console: Optional Rich Console for status messages.
+
+    Returns:
+        Path to the created global zarr store.
     """
-    raise NotImplementedError("global-preview not yet implemented")
+    import zarr
+    from pyproj import Transformer
+
+    if preview_names is None:
+        preview_names = ["rgb", "pca_rgb"]
+
+    if console is not None:
+        console.print(
+            f"[bold]Scanning {zarr_dir} for zone stores (year={year})...[/bold]"
+        )
+
+    # ------------------------------------------------------------------
+    # 1. Discover zone stores
+    # ------------------------------------------------------------------
+    pattern = re.compile(rf"^utm(\d{{2}})_{year}\.zarr$")
+    zone_stores: Dict[int, Path] = {}
+
+    for entry in sorted(zarr_dir.iterdir()):
+        if not entry.is_dir():
+            continue
+        m = pattern.match(entry.name)
+        if m is None:
+            continue
+        zone_num = int(m.group(1))
+        if zones is not None and zone_num not in zones:
+            continue
+        zone_stores[zone_num] = entry
+
+    if not zone_stores:
+        msg = f"No zone stores found in {zarr_dir} for year {year}"
+        if zones is not None:
+            msg += f" (zones filter: {zones})"
+        raise FileNotFoundError(msg)
+
+    if console is not None:
+        console.print(
+            f"  Found {len(zone_stores)} zone store(s): "
+            f"{sorted(zone_stores.keys())}"
+        )
+
+    # ------------------------------------------------------------------
+    # 2. Compute global WGS84 bounding box
+    # ------------------------------------------------------------------
+    global_lon_min = float("inf")
+    global_lon_max = float("-inf")
+    global_lat_min = float("inf")
+    global_lat_max = float("-inf")
+
+    zone_infos: Dict[int, dict] = {}
+
+    for zone_num, store_path in sorted(zone_stores.items()):
+        store = zarr.open_group(str(store_path), mode="r")
+        attrs = dict(store.attrs)
+
+        epsg = int(attrs["crs_epsg"])
+        transform = list(attrs["transform"])
+        pixel_size = transform[0]
+        origin_e = transform[2]
+        origin_n = transform[5]
+
+        # Find the first available preview array to get the shape
+        preview_shape = None
+        for pname in preview_names:
+            if pname in store:
+                preview_shape = store[pname].shape
+                break
+
+        if preview_shape is None:
+            if console is not None:
+                console.print(
+                    f"  [yellow]Zone {zone_num}: no preview arrays found, "
+                    f"skipping[/yellow]"
+                )
+            continue
+
+        h, w = preview_shape[:2]
+
+        # UTM corner coordinates
+        corners_utm = [
+            (origin_e, origin_n),                             # top-left
+            (origin_e + w * pixel_size, origin_n),            # top-right
+            (origin_e, origin_n - h * pixel_size),            # bottom-left
+            (origin_e + w * pixel_size, origin_n - h * pixel_size),  # bottom-right
+        ]
+
+        # Add mid-edge points for better bounding at high latitudes
+        mid_e = origin_e + w * pixel_size / 2
+        mid_n = origin_n - h * pixel_size / 2
+        corners_utm += [
+            (mid_e, origin_n),                   # top-centre
+            (mid_e, origin_n - h * pixel_size),  # bottom-centre
+            (origin_e, mid_n),                   # left-centre
+            (origin_e + w * pixel_size, mid_n),  # right-centre
+        ]
+
+        # Reproject corners to WGS84
+        transformer = Transformer.from_crs(
+            f"EPSG:{epsg}", "EPSG:4326", always_xy=True
+        )
+        corners_4326 = [
+            transformer.transform(e, n) for e, n in corners_utm
+        ]
+
+        lons = [c[0] for c in corners_4326]
+        lats = [c[1] for c in corners_4326]
+
+        zone_lon_min, zone_lon_max = min(lons), max(lons)
+        zone_lat_min, zone_lat_max = min(lats), max(lats)
+
+        # Union into the global bounding box
+        global_lon_min = min(global_lon_min, zone_lon_min)
+        global_lon_max = max(global_lon_max, zone_lon_max)
+        global_lat_min = min(global_lat_min, zone_lat_min)
+        global_lat_max = max(global_lat_max, zone_lat_max)
+
+        zone_infos[zone_num] = {
+            "store_path": store_path,
+            "epsg": epsg,
+            "transform": transform,
+            "shape": preview_shape,
+            "bounds_4326": (
+                zone_lon_min, zone_lat_min, zone_lon_max, zone_lat_max,
+            ),
+        }
+
+        if console is not None:
+            console.print(
+                f"  Zone {zone_num:02d} (EPSG:{epsg}): "
+                f"{h}x{w} px, "
+                f"lon [{zone_lon_min:.4f}, {zone_lon_max:.4f}], "
+                f"lat [{zone_lat_min:.4f}, {zone_lat_max:.4f}]"
+            )
+
+    if not zone_infos:
+        raise FileNotFoundError(
+            "No zone stores with valid preview arrays found"
+        )
+
+    global_bounds = (
+        global_lon_min, global_lat_min, global_lon_max, global_lat_max,
+    )
+
+    if console is not None:
+        console.print(
+            f"  [bold]Global extent:[/bold] "
+            f"lon [{global_lon_min:.4f}, {global_lon_max:.4f}], "
+            f"lat [{global_lat_min:.4f}, {global_lat_max:.4f}]"
+        )
+
+    # ------------------------------------------------------------------
+    # 3. Compute global array dimensions
+    # ------------------------------------------------------------------
+    base_res = 0.0001  # ~10 m at equator
+
+    global_w = int(
+        math.ceil((global_lon_max - global_lon_min) / base_res)
+    )
+    global_h = int(
+        math.ceil((global_lat_max - global_lat_min) / base_res)
+    )
+
+    if console is not None:
+        console.print(
+            f"  [dim]Base resolution: {base_res}° "
+            f"→ {global_w}x{global_h} pixels[/dim]"
+        )
+        console.print(
+            f"  [dim]Pyramid levels: {num_levels}[/dim]"
+        )
+
+    # ------------------------------------------------------------------
+    # 4. Create the global store
+    # ------------------------------------------------------------------
+    _write_global_store(
+        output_path=output_path,
+        zone_infos=zone_infos,
+        preview_names=preview_names,
+        global_bounds=global_bounds,
+        base_res=base_res,
+        num_levels=num_levels,
+        console=console,
+    )
+
+    return output_path
+
+
+def _write_global_store(
+    output_path: Path,
+    zone_infos: dict,
+    preview_names: List[str],
+    global_bounds: Tuple[float, float, float, float],
+    base_res: float,
+    num_levels: int,
+    console: "rich.console.Console",
+) -> None:
+    """Create global 4326 zarr store and reproject each zone into it."""
+    console.print("[yellow]_write_global_store not yet implemented")
