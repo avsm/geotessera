@@ -1301,7 +1301,7 @@ def add_pca_to_existing_store(
 
 
 # -----------------------------------------------------------------------------
-# Web Mercator pyramids (ndpyramid-based)
+# Web Mercator pyramids (rasterio-based, level-at-a-time)
 # -----------------------------------------------------------------------------
 
 
@@ -1391,17 +1391,34 @@ def _utm_array_to_xarray(
     return xda
 
 
+def _mercator_tile_transform(dim: int):
+    """Return the Affine transform for a Web Mercator grid of *dim* × *dim* px.
+
+    Covers the full EPSG:3857 extent (-20037508.34 … +20037508.34).
+    """
+    from rasterio.transform import Affine
+
+    extent = 20_037_508.342_789_244  # half-circumference of Earth in metres
+    res = 2 * extent / dim
+    return Affine(res, 0.0, -extent, 0.0, -res, extent)
+
+
 def build_mercator_pyramid(
     store: "zarr.Group",
     preview_name: str,
     max_zoom: int = 12,
     console: Optional["rich.console.Console"] = None,
 ) -> dict:
-    """Build a Web Mercator pyramid from a UTM preview array using ndpyramid.
+    """Build a Web Mercator pyramid from a UTM preview array.
 
-    Reprojects ``store[preview_name]`` into EPSG:3857 at multiple zoom
-    levels and stores the results as ``{preview_name}_mercator/{zoom}``
-    with 256x256 chunk size (one chunk = one XYZ map tile).
+    For each zoom level the source data is first coarsened (decimated) so
+    that its resolution roughly matches the target, then reprojected from
+    the source UTM CRS to EPSG:3857.  Processing one level at a time and
+    coarsening before reprojection keeps peak memory usage low even for
+    very large source arrays (hundreds of thousands of pixels per side).
+
+    Results are stored as ``{preview_name}_mercator/{zoom}`` with 256×256
+    chunk size (one chunk = one XYZ map tile).
 
     Args:
         store: Zarr group opened in ``r+`` mode.
@@ -1413,11 +1430,13 @@ def build_mercator_pyramid(
         Dict with ``zoom_range``, ``tile_bounds``, ``levels_written``
         (empty dict if the source array is missing).
     """
+    import gc
+
     import rioxarray  # noqa: F401 — registers .rio accessor
     import xarray as xr
     import zarr
-    from ndpyramid import pyramid_reproject
     from pyproj import Transformer
+    from rasterio.enums import Resampling
 
     # --- Validate source array exists ---
     try:
@@ -1473,10 +1492,9 @@ def build_mercator_pyramid(
 
     mercator_group = store.create_group(mercator_name)
 
-    # --- Wrap UTM array as xarray DataArray ---
-    da = _utm_array_to_xarray(store, preview_name)
-    nc = da.shape[0]  # number of bands (band is first dim)
-    ds = da.to_dataset(name=preview_name)
+    # --- Wrap UTM array as lazy dask-backed xarray DataArray ---
+    src_da = _utm_array_to_xarray(store, preview_name)
+    nc = src_da.shape[0]  # number of bands (band is first dim)
 
     if console is not None:
         console.print(
@@ -1484,36 +1502,93 @@ def build_mercator_pyramid(
             f"({h}x{w}x{nc}) to Web Mercator...[/dim]"
         )
 
-    # --- Run ndpyramid reprojection ---
-    dt = pyramid_reproject(
-        ds,
-        levels=num_levels,
-        pixels_per_tile=256,
-        resampling="average",
-    )
+    # --- Process each zoom level independently ---
+    # Coarsen the source to roughly match the target resolution before
+    # reprojecting.  This avoids loading the full-resolution source
+    # (potentially tens of GB) into memory for every level.
+    equatorial_circumference = 40_075_016.686
+    cos_lat = math.cos(math.radians(center_lat))
 
-    # --- Write each level to zarr ---
     levels_written = 0
     tile_bounds = {}
 
     for i in range(num_levels):
         zoom = zoom_min + i
-        level_key = str(i)  # ndpyramid uses 0-indexed keys
+        # ndpyramid convention: level 0 = coarsest
+        ndp_level = i
 
-        level_ds = dt[level_key].ds
-        level_da = level_ds[preview_name]
+        # Target resolution at this zoom level
+        target_res = equatorial_circumference * cos_lat / (256 * 2**zoom)
 
-        # ndpyramid outputs (band, y, x) — transpose to (y, x, band)
-        level_dims = level_da.dims
-        if level_dims[0] == "band" or (
-            len(level_dims) == 3 and level_dims[0] != "y"
-        ):
-            level_data = np.transpose(level_da.values, (1, 2, 0))
+        # How much coarser is the target than the source?
+        coarsen_factor = max(1, int(target_res / pixel_size_m))
+
+        if coarsen_factor > 1:
+            # Coarsen spatially — use dask lazy coarsen then compute
+            # Dims are (band, y, x); coarsen only y and x
+            coarsened = src_da.coarsen(
+                y=coarsen_factor, x=coarsen_factor, boundary="trim"
+            ).mean()
+
+            # Update the CRS and transform for the coarsened array
+            new_ps = pixel_size * coarsen_factor
+            new_origin_e = origin_e + (coarsen_factor - 1) * pixel_size / 2
+            new_origin_n = origin_n - (coarsen_factor - 1) * pixel_size / 2
+            ch = coarsened.sizes["y"]
+            cw = coarsened.sizes["x"]
+
+            y_coords = new_origin_n - (np.arange(ch) + 0.5) * new_ps
+            x_coords = new_origin_e + (np.arange(cw) + 0.5) * new_ps
+            coarsened = coarsened.assign_coords(y=y_coords, x=x_coords)
+
+            from affine import Affine as AffineT
+
+            coarsened = coarsened.rio.write_crs(f"EPSG:{epsg}")
+            coarsened = coarsened.rio.write_transform(
+                AffineT(new_ps, 0, new_origin_e, 0, -new_ps, new_origin_n)
+            )
+            coarsened = coarsened.rio.set_spatial_dims(x_dim="x", y_dim="y")
+
+            if console is not None:
+                console.print(
+                    f"  [dim]  z{zoom}: coarsen {coarsen_factor}x → "
+                    f"{ch}×{cw} then reproject[/dim]"
+                )
+
+            # Compute the coarsened array into memory (small)
+            level_input = coarsened.compute()
+            del coarsened
         else:
-            level_data = level_da.values
+            if console is not None:
+                console.print(
+                    f"  [dim]  z{zoom}: reproject at native res[/dim]"
+                )
+            # Fine enough — compute the source into memory
+            level_input = src_da.compute()
 
-        # Ensure uint8 output
+        # --- Reproject to Web Mercator at this zoom level ---
+        dim = 2**ndp_level * 256  # output grid size
+        dst_transform = _mercator_tile_transform(dim)
+
+        level_ds = level_input.to_dataset(name=preview_name)
+        reprojected_ds = level_ds[preview_name].rio.reproject(
+            "EPSG:3857",
+            resampling=Resampling.average,
+            shape=(dim, dim),
+            transform=dst_transform,
+        )
+
+        # Transpose from (band, y, x) → (y, x, band) for zarr storage
+        level_data = reprojected_ds.values
+        if level_data.ndim == 3 and level_data.shape[0] == nc:
+            level_data = np.transpose(level_data, (1, 2, 0))
+
+        # Ensure uint8
         level_data = np.clip(level_data, 0, 255).astype(np.uint8)
+
+        # Free intermediate arrays
+        del level_input, level_ds, reprojected_ds
+        gc.collect()
 
         ly, lx = level_data.shape[:2]
         lc = level_data.shape[2] if level_data.ndim == 3 else 1
@@ -1555,6 +1630,9 @@ def build_mercator_pyramid(
                 f"({n_tiles_y}x{n_tiles_x} tiles)[/green]"
             )
 
+        del level_data
+        gc.collect()
+
     # --- Group-level attrs ---
     mercator_group.attrs.update({
         "zoom_min": zoom_min,
@@ -1593,7 +1671,7 @@ def add_mercator_pyramids_to_existing_store(
     then builds Mercator pyramids via :func:`build_mercator_pyramid`.
 
     The *workers* parameter is accepted for API compatibility but unused;
-    ndpyramid handles parallelism internally.
+    levels are processed sequentially to limit peak memory.
 
     Args:
         store_path: Path to the ``.zarr`` directory.
