@@ -1097,6 +1097,7 @@ def build_global_preview(
     year: int,
     zones: Optional[List[int]] = None,
     num_levels: int = 7,
+    workers: int = 4,
     console: Optional["rich.console.Console"] = None,
 ) -> Path:
     """Build global EPSG:4326 preview store from per-zone UTM stores.
@@ -1302,10 +1303,125 @@ def build_global_preview(
         global_bounds=global_bounds,
         base_res=base_res,
         num_levels=num_levels,
+        workers=workers,
         console=console,
     )
 
     return output_path
+
+
+def _reproject_tile(
+    src_arr,
+    tmp_arr,
+    strip_start: int,
+    strip_h: int,
+    tile_col_start: int,
+    tile_w: int,
+    north: float,
+    west: float,
+    base_res: float,
+    num_bands: int,
+    src_epsg: int,
+    src_pixel: float,
+    src_origin_e: float,
+    src_origin_n: float,
+    src_h: int,
+    src_w: int,
+    to_utm,
+) -> bool:
+    """Reproject one tile from UTM source to WGS84 output.
+
+    Returns True if any data was written.
+    """
+    from affine import Affine
+    from rasterio.enums import Resampling
+    import rasterio.warp
+
+    tile_col_end = tile_col_start + tile_w
+    strip_end = strip_start + strip_h
+    dst_north = north - strip_start * base_res
+    tile_west = west + tile_col_start * base_res
+    tile_east = west + tile_col_end * base_res
+
+    dst_transform = Affine(
+        base_res, 0, tile_west,
+        0, -base_res, dst_north,
+    )
+
+    dst_south = north - strip_end * base_res
+    sample_lons = [
+        tile_west, tile_east, tile_west, tile_east,
+        (tile_west + tile_east) / 2,
+    ]
+    sample_lats = [
+        dst_north, dst_north, dst_south, dst_south,
+        (dst_north + dst_south) / 2,
+    ]
+    try:
+        utm_xs, utm_ys = to_utm.transform(sample_lons, sample_lats)
+    except Exception:
+        return False
+
+    if any(not math.isfinite(v) for v in list(utm_xs) + list(utm_ys)):
+        return False
+
+    pad = 16
+    r_min = max(0, int((src_origin_n - max(utm_ys)) / src_pixel) - pad)
+    r_max = min(src_h, int(math.ceil(
+        (src_origin_n - min(utm_ys)) / src_pixel
+    )) + pad)
+    c_min = max(0, int((min(utm_xs) - src_origin_e) / src_pixel) - pad)
+    c_max = min(src_w, int(math.ceil(
+        (max(utm_xs) - src_origin_e) / src_pixel
+    )) + pad)
+
+    if r_max <= r_min or c_max <= c_min:
+        return False
+
+    window = np.asarray(src_arr[r_min:r_max, c_min:c_max, :])
+    if not window.any():
+        return False
+
+    src_data = np.transpose(window.astype(np.float32), (2, 0, 1))
+    del window
+
+    win_transform = Affine(
+        src_pixel, 0, src_origin_e + c_min * src_pixel,
+        0, -src_pixel, src_origin_n - r_min * src_pixel,
+    )
+
+    dst_data = np.full(
+        (num_bands, strip_h, tile_w), np.nan, dtype=np.float32,
+    )
+
+    try:
+        rasterio.warp.reproject(
+            source=src_data,
+            destination=dst_data,
+            src_transform=win_transform,
+            src_crs=f"EPSG:{src_epsg}",
+            dst_transform=dst_transform,
+            dst_crs="EPSG:4326",
+            resampling=Resampling.average,
+        )
+    except Exception:
+        return False
+
+    del src_data
+    dst_data = np.nan_to_num(dst_data, nan=0.0)
+    dst_data = np.clip(dst_data, 0, 255).astype(np.uint8)
+    out = np.transpose(dst_data, (1, 2, 0))
+    del dst_data
+
+    if not out.any(axis=2).any():
+        return False
+
+    tmp_arr[
+        strip_start : strip_start + strip_h,
+        tile_col_start : tile_col_end,
+        :,
+    ] = out
+    return True
 
 
 def _write_global_store(
@@ -1315,6 +1431,7 @@ def _write_global_store(
     global_bounds: Tuple[float, float, float, float],
     base_res: float,
     num_levels: int,
+    workers: int,
     console: "rich.console.Console",
 ) -> None:
     """Create global 4326 zarr store and reproject each zone into it.
@@ -1322,13 +1439,13 @@ def _write_global_store(
     Two phases:
       1. Reproject each zone's preview arrays from UTM to WGS84 using
          windowed rasterio.warp.reproject() into a temporary level-0
-         zarr store.  Peak memory ≈ one strip of source + destination.
-      2. Open level-0 as a dask-backed xarray Dataset, use topozarr
-         to build coarsened pyramid levels, and write the final store.
+         zarr store.  Tiles within each zone run in parallel threads.
+      2. Build coarsened pyramid levels from level-0 on disk.
     """
     import gc
     import shutil
     import tempfile
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     import rasterio.warp
     import zarr
@@ -1428,8 +1545,11 @@ def _write_global_store(
                 )
 
             strip_height = 2048
-            strips_written = 0
+            tiles_written = 0
+            tiles_total = 0
 
+            # Build list of tile jobs for this zone
+            tile_jobs = []
             for strip_start in range(
                 zone_row_start, zone_row_end, strip_height
             ):
@@ -1437,8 +1557,6 @@ def _write_global_store(
                     strip_start + strip_height, zone_row_end
                 )
                 strip_h = strip_end - strip_start
-
-                # Sub-divide wide zones into column tiles
                 for tile_col_start in range(
                     zone_col_start, zone_col_end, max_tile_cols
                 ):
@@ -1446,127 +1564,69 @@ def _write_global_store(
                         tile_col_start + max_tile_cols, zone_col_end
                     )
                     tile_w = tile_col_end - tile_col_start
-
-                    dst_north = north - strip_start * base_res
-                    tile_west = west + tile_col_start * base_res
-                    tile_east = west + tile_col_end * base_res
-
-                    dst_transform = Affine(
-                        base_res, 0, tile_west,
-                        0, -base_res, dst_north,
+                    tile_jobs.append(
+                        (strip_start, strip_h, tile_col_start, tile_w)
                     )
 
-                    # Back-project corners + midpoint to UTM
-                    dst_south = north - strip_end * base_res
-                    sample_lons = [
-                        tile_west, tile_east, tile_west, tile_east,
-                        (tile_west + tile_east) / 2,
-                    ]
-                    sample_lats = [
-                        dst_north, dst_north, dst_south, dst_south,
-                        (dst_north + dst_south) / 2,
-                    ]
-                    try:
-                        utm_xs, utm_ys = to_utm.transform(
-                            sample_lons, sample_lats
-                        )
-                    except Exception:
-                        continue
+            tiles_total = len(tile_jobs)
+            if console is not None:
+                console.print(
+                    f"      {tiles_total} tiles, "
+                    f"{workers} workers"
+                )
 
-                    if any(
-                        not math.isfinite(v)
-                        for v in list(utm_xs) + list(utm_ys)
+            # Process tiles in parallel — each tile reads a
+            # different source window and writes to a
+            # non-overlapping output region.
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(
+                        _reproject_tile,
+                        src_arr=src_arr,
+                        tmp_arr=tmp_arr,
+                        strip_start=ss,
+                        strip_h=sh,
+                        tile_col_start=tcs,
+                        tile_w=tw,
+                        north=north,
+                        west=west,
+                        base_res=base_res,
+                        num_bands=num_bands,
+                        src_epsg=src_epsg,
+                        src_pixel=src_pixel,
+                        src_origin_e=src_origin_e,
+                        src_origin_n=src_origin_n,
+                        src_h=src_h,
+                        src_w=src_w,
+                        to_utm=to_utm,
+                    ): (ss, tcs)
+                    for ss, sh, tcs, tw in tile_jobs
+                }
+
+                for future in as_completed(futures):
+                    if future.result():
+                        tiles_written += 1
+                    # Progress every 50 tiles
+                    done = tiles_total - len(
+                        [f for f in futures if not f.done()]
+                    )
+                    if (
+                        console is not None
+                        and done % 50 == 0
+                        and done > 0
                     ):
-                        continue
-
-                    pad = 16
-                    r_min = max(0, int(
-                        (src_origin_n - max(utm_ys)) / src_pixel
-                    ) - pad)
-                    r_max = min(src_h, int(math.ceil(
-                        (src_origin_n - min(utm_ys)) / src_pixel
-                    )) + pad)
-                    c_min = max(0, int(
-                        (min(utm_xs) - src_origin_e) / src_pixel
-                    ) - pad)
-                    c_max = min(src_w, int(math.ceil(
-                        (max(utm_xs) - src_origin_e) / src_pixel
-                    )) + pad)
-
-                    if r_max <= r_min or c_max <= c_min:
-                        continue
-
-                    window = np.asarray(
-                        src_arr[r_min:r_max, c_min:c_max, :]
-                    )
-                    if not window.any():
-                        del window
-                        continue
-
-                    src_data = np.transpose(
-                        window.astype(np.float32), (2, 0, 1)
-                    )
-                    del window
-
-                    win_transform = Affine(
-                        src_pixel, 0,
-                        src_origin_e + c_min * src_pixel,
-                        0, -src_pixel,
-                        src_origin_n - r_min * src_pixel,
-                    )
-
-                    dst_data = np.full(
-                        (num_bands, strip_h, tile_w),
-                        np.nan,
-                        dtype=np.float32,
-                    )
-
-                    try:
-                        rasterio.warp.reproject(
-                            source=src_data,
-                            destination=dst_data,
-                            src_transform=win_transform,
-                            src_crs=f"EPSG:{src_epsg}",
-                            dst_transform=dst_transform,
-                            dst_crs="EPSG:4326",
-                            resampling=Resampling.average,
+                        pct = int(100 * done / tiles_total)
+                        console.print(
+                            f"      [{pct}%] {done}/{tiles_total} "
+                            f"tiles done"
                         )
-                    except Exception as exc:
-                        if console is not None:
-                            console.print(
-                                f"      [yellow]strip {strip_start}-"
-                                f"{strip_end}: {exc}[/yellow]"
-                            )
-                        del src_data, dst_data
-                        continue
 
-                    del src_data
-                    dst_data = np.nan_to_num(dst_data, nan=0.0)
-                    dst_data = np.clip(
-                        dst_data, 0, 255
-                    ).astype(np.uint8)
-                    out = np.transpose(dst_data, (1, 2, 0))
-                    del dst_data
-
-                    mask = out.any(axis=2)
-                    if not mask.any():
-                        del out, mask
-                        continue
-
-                    tmp_arr[
-                        strip_start:strip_end,
-                        tile_col_start:tile_col_end,
-                        :,
-                    ] = out
-
-                    strips_written += 1
-                    del out, mask
-
-                gc.collect()
+            gc.collect()
 
             if console is not None:
                 console.print(
-                    f"      {strips_written} tiles written"
+                    f"      {tiles_written}/{tiles_total} tiles "
+                    f"written"
                 )
 
     # ==================================================================
@@ -1668,40 +1728,35 @@ def _write_global_store(
                 dimension_names=["lat", "lon", "band"],
             )
 
-            # Coarsen in tiles: read 2x2 blocks from prev level,
-            # average into output tiles.  Both row and column
-            # dimensions are chunked to bound memory.
-            coarsen_strip = chunk_size  # output rows per iteration
-            coarsen_cols = max_tile_cols  # output cols per iteration
-            for r0 in range(0, cur_h, coarsen_strip):
+            # Coarsen in row strips with parallel I/O.
+            # Each strip covers full width to avoid cross-chunk
+            # races from column tiling.
+            coarsen_strip = chunk_size
+            cur_chunk_w = min(chunk_size, cur_w)
+
+            def _coarsen_strip(r0):
                 r1 = min(r0 + coarsen_strip, cur_h)
                 sr0 = r0 * 2
                 sr1 = min(sr0 + (r1 - r0) * 2, prev_h)
+                strip = np.asarray(
+                    prev_arr[sr0:sr1, : cur_w * 2, :]
+                ).astype(np.float32)
+                th = strip.shape[0] // 2
+                tw = strip.shape[1] // 2
+                if th == 0 or tw == 0:
+                    return
+                coarsened = (
+                    strip[: th * 2, : tw * 2, :]
+                    .reshape(th, 2, tw, 2, num_bands)
+                    .mean(axis=(1, 3))
+                )
+                cur_arr[r0 : r0 + th, : tw, :] = (
+                    np.clip(coarsened, 0, 255).astype(np.uint8)
+                )
 
-                for c0 in range(0, cur_w, coarsen_cols):
-                    c1 = min(c0 + coarsen_cols, cur_w)
-                    sc0 = c0 * 2
-                    sc1 = min(sc0 + (c1 - c0) * 2, prev_w)
-
-                    tile = np.asarray(
-                        prev_arr[sr0:sr1, sc0:sc1, :]
-                    ).astype(np.float32)
-
-                    # 2x2 block mean
-                    th = tile.shape[0] // 2
-                    tw = tile.shape[1] // 2
-                    if th == 0 or tw == 0:
-                        del tile
-                        continue
-                    coarsened = (
-                        tile[: th * 2, : tw * 2, :]
-                        .reshape(th, 2, tw, 2, num_bands)
-                        .mean(axis=(1, 3))
-                    )
-                    cur_arr[r0 : r0 + th, c0 : c0 + tw, :] = (
-                        np.clip(coarsened, 0, 255).astype(np.uint8)
-                    )
-                    del tile, coarsened
+            strip_starts = list(range(0, cur_h, coarsen_strip))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                list(pool.map(_coarsen_strip, strip_starts))
 
             gc.collect()
             prev_h, prev_w = cur_h, cur_w

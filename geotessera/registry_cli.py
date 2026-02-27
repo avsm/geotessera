@@ -2664,6 +2664,7 @@ def global_preview_command(args):
     output_path = Path(args.output)
     year = args.year
     num_levels = args.levels
+    num_workers = args.workers
 
     # Parse zones into list of ints
     zones = None
@@ -2679,7 +2680,8 @@ def global_preview_command(args):
         f"  Input:   {zarr_dir}\n"
         f"  Output:  {output_path}\n"
         f"  Year:    {year}\n"
-        f"  Levels:  {num_levels}"
+        f"  Levels:  {num_levels}\n"
+        f"  Workers: {num_workers}"
     )
     if zones:
         console.print(f"  Zones:   {', '.join(str(z) for z in zones)}")
@@ -2690,6 +2692,7 @@ def global_preview_command(args):
         year=year,
         zones=zones,
         num_levels=num_levels,
+        workers=num_workers,
         console=console,
     )
 
@@ -3417,6 +3420,12 @@ Directory Structure:
         type=int,
         default=7,
         help="Number of multiscale levels (default: 7)",
+    )
+    global_preview_parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Number of parallel reprojection workers (default: 4)",
     )
     global_preview_parser.set_defaults(func=global_preview_command)
 
