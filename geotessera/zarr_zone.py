@@ -1343,6 +1343,10 @@ def _write_global_store(
 
     west, south, east, north = global_bounds
     num_bands = 4
+    chunk_size = 512
+    # Cap tile width so each tile fits in ~2 GB of float32:
+    #   4 bands × 2048 rows × 65536 cols × 4 bytes ≈ 2 GB
+    max_tile_cols = 65536
     level0_w = int(math.ceil((east - west) / base_res))
     level0_h = int(math.ceil((north - south) / base_res))
 
@@ -1369,10 +1373,11 @@ def _write_global_store(
         tmp_arr = tmp_root.create_array(
             preview_name,
             shape=(level0_h, level0_w, num_bands),
-            chunks=(512, 512, num_bands),
+            chunks=(chunk_size, chunk_size, num_bands),
             dtype=np.uint8,
             fill_value=np.uint8(0),
             compressors=BloscCodec(cname="zstd", clevel=3),
+            dimension_names=["lat", "lon", "band"],
         )
 
         for zone_num, zinfo in sorted(zone_infos.items()):
@@ -1437,124 +1442,135 @@ def _write_global_store(
                 )
                 strip_h = strip_end - strip_start
 
-                dst_north = north - strip_start * base_res
-                dst_west = west + zone_col_start * base_res
-
-                dst_transform = Affine(
-                    base_res, 0, dst_west,
-                    0, -base_res, dst_north,
-                )
-
-                # Back-project corners + midpoint to UTM to find
-                # the source window we need
-                dst_east = west + zone_col_end * base_res
-                dst_south = north - strip_end * base_res
-                sample_lons = [
-                    dst_west, dst_east, dst_west, dst_east,
-                    (dst_west + dst_east) / 2,
-                ]
-                sample_lats = [
-                    dst_north, dst_north, dst_south, dst_south,
-                    (dst_north + dst_south) / 2,
-                ]
-                try:
-                    utm_xs, utm_ys = to_utm.transform(
-                        sample_lons, sample_lats
-                    )
-                except Exception:
-                    continue
-
-                if any(
-                    not math.isfinite(v)
-                    for v in list(utm_xs) + list(utm_ys)
+                # Sub-divide wide zones into column tiles
+                for tile_col_start in range(
+                    zone_col_start, zone_col_end, max_tile_cols
                 ):
-                    continue
-
-                pad = 16
-                r_min = max(0, int(
-                    (src_origin_n - max(utm_ys)) / src_pixel
-                ) - pad)
-                r_max = min(src_h, int(math.ceil(
-                    (src_origin_n - min(utm_ys)) / src_pixel
-                )) + pad)
-                c_min = max(0, int(
-                    (min(utm_xs) - src_origin_e) / src_pixel
-                ) - pad)
-                c_max = min(src_w, int(math.ceil(
-                    (max(utm_xs) - src_origin_e) / src_pixel
-                )) + pad)
-
-                if r_max <= r_min or c_max <= c_min:
-                    continue
-
-                window = np.asarray(
-                    src_arr[r_min:r_max, c_min:c_max, :]
-                )
-                if not window.any():
-                    del window
-                    continue
-
-                src_data = np.transpose(
-                    window.astype(np.float32), (2, 0, 1)
-                )
-                del window
-
-                win_transform = Affine(
-                    src_pixel, 0,
-                    src_origin_e + c_min * src_pixel,
-                    0, -src_pixel,
-                    src_origin_n - r_min * src_pixel,
-                )
-
-                dst_data = np.full(
-                    (num_bands, strip_h, zone_strip_w),
-                    np.nan,
-                    dtype=np.float32,
-                )
-
-                try:
-                    rasterio.warp.reproject(
-                        source=src_data,
-                        destination=dst_data,
-                        src_transform=win_transform,
-                        src_crs=f"EPSG:{src_epsg}",
-                        dst_transform=dst_transform,
-                        dst_crs="EPSG:4326",
-                        resampling=Resampling.average,
+                    tile_col_end = min(
+                        tile_col_start + max_tile_cols, zone_col_end
                     )
-                except Exception as exc:
-                    if console is not None:
-                        console.print(
-                            f"      [yellow]strip {strip_start}-"
-                            f"{strip_end}: {exc}[/yellow]"
+                    tile_w = tile_col_end - tile_col_start
+
+                    dst_north = north - strip_start * base_res
+                    tile_west = west + tile_col_start * base_res
+                    tile_east = west + tile_col_end * base_res
+
+                    dst_transform = Affine(
+                        base_res, 0, tile_west,
+                        0, -base_res, dst_north,
+                    )
+
+                    # Back-project corners + midpoint to UTM
+                    dst_south = north - strip_end * base_res
+                    sample_lons = [
+                        tile_west, tile_east, tile_west, tile_east,
+                        (tile_west + tile_east) / 2,
+                    ]
+                    sample_lats = [
+                        dst_north, dst_north, dst_south, dst_south,
+                        (dst_north + dst_south) / 2,
+                    ]
+                    try:
+                        utm_xs, utm_ys = to_utm.transform(
+                            sample_lons, sample_lats
                         )
-                    del src_data, dst_data
-                    continue
+                    except Exception:
+                        continue
 
-                del src_data
-                dst_data = np.nan_to_num(dst_data, nan=0.0)
-                dst_data = np.clip(dst_data, 0, 255).astype(np.uint8)
-                out = np.transpose(dst_data, (1, 2, 0))
-                del dst_data
+                    if any(
+                        not math.isfinite(v)
+                        for v in list(utm_xs) + list(utm_ys)
+                    ):
+                        continue
 
-                mask = out.any(axis=2)
-                if not mask.any():
+                    pad = 16
+                    r_min = max(0, int(
+                        (src_origin_n - max(utm_ys)) / src_pixel
+                    ) - pad)
+                    r_max = min(src_h, int(math.ceil(
+                        (src_origin_n - min(utm_ys)) / src_pixel
+                    )) + pad)
+                    c_min = max(0, int(
+                        (min(utm_xs) - src_origin_e) / src_pixel
+                    ) - pad)
+                    c_max = min(src_w, int(math.ceil(
+                        (max(utm_xs) - src_origin_e) / src_pixel
+                    )) + pad)
+
+                    if r_max <= r_min or c_max <= c_min:
+                        continue
+
+                    window = np.asarray(
+                        src_arr[r_min:r_max, c_min:c_max, :]
+                    )
+                    if not window.any():
+                        del window
+                        continue
+
+                    src_data = np.transpose(
+                        window.astype(np.float32), (2, 0, 1)
+                    )
+                    del window
+
+                    win_transform = Affine(
+                        src_pixel, 0,
+                        src_origin_e + c_min * src_pixel,
+                        0, -src_pixel,
+                        src_origin_n - r_min * src_pixel,
+                    )
+
+                    dst_data = np.full(
+                        (num_bands, strip_h, tile_w),
+                        np.nan,
+                        dtype=np.float32,
+                    )
+
+                    try:
+                        rasterio.warp.reproject(
+                            source=src_data,
+                            destination=dst_data,
+                            src_transform=win_transform,
+                            src_crs=f"EPSG:{src_epsg}",
+                            dst_transform=dst_transform,
+                            dst_crs="EPSG:4326",
+                            resampling=Resampling.average,
+                        )
+                    except Exception as exc:
+                        if console is not None:
+                            console.print(
+                                f"      [yellow]strip {strip_start}-"
+                                f"{strip_end}: {exc}[/yellow]"
+                            )
+                        del src_data, dst_data
+                        continue
+
+                    del src_data
+                    dst_data = np.nan_to_num(dst_data, nan=0.0)
+                    dst_data = np.clip(
+                        dst_data, 0, 255
+                    ).astype(np.uint8)
+                    out = np.transpose(dst_data, (1, 2, 0))
+                    del dst_data
+
+                    mask = out.any(axis=2)
+                    if not mask.any():
+                        del out, mask
+                        continue
+
+                    tmp_arr[
+                        strip_start:strip_end,
+                        tile_col_start:tile_col_end,
+                        :,
+                    ] = out
+
+                    strips_written += 1
                     del out, mask
-                    continue
 
-                tmp_arr[
-                    strip_start:strip_end,
-                    zone_col_start:zone_col_end,
-                    :,
-                ] = out
-
-                strips_written += 1
-                del out, mask
                 gc.collect()
 
             if console is not None:
                 console.print(
-                    f"      {strips_written} strips written"
+                    f"      {strips_written} tiles written"
                 )
 
     # ==================================================================
@@ -1575,50 +1591,49 @@ def _write_global_store(
             f"level-by-level[/bold]"
         )
 
-    out_root = zarr.open_group(str(output_path), mode="w", zarr_format=3)
+    # Move the temp store to become the output store (level 0 is
+    # already written there).  This avoids a multi-hour copy of the
+    # full-resolution data.
+    if os.path.exists(str(output_path)):
+        shutil.rmtree(str(output_path))
+    shutil.move(tmp_store_path, str(output_path))
+    tmp_store_moved = True
+
+    out_root = zarr.open_group(str(output_path), mode="r+", zarr_format=3)
 
     for preview_name in preview_names:
-        # -- Level 0: copy from temp store into output /{0}/{preview} --
-        level0_zarr = zarr.open_array(
-            os.path.join(tmp_store_path, preview_name), mode="r"
-        )
-        level0_shape = level0_zarr.shape  # (H, W, bands)
+        # Level 0 is already at /{preview_name} in the moved store.
+        # Restructure: move it to /0/{preview_name} for multiscales.
+        level0_src = os.path.join(str(output_path), preview_name)
+        level0_dst_dir = os.path.join(str(output_path), "0")
+        os.makedirs(level0_dst_dir, exist_ok=True)
+        shutil.move(level0_src, os.path.join(level0_dst_dir, preview_name))
+
+        # Create a zarr v3 group node at /0 so zarr recognises it
+        import json as _json
+
+        group_meta_path = os.path.join(level0_dst_dir, "zarr.json")
+        with open(group_meta_path, "w") as f:
+            _json.dump(
+                {
+                    "zarr_format": 3,
+                    "node_type": "group",
+                    "attributes": {},
+                },
+                f,
+            )
+
+        # Reopen the whole store after restructuring
+        out_root = zarr.open_group(str(output_path), mode="r+", zarr_format=3)
+        level0_arr = out_root[f"0/{preview_name}"]
+        level0_shape = level0_arr.shape  # (H, W, bands)
 
         if console is not None:
             console.print(
                 f"  [dim]Level 0 (finest): "
                 f"{level0_shape[1]}x{level0_shape[0]}x{level0_shape[2]}"
-                f"[/dim]"
+                f" (moved from temp store)[/dim]"
             )
-
-        chunk_size = 512
-        out_arr = out_root.create_array(
-            f"0/{preview_name}",
-            shape=level0_shape,
-            chunks=(chunk_size, chunk_size, num_bands),
-            dtype=np.uint8,
-            fill_value=np.uint8(0),
-            compressors=BloscCodec(cname="zstd", clevel=3),
-            dimension_names=["lat", "lon", "band"],
-        )
-
-        # Copy in row-strips to bound memory
-        copy_strip = 2048
-        total_rows = level0_shape[0]
-        for r0 in range(0, total_rows, copy_strip):
-            r1 = min(r0 + copy_strip, total_rows)
-            out_arr[r0:r1, :, :] = level0_zarr[r0:r1, :, :]
-            if console is not None and r0 % (copy_strip * 10) == 0:
-                pct = int(100 * r0 / total_rows)
-                console.print(
-                    f"    [dim]Copying level 0: {pct}%[/dim]"
-                )
-
-        if console is not None:
-            console.print(f"    [dim]Copying level 0: 100%[/dim]")
-
-        del level0_zarr
-        gc.collect()
 
         # -- Levels 1..N-1: coarsen from previous level on disk --
         prev_h, prev_w = level0_shape[0], level0_shape[1]
@@ -1657,30 +1672,40 @@ def _write_global_store(
                 dimension_names=["lat", "lon", "band"],
             )
 
-            # Coarsen in strips: read 2 rows of chunks from prev,
-            # average into 1 row of chunks in cur
+            # Coarsen in tiles: read 2x2 blocks from prev level,
+            # average into output tiles.  Both row and column
+            # dimensions are chunked to bound memory.
             coarsen_strip = chunk_size  # output rows per iteration
+            coarsen_cols = max_tile_cols  # output cols per iteration
             for r0 in range(0, cur_h, coarsen_strip):
                 r1 = min(r0 + coarsen_strip, cur_h)
-                # Source rows: 2x the output rows
                 sr0 = r0 * 2
                 sr1 = min(sr0 + (r1 - r0) * 2, prev_h)
-                strip = np.asarray(
-                    prev_arr[sr0:sr1, : cur_w * 2, :]
-                ).astype(np.float32)
 
-                # 2x2 block mean: reshape and average
-                sh = strip.shape[0] // 2
-                sw = strip.shape[1] // 2
-                coarsened = (
-                    strip[: sh * 2, : sw * 2, :]
-                    .reshape(sh, 2, sw, 2, num_bands)
-                    .mean(axis=(1, 3))
-                )
-                cur_arr[r0:r1, :cur_w, :] = np.clip(
-                    coarsened, 0, 255
-                ).astype(np.uint8)
-                del strip, coarsened
+                for c0 in range(0, cur_w, coarsen_cols):
+                    c1 = min(c0 + coarsen_cols, cur_w)
+                    sc0 = c0 * 2
+                    sc1 = min(sc0 + (c1 - c0) * 2, prev_w)
+
+                    tile = np.asarray(
+                        prev_arr[sr0:sr1, sc0:sc1, :]
+                    ).astype(np.float32)
+
+                    # 2x2 block mean
+                    th = tile.shape[0] // 2
+                    tw = tile.shape[1] // 2
+                    if th == 0 or tw == 0:
+                        del tile
+                        continue
+                    coarsened = (
+                        tile[: th * 2, : tw * 2, :]
+                        .reshape(th, 2, tw, 2, num_bands)
+                        .mean(axis=(1, 3))
+                    )
+                    cur_arr[r0 : r0 + th, c0 : c0 + tw, :] = (
+                        np.clip(coarsened, 0, 255).astype(np.uint8)
+                    )
+                    del tile, coarsened
 
             gc.collect()
             prev_h, prev_w = cur_h, cur_w
