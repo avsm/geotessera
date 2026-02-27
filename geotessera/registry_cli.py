@@ -2674,15 +2674,12 @@ def global_preview_command(args):
             console.print("[red]Error: --zones must be comma-separated integers[/red]")
             return 1
 
-    preview_names = [args.preview]
-
     console.print(
         f"[bold]Building global preview store[/bold]\n"
         f"  Input:   {zarr_dir}\n"
         f"  Output:  {output_path}\n"
         f"  Year:    {year}\n"
-        f"  Levels:  {num_levels}\n"
-        f"  Preview: {', '.join(preview_names)}"
+        f"  Levels:  {num_levels}"
     )
     if zones:
         console.print(f"  Zones:   {', '.join(str(z) for z in zones)}")
@@ -2693,7 +2690,6 @@ def global_preview_command(args):
         year=year,
         zones=zones,
         num_levels=num_levels,
-        preview_names=preview_names,
         console=console,
     )
 
@@ -3421,13 +3417,6 @@ Directory Structure:
         type=int,
         default=7,
         help="Number of multiscale levels (default: 7)",
-    )
-    global_preview_parser.add_argument(
-        "--preview",
-        type=str,
-        default="rgb",
-        choices=["rgb"],
-        help="Which preview array to include (default: rgb)",
     )
     global_preview_parser.set_defaults(func=global_preview_command)
 

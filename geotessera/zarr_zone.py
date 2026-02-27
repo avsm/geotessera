@@ -1097,12 +1097,11 @@ def build_global_preview(
     year: int,
     zones: Optional[List[int]] = None,
     num_levels: int = 7,
-    preview_names: Optional[List[str]] = None,
     console: Optional["rich.console.Console"] = None,
 ) -> Path:
     """Build global EPSG:4326 preview store from per-zone UTM stores.
 
-    Reprojects each zone's rgb array from UTM to WGS84,
+    Reprojects each zone's RGB array from UTM to WGS84,
     writes into a single global zarr store with zarr-conventions/multiscales
     metadata for use with @carbonplan/zarr-layer.
 
@@ -1119,8 +1118,6 @@ def build_global_preview(
         zones: Optional list of UTM zone numbers to include. If *None*,
             all matching stores are used.
         num_levels: Number of resolution levels in the output pyramid.
-        preview_names: List of preview array names to include (e.g.
-            ``["rgb"]``). Defaults to ``["rgb"]``.
         console: Optional Rich Console for status messages.
 
     Returns:
@@ -1129,8 +1126,7 @@ def build_global_preview(
     import zarr
     from pyproj import Transformer
 
-    if preview_names is None:
-        preview_names = ["rgb"]
+    preview_names = ["rgb"]
 
     if console is not None:
         console.print(
