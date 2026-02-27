@@ -1334,15 +1334,11 @@ def _write_global_store(
     import shutil
     import tempfile
 
-    import dask.array as da
     import rasterio.warp
-    import xarray as xr
-    import xproj  # noqa: F401 — registers .proj accessor
     import zarr
     from affine import Affine
     from pyproj import Transformer
     from rasterio.enums import Resampling
-    from topozarr import create_pyramid
     from zarr.codecs import BloscCodec
 
     west, south, east, north = global_bounds
@@ -1562,107 +1558,148 @@ def _write_global_store(
                 )
 
     # ==================================================================
-    # Phase 2: Use topozarr to build pyramid from level-0
+    # Phase 2: Build pyramid level-by-level
     # ==================================================================
+    # Write each level independently, reading from the previously-written
+    # level on disk.  This breaks the dask computation chain so only one
+    # level's data is ever in memory at a time.
+    # ==================================================================
+    from topozarr.metadata import (
+        create_level_encoding,
+        create_multiscale_metadata,
+    )
+
     if console is not None:
         console.print(
             f"\n  [bold]Phase 2: Building {num_levels}-level pyramid "
-            f"with topozarr[/bold]"
+            f"level-by-level[/bold]"
         )
 
-    # Open the temporary level-0 as dask-backed xarray
+    out_root = zarr.open_group(str(output_path), mode="w", zarr_format=3)
+
     for preview_name in preview_names:
+        # -- Level 0: copy from temp store into output /{0}/{preview} --
         level0_zarr = zarr.open_array(
             os.path.join(tmp_store_path, preview_name), mode="r"
         )
-
-        dask_arr = da.from_zarr(level0_zarr, chunks=(512, 512, num_bands))
-
-        lat_coords = north - (np.arange(level0_h) + 0.5) * base_res
-        lon_coords = west + (np.arange(level0_w) + 0.5) * base_res
-
-        ds = xr.Dataset(
-            {
-                preview_name: xr.DataArray(
-                    dask_arr,
-                    dims=["lat", "lon", "band"],
-                    coords={
-                        "lat": lat_coords,
-                        "lon": lon_coords,
-                    },
-                ),
-            },
-        )
-        ds = ds.proj.assign_crs(spatial_ref_crs={"EPSG": 4326})
-
-        pyramid = create_pyramid(
-            ds,
-            levels=num_levels,
-            x_dim="lon",
-            y_dim="lat",
-            method="mean",
-            target_chunk_bytes=512 * 512 * num_bands,  # ~1 MB chunks
-            target_shard_bytes=None,  # no sharding
-        )
-
-        # topozarr sets non-spatial dims to chunk=1, but for 4-band
-        # RGBA that means 4x the fetches.  Override encoding + dask
-        # chunks to keep band=num_bands.
-        for path, var_enc in pyramid.encoding.items():
-            for var_name, enc in var_enc.items():
-                if "chunks" in enc:
-                    chunks = list(enc["chunks"])
-                    lvl_ds = pyramid.dt[path].dataset
-                    if var_name in lvl_ds:
-                        da_var = lvl_ds[var_name]
-                        for i, dim in enumerate(da_var.dims):
-                            if dim == "band":
-                                chunks[i] = int(da_var.sizes["band"])
-                        enc["chunks"] = tuple(chunks)
-                enc["compressors"] = BloscCodec(cname="zstd", clevel=3)
-
-            # Rechunk DataTree node so dask chunks match encoding
-            node = pyramid.dt[path]
-            rechunked = node.to_dataset().chunk({"band": num_bands})
-            pyramid.dt[path] = rechunked
-
-        if console is not None:
-            for idx in range(num_levels):
-                lvl_ds = pyramid.dt[f"/{idx}"].dataset
-                shape = lvl_ds[preview_name].shape
-                console.print(
-                    f"  [dim]Level {idx}: "
-                    f"{shape[1]}x{shape[0]}x{shape[2]}[/dim]"
-                )
-
-        # Patch CRS into multiscales for zarr-layer compatibility
-        attrs = dict(pyramid.dt.attrs)
-        if "multiscales" in attrs:
-            attrs["multiscales"]["crs"] = "EPSG:4326"
-            pyramid.dt.attrs = attrs
+        level0_shape = level0_zarr.shape  # (H, W, bands)
 
         if console is not None:
             console.print(
-                f"  [dim]Writing pyramid to {output_path}[/dim]"
+                f"  [dim]Level 0 (finest): "
+                f"{level0_shape[1]}x{level0_shape[0]}x{level0_shape[2]}"
+                f"[/dim]"
             )
 
-        pyramid.dt.to_zarr(
-            str(output_path),
-            mode="w",
-            encoding=pyramid.encoding,
-            zarr_format=3,
+        chunk_size = 512
+        out_arr = out_root.create_array(
+            f"0/{preview_name}",
+            shape=level0_shape,
+            chunks=(chunk_size, chunk_size, num_bands),
+            dtype=np.uint8,
+            fill_value=np.uint8(0),
+            compressors=BloscCodec(cname="zstd", clevel=3),
+            dimension_names=["lat", "lon", "band"],
         )
+
+        # Copy in row-strips to bound memory
+        copy_strip = 2048
+        total_rows = level0_shape[0]
+        for r0 in range(0, total_rows, copy_strip):
+            r1 = min(r0 + copy_strip, total_rows)
+            out_arr[r0:r1, :, :] = level0_zarr[r0:r1, :, :]
+            if console is not None and r0 % (copy_strip * 10) == 0:
+                pct = int(100 * r0 / total_rows)
+                console.print(
+                    f"    [dim]Copying level 0: {pct}%[/dim]"
+                )
+
+        if console is not None:
+            console.print(f"    [dim]Copying level 0: 100%[/dim]")
+
+        del level0_zarr
+        gc.collect()
+
+        # -- Levels 1..N-1: coarsen from previous level on disk --
+        prev_h, prev_w = level0_shape[0], level0_shape[1]
+
+        for lvl in range(1, num_levels):
+            cur_h = prev_h // 2
+            cur_w = prev_w // 2
+            if cur_h < 1 or cur_w < 1:
+                if console is not None:
+                    console.print(
+                        f"  [yellow]Stopping at level {lvl}: "
+                        f"dimensions too small[/yellow]"
+                    )
+                break
+
+            if console is not None:
+                console.print(
+                    f"  [dim]Level {lvl}: "
+                    f"{cur_w}x{cur_h}x{num_bands}[/dim]"
+                )
+
+            # Open previous level from the output store
+            prev_arr = out_root[f"{lvl - 1}/{preview_name}"]
+
+            cur_arr = out_root.create_array(
+                f"{lvl}/{preview_name}",
+                shape=(cur_h, cur_w, num_bands),
+                chunks=(
+                    min(chunk_size, cur_h),
+                    min(chunk_size, cur_w),
+                    num_bands,
+                ),
+                dtype=np.uint8,
+                fill_value=np.uint8(0),
+                compressors=BloscCodec(cname="zstd", clevel=3),
+                dimension_names=["lat", "lon", "band"],
+            )
+
+            # Coarsen in strips: read 2 rows of chunks from prev,
+            # average into 1 row of chunks in cur
+            coarsen_strip = chunk_size  # output rows per iteration
+            for r0 in range(0, cur_h, coarsen_strip):
+                r1 = min(r0 + coarsen_strip, cur_h)
+                # Source rows: 2x the output rows
+                sr0 = r0 * 2
+                sr1 = min(sr0 + (r1 - r0) * 2, prev_h)
+                strip = np.asarray(
+                    prev_arr[sr0:sr1, : cur_w * 2, :]
+                ).astype(np.float32)
+
+                # 2x2 block mean: reshape and average
+                sh = strip.shape[0] // 2
+                sw = strip.shape[1] // 2
+                coarsened = (
+                    strip[: sh * 2, : sw * 2, :]
+                    .reshape(sh, 2, sw, 2, num_bands)
+                    .mean(axis=(1, 3))
+                )
+                cur_arr[r0:r1, :cur_w, :] = np.clip(
+                    coarsened, 0, 255
+                ).astype(np.uint8)
+                del strip, coarsened
+
+            gc.collect()
+            prev_h, prev_w = cur_h, cur_w
+
+    # ------------------------------------------------------------------
+    # Write multiscales metadata
+    # ------------------------------------------------------------------
+    actual_levels = len([
+        k for k in out_root.keys() if k.isdigit()
+    ])
+    ms_attrs = create_multiscale_metadata(
+        actual_levels, "EPSG:4326", "mean"
+    )
+    # Patch CRS into multiscales for zarr-layer compatibility
+    ms_attrs["multiscales"]["crs"] = "EPSG:4326"
+    out_root.attrs.update(ms_attrs)
 
     # Consolidate metadata
     zarr.consolidate_metadata(str(output_path))
-
-    # Re-apply root attributes after consolidation (consolidate_metadata
-    # may overwrite the root zarr.json, dropping custom attributes like
-    # multiscales that were set on the datatree).
-    root = zarr.open_group(str(output_path), mode="r+", zarr_format=3)
-    if not root.attrs.get("multiscales") and attrs.get("multiscales"):
-        root.attrs.update(attrs)
-        logger.info("Re-applied multiscales attributes after consolidation")
 
     # Clean up temporary store
     shutil.rmtree(tmp_dir, ignore_errors=True)
