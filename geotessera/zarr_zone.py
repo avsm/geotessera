@@ -37,7 +37,7 @@ GLOBAL_LEVEL0_W = 3_600_000  # ceil(360 / 0.0001)
 GLOBAL_LEVEL0_H = 1_800_000  # ceil(180 / 0.0001)
 GLOBAL_CHUNK = 512
 GLOBAL_NUM_BANDS = 4
-GLOBAL_DEFAULT_LEVELS = 7
+GLOBAL_DEFAULT_LEVELS = 10
 GLOBAL_BATCH_CHUNK_ROWS = 64  # chunk-rows per dask compute batch
 
 
@@ -1289,7 +1289,18 @@ def _reproject_chunk(
     if not out.any():
         return False
 
-    global_arr[row0 : row0 + tile_h, col0 : col0 + tile_w, :] = out
+    # Composite with existing data: only overwrite pixels where new data is
+    # non-zero.  This prevents a later zone from clobbering a previous zone's
+    # partial contribution in chunks that straddle a UTM zone boundary.
+    mask = out.any(axis=2)  # (tile_h, tile_w) bool
+    if mask.all():
+        global_arr[row0 : row0 + tile_h, col0 : col0 + tile_w, :] = out
+    else:
+        existing = np.asarray(
+            global_arr[row0 : row0 + tile_h, col0 : col0 + tile_w, :]
+        )
+        existing[mask] = out[mask]
+        global_arr[row0 : row0 + tile_h, col0 : col0 + tile_w, :] = existing
     return True
 
 
