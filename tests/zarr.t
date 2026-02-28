@@ -186,10 +186,10 @@ Build global preview store from the zone store:
 
   $ geotessera-registry global-preview \
   >   "$TESTDIR/zarr_global_test" \
-  >   --output "$TESTDIR/zarr_global_test/global_rgb_2024.zarr" \
   >   --year 2024 \
   >   --levels 3 \
-  >   --preview rgb 2>&1 | grep -E '(Global|levels|store written)' | head -3 | sed 's/ *$//'
+  >   --workers 2 2>&1 | grep -E '(Building|Found|Processing|Global store)' | head -4 | sed 's/ *$//'
+  * (glob)
   * (glob)
   * (glob)
   * (glob)
@@ -211,6 +211,8 @@ Verify global preview store structure has multiscales metadata:
   > has_blosc = any(c.get('name') == 'blosc' for c in first_arr.get('codecs', []))
   > print(f'has_blosc: {has_blosc}')
   > print(f'dimension_names: {first_arr.get(\"dimension_names\")}')
+  > sp = meta['attributes']['spatial']
+  > print(f'bounds: {sp[\"bounds\"]}')
   > "
   crs: EPSG:4326
   num_levels: 3
@@ -218,3 +220,4 @@ Verify global preview store structure has multiscales metadata:
   has_rgb_arrays: True
   has_blosc: True
   dimension_names: ['lat', 'lon', 'band']
+  bounds: [-180.0, -90.0, 180.0, 90.0]
