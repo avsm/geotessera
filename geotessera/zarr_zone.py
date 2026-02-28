@@ -1173,7 +1173,10 @@ def _ensure_global_store(store_path: Path, num_levels: int) -> None:
         "resolution": GLOBAL_BASE_RES,
     }
     root.attrs.update(ms_attrs)
-    zarr.consolidate_metadata(str(store_path))
+    import warnings
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Consolidated metadata")
+        zarr.consolidate_metadata(str(store_path))
 
 
 def _reproject_chunk(
@@ -1196,9 +1199,14 @@ def _reproject_chunk(
 
     Returns True if any non-zero data was written.
     """
+    import warnings
+
     from affine import Affine
     from rasterio.enums import Resampling
     import rasterio.warp
+    from rasterio.errors import NotGeoreferencedWarning
+
+    warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
 
     west, south, east, north = GLOBAL_BOUNDS
     row0 = chunk_row * GLOBAL_CHUNK
@@ -1615,7 +1623,10 @@ def build_global_preview(
         gc.collect()
 
     # 5. Re-consolidate metadata
-    zarr.consolidate_metadata(str(output_path))
+    import warnings
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Consolidated metadata")
+        zarr.consolidate_metadata(str(output_path))
     if console is not None:
         console.print(
             f"\n  [bold green]Global store updated: {output_path}[/bold green]"
