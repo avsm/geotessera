@@ -30,6 +30,16 @@ logger = logging.getLogger(__name__)
 N_BANDS = 128
 RGB_PREVIEW_BANDS = (0, 1, 2)
 
+# Global preview grid (fixed extent, never changes)
+GLOBAL_BOUNDS = (-180.0, -90.0, 180.0, 90.0)
+GLOBAL_BASE_RES = 0.0001  # degrees (~10m at equator)
+GLOBAL_LEVEL0_W = 3_600_000  # ceil(360 / 0.0001)
+GLOBAL_LEVEL0_H = 1_800_000  # ceil(180 / 0.0001)
+GLOBAL_CHUNK = 512
+GLOBAL_NUM_BANDS = 4
+GLOBAL_DEFAULT_LEVELS = 7
+GLOBAL_BATCH_CHUNK_ROWS = 64  # chunk-rows per dask compute batch
+
 
 # =============================================================================
 # Data types
@@ -1091,236 +1101,81 @@ def read_region_from_zone(
     return np.asarray(embeddings), np.asarray(scales), attrs
 
 
-def build_global_preview(
-    zarr_dir: Path,
-    output_path: Path,
-    year: int,
-    zones: Optional[List[int]] = None,
-    num_levels: int = 7,
-    workers: int = 4,
-    console: Optional["rich.console.Console"] = None,
-) -> Path:
-    """Build global EPSG:4326 preview store from per-zone UTM stores.
+def _ensure_global_store(store_path: Path, num_levels: int) -> None:
+    """Create the global preview store with fixed dimensions if it doesn't exist.
 
-    Reprojects each zone's RGB array from UTM to WGS84,
-    writes into a single global zarr store with zarr-conventions/multiscales
-    metadata for use with @carbonplan/zarr-layer.
-
-    Steps:
-        1. Discover zone stores matching ``utm{ZZ}_{year}.zarr`` in *zarr_dir*.
-        2. Compute the union WGS84 bounding box across all discovered zones.
-        3. Determine global array dimensions at ~0.0001 deg resolution.
-        4. Delegate to :func:`_write_global_store` to create the output.
-
-    Args:
-        zarr_dir: Directory containing per-zone ``.zarr`` stores.
-        output_path: Path for the output global zarr store.
-        year: Year to filter zone store filenames.
-        zones: Optional list of UTM zone numbers to include. If *None*,
-            all matching stores are used.
-        num_levels: Number of resolution levels in the output pyramid.
-        console: Optional Rich Console for status messages.
-
-    Returns:
-        Path to the created global zarr store.
+    If the store already exists with correct dimensions, this is a no-op.
+    Creates level 0 through level (num_levels-1), each with an 'rgb' array
+    and a 'band' coordinate array.
     """
+    import json as _json
     import zarr
-    from pyproj import Transformer
+    from zarr.codecs import BloscCodec
 
-    preview_names = ["rgb"]
-
-    if console is not None:
-        console.print(
-            f"[bold]Scanning {zarr_dir} for zone stores (year={year})...[/bold]"
-        )
-
-    # ------------------------------------------------------------------
-    # 1. Discover zone stores
-    # ------------------------------------------------------------------
-    pattern = re.compile(rf"^utm(\d{{2}})_{year}\.zarr$")
-    zone_stores: Dict[int, Path] = {}
-
-    for entry in sorted(zarr_dir.iterdir()):
-        if not entry.is_dir():
-            continue
-        m = pattern.match(entry.name)
-        if m is None:
-            continue
-        zone_num = int(m.group(1))
-        if zones is not None and zone_num not in zones:
-            continue
-        zone_stores[zone_num] = entry
-
-    if not zone_stores:
-        msg = f"No zone stores found in {zarr_dir} for year {year}"
-        if zones is not None:
-            msg += f" (zones filter: {zones})"
-        raise FileNotFoundError(msg)
-
-    if console is not None:
-        console.print(
-            f"  Found {len(zone_stores)} zone store(s): "
-            f"{sorted(zone_stores.keys())}"
-        )
-
-    # ------------------------------------------------------------------
-    # 2. Compute global WGS84 bounding box
-    # ------------------------------------------------------------------
-    global_lon_min = float("inf")
-    global_lon_max = float("-inf")
-    global_lat_min = float("inf")
-    global_lat_max = float("-inf")
-
-    zone_infos: Dict[int, dict] = {}
-
-    for zone_num, store_path in sorted(zone_stores.items()):
-        store = zarr.open_group(str(store_path), mode="r")
-        attrs = dict(store.attrs)
-
-        epsg = int(attrs["crs_epsg"])
-        transform = list(attrs["transform"])
-        pixel_size = transform[0]
-        origin_e = transform[2]
-        origin_n = transform[5]
-
-        # Find the first available preview array to get the shape
-        preview_shape = None
-        for pname in preview_names:
-            if pname in store:
-                preview_shape = store[pname].shape
-                break
-
-        if preview_shape is None:
-            if console is not None:
-                console.print(
-                    f"  [yellow]Zone {zone_num}: no preview arrays found, "
-                    f"skipping[/yellow]"
-                )
-            continue
-
-        h, w = preview_shape[:2]
-
-        # UTM corner coordinates
-        corners_utm = [
-            (origin_e, origin_n),                             # top-left
-            (origin_e + w * pixel_size, origin_n),            # top-right
-            (origin_e, origin_n - h * pixel_size),            # bottom-left
-            (origin_e + w * pixel_size, origin_n - h * pixel_size),  # bottom-right
-        ]
-
-        # Add mid-edge points for better bounding at high latitudes
-        mid_e = origin_e + w * pixel_size / 2
-        mid_n = origin_n - h * pixel_size / 2
-        corners_utm += [
-            (mid_e, origin_n),                   # top-centre
-            (mid_e, origin_n - h * pixel_size),  # bottom-centre
-            (origin_e, mid_n),                   # left-centre
-            (origin_e + w * pixel_size, mid_n),  # right-centre
-        ]
-
-        # Reproject corners to WGS84
-        transformer = Transformer.from_crs(
-            f"EPSG:{epsg}", "EPSG:4326", always_xy=True
-        )
-        corners_4326 = [
-            transformer.transform(e, n) for e, n in corners_utm
-        ]
-
-        lons = [c[0] for c in corners_4326]
-        lats = [c[1] for c in corners_4326]
-
-        zone_lon_min, zone_lon_max = min(lons), max(lons)
-        zone_lat_min, zone_lat_max = min(lats), max(lats)
-
-        # Union into the global bounding box
-        global_lon_min = min(global_lon_min, zone_lon_min)
-        global_lon_max = max(global_lon_max, zone_lon_max)
-        global_lat_min = min(global_lat_min, zone_lat_min)
-        global_lat_max = max(global_lat_max, zone_lat_max)
-
-        zone_infos[zone_num] = {
-            "store_path": store_path,
-            "epsg": epsg,
-            "transform": transform,
-            "shape": preview_shape,
-            "bounds_4326": (
-                zone_lon_min, zone_lat_min, zone_lon_max, zone_lat_max,
-            ),
-        }
-
-        if console is not None:
-            console.print(
-                f"  Zone {zone_num:02d} (EPSG:{epsg}): "
-                f"{h}x{w} px, "
-                f"lon [{zone_lon_min:.4f}, {zone_lon_max:.4f}], "
-                f"lat [{zone_lat_min:.4f}, {zone_lat_max:.4f}]"
+    if store_path.exists():
+        root = zarr.open_group(str(store_path), mode="r")
+        if "0/rgb" in root:
+            shape = root["0/rgb"].shape
+            if shape == (GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W, GLOBAL_NUM_BANDS):
+                return
+            raise ValueError(
+                f"Existing store has shape {shape}, expected "
+                f"({GLOBAL_LEVEL0_H}, {GLOBAL_LEVEL0_W}, {GLOBAL_NUM_BANDS})"
             )
 
-    if not zone_infos:
-        raise FileNotFoundError(
-            "No zone stores with valid preview arrays found"
+    root = zarr.open_group(str(store_path), mode="w", zarr_format=3)
+    h, w = GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W
+    band_data = np.arange(GLOBAL_NUM_BANDS, dtype=np.int32)
+
+    for lvl in range(num_levels):
+        if h < 1 or w < 1:
+            break
+        level_dir = os.path.join(str(store_path), str(lvl))
+        os.makedirs(level_dir, exist_ok=True)
+        group_meta = os.path.join(level_dir, "zarr.json")
+        if not os.path.exists(group_meta):
+            with open(group_meta, "w") as f:
+                _json.dump(
+                    {"zarr_format": 3, "node_type": "group", "attributes": {}},
+                    f,
+                )
+        root = zarr.open_group(str(store_path), mode="r+", zarr_format=3)
+        root.create_array(
+            f"{lvl}/rgb",
+            shape=(h, w, GLOBAL_NUM_BANDS),
+            chunks=(GLOBAL_CHUNK, GLOBAL_CHUNK, GLOBAL_NUM_BANDS),
+            dtype=np.uint8,
+            fill_value=np.uint8(0),
+            compressors=BloscCodec(cname="zstd", clevel=3),
+            dimension_names=["lat", "lon", "band"],
         )
-
-    global_bounds = (
-        global_lon_min, global_lat_min, global_lon_max, global_lat_max,
-    )
-
-    if console is not None:
-        console.print(
-            f"  [bold]Global extent:[/bold] "
-            f"lon [{global_lon_min:.4f}, {global_lon_max:.4f}], "
-            f"lat [{global_lat_min:.4f}, {global_lat_max:.4f}]"
+        root.create_array(
+            f"{lvl}/band",
+            data=band_data,
+            chunks=(GLOBAL_NUM_BANDS,),
         )
+        h //= 2
+        w //= 2
 
-    # ------------------------------------------------------------------
-    # 3. Compute global array dimensions
-    # ------------------------------------------------------------------
-    base_res = 0.0001  # ~10 m at equator
-
-    global_w = int(
-        math.ceil((global_lon_max - global_lon_min) / base_res)
-    )
-    global_h = int(
-        math.ceil((global_lat_max - global_lat_min) / base_res)
-    )
-
-    if console is not None:
-        console.print(
-            f"  [dim]Base resolution: {base_res}° "
-            f"→ {global_w}x{global_h} pixels[/dim]"
-        )
-        console.print(
-            f"  [dim]Pyramid levels: {num_levels}[/dim]"
-        )
-
-    # ------------------------------------------------------------------
-    # 4. Create the global store
-    # ------------------------------------------------------------------
-    _write_global_store(
-        output_path=output_path,
-        zone_infos=zone_infos,
-        preview_names=preview_names,
-        global_bounds=global_bounds,
-        base_res=base_res,
-        num_levels=num_levels,
-        workers=workers,
-        console=console,
-    )
-
-    return output_path
+    from topozarr.metadata import create_multiscale_metadata
+    root = zarr.open_group(str(store_path), mode="r+", zarr_format=3)
+    actual_levels = len([k for k in root.keys() if k.isdigit()])
+    ms_attrs = create_multiscale_metadata(actual_levels, "EPSG:4326", "mean")
+    ms_attrs["multiscales"]["crs"] = "EPSG:4326"
+    west, south, east, north = GLOBAL_BOUNDS
+    ms_attrs["spatial"] = {
+        "bounds": [west, south, east, north],
+        "resolution": GLOBAL_BASE_RES,
+    }
+    root.attrs.update(ms_attrs)
+    zarr.consolidate_metadata(str(store_path))
 
 
-def _reproject_tile(
+def _reproject_chunk(
+    global_arr,
+    chunk_row: int,
+    chunk_col: int,
     src_arr,
-    tmp_arr,
-    strip_start: int,
-    strip_h: int,
-    tile_col_start: int,
-    tile_w: int,
-    north: float,
-    west: float,
-    base_res: float,
-    num_bands: int,
     src_epsg: int,
     src_pixel: float,
     src_origin_e: float,
@@ -1329,34 +1184,39 @@ def _reproject_tile(
     src_w: int,
     to_utm,
 ) -> bool:
-    """Reproject one tile from UTM source to WGS84 output.
+    """Reproject one 512x512 output chunk from UTM source and write to global_arr.
 
-    Returns True if any data was written.
+    Each call writes to a unique (chunk_row, chunk_col) position, so concurrent
+    calls to different positions are safe.
+
+    Returns True if any non-zero data was written.
     """
     from affine import Affine
     from rasterio.enums import Resampling
     import rasterio.warp
 
-    tile_col_end = tile_col_start + tile_w
-    strip_end = strip_start + strip_h
-    dst_north = north - strip_start * base_res
-    tile_west = west + tile_col_start * base_res
-    tile_east = west + tile_col_end * base_res
+    west, south, east, north = GLOBAL_BOUNDS
+    row0 = chunk_row * GLOBAL_CHUNK
+    col0 = chunk_col * GLOBAL_CHUNK
+    tile_h = min(GLOBAL_CHUNK, GLOBAL_LEVEL0_H - row0)
+    tile_w = min(GLOBAL_CHUNK, GLOBAL_LEVEL0_W - col0)
+    if tile_h <= 0 or tile_w <= 0:
+        return False
+
+    tile_west = west + col0 * GLOBAL_BASE_RES
+    tile_north = north - row0 * GLOBAL_BASE_RES
+    tile_east = tile_west + tile_w * GLOBAL_BASE_RES
+    tile_south = tile_north - tile_h * GLOBAL_BASE_RES
 
     dst_transform = Affine(
-        base_res, 0, tile_west,
-        0, -base_res, dst_north,
+        GLOBAL_BASE_RES, 0, tile_west,
+        0, -GLOBAL_BASE_RES, tile_north,
     )
 
-    dst_south = north - strip_end * base_res
-    sample_lons = [
-        tile_west, tile_east, tile_west, tile_east,
-        (tile_west + tile_east) / 2,
-    ]
-    sample_lats = [
-        dst_north, dst_north, dst_south, dst_south,
-        (dst_north + dst_south) / 2,
-    ]
+    sample_lons = [tile_west, tile_east, tile_west, tile_east,
+                   (tile_west + tile_east) / 2]
+    sample_lats = [tile_north, tile_north, tile_south, tile_south,
+                   (tile_north + tile_south) / 2]
     try:
         utm_xs, utm_ys = to_utm.transform(sample_lons, sample_lats)
     except Exception:
@@ -1391,7 +1251,7 @@ def _reproject_tile(
     )
 
     dst_data = np.full(
-        (num_bands, strip_h, tile_w), np.nan, dtype=np.float32,
+        (GLOBAL_NUM_BANDS, tile_h, tile_w), np.nan, dtype=np.float32,
     )
 
     try:
@@ -1413,389 +1273,348 @@ def _reproject_tile(
     out = np.transpose(dst_data, (1, 2, 0))
     del dst_data
 
-    if not out.any(axis=2).any():
+    if not out.any():
         return False
 
-    tmp_arr[
-        strip_start : strip_start + strip_h,
-        tile_col_start : tile_col_end,
-        :,
-    ] = out
+    global_arr[row0 : row0 + tile_h, col0 : col0 + tile_w, :] = out
     return True
 
 
-def _write_global_store(
-    output_path: Path,
-    zone_infos: dict,
-    preview_names: List[str],
-    global_bounds: Tuple[float, float, float, float],
-    base_res: float,
+def _reproject_zone(
+    store_path: Path,
+    zone_num: int,
+    zone_store_path: Path,
+    zone_epsg: int,
+    zone_transform: list,
+    zone_shape: tuple,
+    workers: int,
+    console: Optional["rich.console.Console"] = None,
+) -> Tuple[int, int, int, int]:
+    """Reproject one zone's RGB into level 0 of the global store.
+
+    Uses dask.delayed to parallelise chunk-level reprojection tasks.
+    Each task writes to a unique chunk position, eliminating write races.
+
+    Returns (row_start, row_end, col_start, col_end) in pixel coords,
+    snapped to chunk boundaries.
+    """
+    import dask
+    import zarr
+    from pyproj import Transformer
+
+    src_pixel = zone_transform[0]
+    src_origin_e = zone_transform[2]
+    src_origin_n = zone_transform[5]
+    src_h, src_w = zone_shape[:2]
+
+    west, south, east, north = GLOBAL_BOUNDS
+
+    # Compute zone's WGS84 bounding box
+    to_4326 = Transformer.from_crs(
+        f"EPSG:{zone_epsg}", "EPSG:4326", always_xy=True,
+    )
+    corners_utm = [
+        (src_origin_e, src_origin_n),
+        (src_origin_e + src_w * src_pixel, src_origin_n),
+        (src_origin_e, src_origin_n - src_h * src_pixel),
+        (src_origin_e + src_w * src_pixel, src_origin_n - src_h * src_pixel),
+    ]
+    mid_e = src_origin_e + src_w * src_pixel / 2
+    mid_n = src_origin_n - src_h * src_pixel / 2
+    corners_utm += [
+        (mid_e, src_origin_n),
+        (mid_e, src_origin_n - src_h * src_pixel),
+        (src_origin_e, mid_n),
+        (src_origin_e + src_w * src_pixel, mid_n),
+    ]
+    corners_4326 = [to_4326.transform(e, n) for e, n in corners_utm]
+    lons = [c[0] for c in corners_4326]
+    lats = [c[1] for c in corners_4326]
+
+    zlon_min, zlon_max = min(lons), max(lons)
+    zlat_min, zlat_max = min(lats), max(lats)
+
+    # Snap to chunk boundaries (expand outward)
+    col_start = max(0, (int(math.floor((zlon_min - west) / GLOBAL_BASE_RES))
+                        // GLOBAL_CHUNK * GLOBAL_CHUNK))
+    col_end = min(GLOBAL_LEVEL0_W,
+                  ((int(math.ceil((zlon_max - west) / GLOBAL_BASE_RES))
+                    + GLOBAL_CHUNK - 1) // GLOBAL_CHUNK * GLOBAL_CHUNK))
+    row_start = max(0, (int(math.floor((north - zlat_max) / GLOBAL_BASE_RES))
+                        // GLOBAL_CHUNK * GLOBAL_CHUNK))
+    row_end = min(GLOBAL_LEVEL0_H,
+                  ((int(math.ceil((north - zlat_min) / GLOBAL_BASE_RES))
+                    + GLOBAL_CHUNK - 1) // GLOBAL_CHUNK * GLOBAL_CHUNK))
+
+    if col_end <= col_start or row_end <= row_start:
+        if console is not None:
+            console.print(f"    [yellow]Zone {zone_num}: no output region[/yellow]")
+        return (0, 0, 0, 0)
+
+    n_chunk_rows = (row_end - row_start) // GLOBAL_CHUNK
+    n_chunk_cols = (col_end - col_start) // GLOBAL_CHUNK
+    chunk_row_start = row_start // GLOBAL_CHUNK
+    chunk_col_start = col_start // GLOBAL_CHUNK
+
+    if console is not None:
+        total_chunks = n_chunk_rows * n_chunk_cols
+        console.print(
+            f"    Zone {zone_num:02d}: rows {row_start}-{row_end}, "
+            f"cols {col_start}-{col_end} "
+            f"({n_chunk_rows}x{n_chunk_cols} = {total_chunks} chunks)"
+        )
+
+    global_root = zarr.open_group(str(store_path), mode="r+", zarr_format=3)
+    global_arr = global_root["0/rgb"]
+    zone_store = zarr.open_group(str(zone_store_path), mode="r")
+    src_arr = zone_store["rgb"]
+
+    to_utm = Transformer.from_crs(
+        "EPSG:4326", f"EPSG:{zone_epsg}", always_xy=True,
+    )
+
+    chunks_written = 0
+    chunks_total = n_chunk_rows * n_chunk_cols
+
+    for batch_start in range(0, n_chunk_rows, GLOBAL_BATCH_CHUNK_ROWS):
+        batch_end = min(batch_start + GLOBAL_BATCH_CHUNK_ROWS, n_chunk_rows)
+
+        tasks = []
+        for cr_offset in range(batch_start, batch_end):
+            cr = chunk_row_start + cr_offset
+            for cc_offset in range(n_chunk_cols):
+                cc = chunk_col_start + cc_offset
+                task = dask.delayed(_reproject_chunk)(
+                    global_arr=global_arr,
+                    chunk_row=cr,
+                    chunk_col=cc,
+                    src_arr=src_arr,
+                    src_epsg=zone_epsg,
+                    src_pixel=src_pixel,
+                    src_origin_e=src_origin_e,
+                    src_origin_n=src_origin_n,
+                    src_h=src_h,
+                    src_w=src_w,
+                    to_utm=to_utm,
+                )
+                tasks.append(task)
+
+        results = dask.compute(*tasks, scheduler="threads",
+                               num_workers=workers)
+        batch_written = sum(1 for r in results if r)
+        chunks_written += batch_written
+
+        if console is not None:
+            done = min((batch_end) * n_chunk_cols, chunks_total)
+            pct = int(100 * done / chunks_total)
+            console.print(
+                f"      [{pct:3d}%] {done}/{chunks_total} chunks "
+                f"({chunks_written} with data)"
+            )
+
+    return (row_start, row_end, col_start, col_end)
+
+
+def _coarsen_zone_pyramid(
+    store_path: Path,
+    row_start: int,
+    row_end: int,
+    col_start: int,
+    col_end: int,
     num_levels: int,
     workers: int,
-    console: "rich.console.Console",
+    console: Optional["rich.console.Console"] = None,
 ) -> None:
-    """Create global 4326 zarr store and reproject each zone into it.
+    """Update pyramid levels 1 through num_levels-1 for the affected region.
 
-    Two phases:
-      1. Reproject each zone's preview arrays from UTM to WGS84 using
-         windowed rasterio.warp.reproject() into a temporary level-0
-         zarr store.  Tiles within each zone run in parallel threads.
-      2. Build coarsened pyramid levels from level-0 on disk.
+    Reads from the previous level and writes coarsened data to the current
+    level, processing in row-strips parallelised with dask.delayed.
+    """
+    import dask
+    import zarr
+
+    root = zarr.open_group(str(store_path), mode="r+", zarr_format=3)
+
+    prev_row_start, prev_row_end = row_start, row_end
+    prev_col_start, prev_col_end = col_start, col_end
+
+    for lvl in range(1, num_levels):
+        prev_arr_path = f"{lvl - 1}/rgb"
+        cur_arr_path = f"{lvl}/rgb"
+
+        if prev_arr_path not in root or cur_arr_path not in root:
+            break
+
+        prev_arr = root[prev_arr_path]
+        cur_arr = root[cur_arr_path]
+        cur_h, cur_w = cur_arr.shape[:2]
+
+        lr_start = max(0, (prev_row_start // 2) // GLOBAL_CHUNK * GLOBAL_CHUNK)
+        lr_end = min(cur_h, ((prev_row_end // 2 + GLOBAL_CHUNK - 1)
+                             // GLOBAL_CHUNK * GLOBAL_CHUNK))
+        lc_start = max(0, (prev_col_start // 2) // GLOBAL_CHUNK * GLOBAL_CHUNK)
+        lc_end = min(cur_w, ((prev_col_end // 2 + GLOBAL_CHUNK - 1)
+                             // GLOBAL_CHUNK * GLOBAL_CHUNK))
+
+        if lr_end <= lr_start or lc_end <= lc_start:
+            break
+
+        if console is not None:
+            console.print(
+                f"    Level {lvl}: rows {lr_start}-{lr_end}, "
+                f"cols {lc_start}-{lc_end}"
+            )
+
+        strip_h = GLOBAL_CHUNK
+
+        def _coarsen_strip(r0, _prev_arr=prev_arr, _cur_arr=cur_arr,
+                           _lc_start=lc_start, _lc_end=lc_end,
+                           _cur_h=cur_h):
+            r1 = min(r0 + strip_h, _cur_h)
+            sr0 = r0 * 2
+            sr1 = min(sr0 + (r1 - r0) * 2, _prev_arr.shape[0])
+            sc0 = _lc_start * 2
+            sc1 = min(sc0 + (_lc_end - _lc_start) * 2, _prev_arr.shape[1])
+            strip = np.asarray(
+                _prev_arr[sr0:sr1, sc0:sc1, :]
+            ).astype(np.float32)
+            th = strip.shape[0] // 2
+            tw = strip.shape[1] // 2
+            if th == 0 or tw == 0:
+                return
+            coarsened = (
+                strip[: th * 2, : tw * 2, :]
+                .reshape(th, 2, tw, 2, GLOBAL_NUM_BANDS)
+                .mean(axis=(1, 3))
+            )
+            result = np.clip(coarsened, 0, 255).astype(np.uint8)
+            _cur_arr[r0 : r0 + th, _lc_start : _lc_start + tw, :] = result
+
+        strip_starts = list(range(lr_start, lr_end, strip_h))
+        tasks = [dask.delayed(_coarsen_strip)(r0) for r0 in strip_starts]
+        dask.compute(*tasks, scheduler="threads", num_workers=workers)
+
+        prev_row_start, prev_row_end = lr_start, lr_end
+        prev_col_start, prev_col_end = lc_start, lc_end
+
+
+def build_global_preview(
+    zarr_dir: Path,
+    year: int,
+    zones: Optional[List[int]] = None,
+    num_levels: int = GLOBAL_DEFAULT_LEVELS,
+    workers: int = 4,
+    console: Optional["rich.console.Console"] = None,
+) -> Path:
+    """Create or update global EPSG:4326 preview store from per-zone UTM stores.
+
+    The output store is always ``{zarr_dir}/global_rgb_{year}.zarr``.
+    If the store already exists, only the specified zones are re-processed.
     """
     import gc
-    import shutil
-    import tempfile
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    import rasterio.warp
     import zarr
-    from affine import Affine
-    from pyproj import Transformer
-    from rasterio.enums import Resampling
-    from zarr.codecs import BloscCodec
 
-    west, south, east, north = global_bounds
-    num_bands = 4
-    chunk_size = 512
-    # Cap tile width so each tile fits in ~2 GB of float32:
-    #   4 bands × 2048 rows × 65536 cols × 4 bytes ≈ 2 GB
-    max_tile_cols = 65536
-    level0_w = int(math.ceil((east - west) / base_res))
-    level0_h = int(math.ceil((north - south) / base_res))
+    if console is not None:
+        console.print(f"[bold]Building global preview (year={year})[/bold]")
 
-    # ==================================================================
-    # Phase 1: Reproject zones into a temporary level-0 zarr store
-    # ==================================================================
-    tmp_dir = tempfile.mkdtemp(prefix="geotessera_global_")
-    tmp_store_path = os.path.join(tmp_dir, "level0.zarr")
+    # 1. Discover zone stores
+    pattern = re.compile(rf"^utm(\d{{2}})_{year}\.zarr$")
+    zone_stores: Dict[int, Path] = {}
+
+    for entry in sorted(zarr_dir.iterdir()):
+        if not entry.is_dir():
+            continue
+        m = pattern.match(entry.name)
+        if m is None:
+            continue
+        zone_num = int(m.group(1))
+        if zones is not None and zone_num not in zones:
+            continue
+        zone_stores[zone_num] = entry
+
+    if not zone_stores:
+        msg = f"No zone stores found in {zarr_dir} for year {year}"
+        if zones is not None:
+            msg += f" (zones filter: {zones})"
+        raise FileNotFoundError(msg)
 
     if console is not None:
         console.print(
-            f"  [dim]Phase 1: Reprojecting zones into level-0 "
-            f"({level0_w}x{level0_h} @ {base_res}°)[/dim]"
+            f"  Found {len(zone_stores)} zone store(s): "
+            f"{sorted(zone_stores.keys())}"
         )
 
-    tmp_root = zarr.open_group(tmp_store_path, mode="w", zarr_format=3)
-
-    for preview_name in preview_names:
-        if console is not None:
-            console.print(
-                f"\n  [bold]Reprojecting: {preview_name}[/bold]"
-            )
-
-        tmp_arr = tmp_root.create_array(
-            preview_name,
-            shape=(level0_h, level0_w, num_bands),
-            chunks=(chunk_size, chunk_size, num_bands),
-            dtype=np.uint8,
-            fill_value=np.uint8(0),
-            compressors=BloscCodec(cname="zstd", clevel=3),
-            dimension_names=["lat", "lon", "band"],
-        )
-
-        for zone_num, zinfo in sorted(zone_infos.items()):
-            store_path = zinfo["store_path"]
-            zone_store = zarr.open_group(str(store_path), mode="r")
-
-            if preview_name not in zone_store:
-                continue
-
-            src_arr = zone_store[preview_name]
-            src_h, src_w, _ = src_arr.shape
-            src_epsg = zinfo["epsg"]
-            src_transform = zinfo["transform"]
-            src_pixel = src_transform[0]
-            src_origin_e = src_transform[2]
-            src_origin_n = src_transform[5]
-
-            to_utm = Transformer.from_crs(
-                "EPSG:4326", f"EPSG:{src_epsg}", always_xy=True,
-            )
-
-            zlon_min, zlat_min, zlon_max, zlat_max = (
-                zinfo["bounds_4326"]
-            )
-            zone_col_start = max(
-                0, int(math.floor((zlon_min - west) / base_res))
-            )
-            zone_col_end = min(
-                level0_w,
-                int(math.ceil((zlon_max - west) / base_res)),
-            )
-            zone_strip_w = zone_col_end - zone_col_start
-            if zone_strip_w <= 0:
-                continue
-
-            zone_row_start = max(
-                0, int(math.floor((north - zlat_max) / base_res))
-            )
-            zone_row_end = min(
-                level0_h,
-                int(math.ceil((north - zlat_min) / base_res)),
-            )
-            if zone_row_end <= zone_row_start:
-                continue
-
+    # 2. Read zone metadata
+    zone_infos: Dict[int, dict] = {}
+    for zone_num, store_path in sorted(zone_stores.items()):
+        store = zarr.open_group(str(store_path), mode="r")
+        attrs = dict(store.attrs)
+        if "rgb" not in store:
             if console is not None:
                 console.print(
-                    f"    Zone {zone_num:02d} "
-                    f"(src {src_h}x{src_w}, "
-                    f"dst rows {zone_row_start}-{zone_row_end}, "
-                    f"cols {zone_col_start}-{zone_col_end})"
+                    f"  [yellow]Zone {zone_num}: no rgb array, skipping[/yellow]"
                 )
+            continue
+        zone_infos[zone_num] = {
+            "store_path": store_path,
+            "epsg": int(attrs["crs_epsg"]),
+            "transform": list(attrs["transform"]),
+            "shape": store["rgb"].shape,
+        }
 
-            strip_height = 2048
-            tiles_written = 0
-            tiles_total = 0
+    if not zone_infos:
+        raise FileNotFoundError("No zone stores with rgb arrays found")
 
-            # Build list of tile jobs for this zone
-            tile_jobs = []
-            for strip_start in range(
-                zone_row_start, zone_row_end, strip_height
-            ):
-                strip_end = min(
-                    strip_start + strip_height, zone_row_end
-                )
-                strip_h = strip_end - strip_start
-                for tile_col_start in range(
-                    zone_col_start, zone_col_end, max_tile_cols
-                ):
-                    tile_col_end = min(
-                        tile_col_start + max_tile_cols, zone_col_end
-                    )
-                    tile_w = tile_col_end - tile_col_start
-                    tile_jobs.append(
-                        (strip_start, strip_h, tile_col_start, tile_w)
-                    )
-
-            tiles_total = len(tile_jobs)
-            if console is not None:
-                console.print(
-                    f"      {tiles_total} tiles, "
-                    f"{workers} workers"
-                )
-
-            # Process tiles in parallel — each tile reads a
-            # different source window and writes to a
-            # non-overlapping output region.
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = {
-                    pool.submit(
-                        _reproject_tile,
-                        src_arr=src_arr,
-                        tmp_arr=tmp_arr,
-                        strip_start=ss,
-                        strip_h=sh,
-                        tile_col_start=tcs,
-                        tile_w=tw,
-                        north=north,
-                        west=west,
-                        base_res=base_res,
-                        num_bands=num_bands,
-                        src_epsg=src_epsg,
-                        src_pixel=src_pixel,
-                        src_origin_e=src_origin_e,
-                        src_origin_n=src_origin_n,
-                        src_h=src_h,
-                        src_w=src_w,
-                        to_utm=to_utm,
-                    ): (ss, tcs)
-                    for ss, sh, tcs, tw in tile_jobs
-                }
-
-                for future in as_completed(futures):
-                    if future.result():
-                        tiles_written += 1
-                    # Progress every 50 tiles
-                    done = tiles_total - len(
-                        [f for f in futures if not f.done()]
-                    )
-                    if (
-                        console is not None
-                        and done % 50 == 0
-                        and done > 0
-                    ):
-                        pct = int(100 * done / tiles_total)
-                        console.print(
-                            f"      [{pct}%] {done}/{tiles_total} "
-                            f"tiles done"
-                        )
-
-            gc.collect()
-
-            if console is not None:
-                console.print(
-                    f"      {tiles_written}/{tiles_total} tiles "
-                    f"written"
-                )
-
-    # ==================================================================
-    # Phase 2: Build pyramid level-by-level
-    # ==================================================================
-    # Write each level independently, reading from the previously-written
-    # level on disk.  This breaks the dask computation chain so only one
-    # level's data is ever in memory at a time.
-    # ==================================================================
-    from topozarr.metadata import (
-        create_level_encoding,
-        create_multiscale_metadata,
-    )
-
+    # 3. Ensure global store exists
+    output_path = zarr_dir / f"global_rgb_{year}.zarr"
+    if console is not None:
+        console.print(f"  Output: {output_path}")
+    _ensure_global_store(output_path, num_levels)
     if console is not None:
         console.print(
-            f"\n  [bold]Phase 2: Building {num_levels}-level pyramid "
-            f"level-by-level[/bold]"
+            f"  Global grid: {GLOBAL_LEVEL0_W}x{GLOBAL_LEVEL0_H} "
+            f"@ {GLOBAL_BASE_RES} deg, {num_levels} levels"
         )
 
-    # Move the temp store to become the output store (level 0 is
-    # already written there).  This avoids a multi-hour copy of the
-    # full-resolution data.
-    if os.path.exists(str(output_path)):
-        shutil.rmtree(str(output_path))
-    shutil.move(tmp_store_path, str(output_path))
-    tmp_store_moved = True
-
-    out_root = zarr.open_group(str(output_path), mode="r+", zarr_format=3)
-
-    for preview_name in preview_names:
-        # Level 0 is already at /{preview_name} in the moved store.
-        # Restructure: move it to /0/{preview_name} for multiscales.
-        level0_src = os.path.join(str(output_path), preview_name)
-        level0_dst_dir = os.path.join(str(output_path), "0")
-        os.makedirs(level0_dst_dir, exist_ok=True)
-        shutil.move(level0_src, os.path.join(level0_dst_dir, preview_name))
-
-        # Create a zarr v3 group node at /0 so zarr recognises it
-        import json as _json
-
-        group_meta_path = os.path.join(level0_dst_dir, "zarr.json")
-        with open(group_meta_path, "w") as f:
-            _json.dump(
-                {
-                    "zarr_format": 3,
-                    "node_type": "group",
-                    "attributes": {},
-                },
-                f,
-            )
-
-        # Reopen the whole store after restructuring
-        out_root = zarr.open_group(str(output_path), mode="r+", zarr_format=3)
-        level0_arr = out_root[f"0/{preview_name}"]
-        level0_shape = level0_arr.shape  # (H, W, bands)
-
+    # 4. Reproject each zone and update pyramid
+    for zone_num, zinfo in sorted(zone_infos.items()):
         if console is not None:
             console.print(
-                f"  [dim]Level 0 (finest): "
-                f"{level0_shape[1]}x{level0_shape[0]}x{level0_shape[2]}"
-                f" (moved from temp store)[/dim]"
+                f"\n  [bold]Processing zone {zone_num:02d} "
+                f"(EPSG:{zinfo['epsg']})[/bold]"
             )
+        row_start, row_end, col_start, col_end = _reproject_zone(
+            store_path=output_path,
+            zone_num=zone_num,
+            zone_store_path=zinfo["store_path"],
+            zone_epsg=zinfo["epsg"],
+            zone_transform=zinfo["transform"],
+            zone_shape=zinfo["shape"],
+            workers=workers,
+            console=console,
+        )
+        if row_end <= row_start or col_end <= col_start:
+            continue
+        if console is not None:
+            console.print(f"    Building pyramid...")
+        _coarsen_zone_pyramid(
+            store_path=output_path,
+            row_start=row_start,
+            row_end=row_end,
+            col_start=col_start,
+            col_end=col_end,
+            num_levels=num_levels,
+            workers=workers,
+            console=console,
+        )
+        gc.collect()
 
-        # -- Levels 1..N-1: coarsen from previous level on disk --
-        prev_h, prev_w = level0_shape[0], level0_shape[1]
-
-        for lvl in range(1, num_levels):
-            cur_h = prev_h // 2
-            cur_w = prev_w // 2
-            if cur_h < 1 or cur_w < 1:
-                if console is not None:
-                    console.print(
-                        f"  [yellow]Stopping at level {lvl}: "
-                        f"dimensions too small[/yellow]"
-                    )
-                break
-
-            if console is not None:
-                console.print(
-                    f"  [dim]Level {lvl}: "
-                    f"{cur_w}x{cur_h}x{num_bands}[/dim]"
-                )
-
-            # Open previous level from the output store
-            prev_arr = out_root[f"{lvl - 1}/{preview_name}"]
-
-            cur_arr = out_root.create_array(
-                f"{lvl}/{preview_name}",
-                shape=(cur_h, cur_w, num_bands),
-                chunks=(
-                    min(chunk_size, cur_h),
-                    min(chunk_size, cur_w),
-                    num_bands,
-                ),
-                dtype=np.uint8,
-                fill_value=np.uint8(0),
-                compressors=BloscCodec(cname="zstd", clevel=3),
-                dimension_names=["lat", "lon", "band"],
-            )
-
-            # Coarsen in row strips with parallel I/O.
-            # Each strip covers full width to avoid cross-chunk
-            # races from column tiling.
-            coarsen_strip = chunk_size
-            cur_chunk_w = min(chunk_size, cur_w)
-
-            def _coarsen_strip(r0):
-                r1 = min(r0 + coarsen_strip, cur_h)
-                sr0 = r0 * 2
-                sr1 = min(sr0 + (r1 - r0) * 2, prev_h)
-                strip = np.asarray(
-                    prev_arr[sr0:sr1, : cur_w * 2, :]
-                ).astype(np.float32)
-                th = strip.shape[0] // 2
-                tw = strip.shape[1] // 2
-                if th == 0 or tw == 0:
-                    return
-                coarsened = (
-                    strip[: th * 2, : tw * 2, :]
-                    .reshape(th, 2, tw, 2, num_bands)
-                    .mean(axis=(1, 3))
-                )
-                cur_arr[r0 : r0 + th, : tw, :] = (
-                    np.clip(coarsened, 0, 255).astype(np.uint8)
-                )
-
-            strip_starts = list(range(0, cur_h, coarsen_strip))
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                list(pool.map(_coarsen_strip, strip_starts))
-
-            gc.collect()
-            prev_h, prev_w = cur_h, cur_w
-
-    # ------------------------------------------------------------------
-    # Write multiscales metadata
-    # ------------------------------------------------------------------
-    actual_levels = len([
-        k for k in out_root.keys() if k.isdigit()
-    ])
-    ms_attrs = create_multiscale_metadata(
-        actual_levels, "EPSG:4326", "mean"
-    )
-    # Patch CRS into multiscales for zarr-layer compatibility
-    ms_attrs["multiscales"]["crs"] = "EPSG:4326"
-    out_root.attrs.update(ms_attrs)
-
-    # Consolidate metadata
+    # 5. Re-consolidate metadata
     zarr.consolidate_metadata(str(output_path))
-
-    # Clean up temporary store
-    shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    # ------------------------------------------------------------------
-    # Print summary
-    # ------------------------------------------------------------------
     if console is not None:
         console.print(
-            f"\n  [bold green]Global store written to {output_path}[/bold green]"
+            f"\n  [bold green]Global store updated: {output_path}[/bold green]"
         )
-        console.print(
-            f"  [dim]{num_levels} levels, "
-            f"{len(preview_names)} preview(s): {preview_names}[/dim]"
-        )
-        console.print(
-            f"  [dim]Bounds: lon [{west:.4f}, {east:.4f}], "
-            f"lat [{south:.4f}, {north:.4f}][/dim]"
-        )
-        console.print(
-            f"  [dim]Base resolution: {base_res}deg, "
-            f"zones: {sorted(zone_infos.keys())}[/dim]"
-        )
+        console.print(f"  Zones processed: {sorted(zone_infos.keys())}")
+
+    return output_path

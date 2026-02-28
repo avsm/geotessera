@@ -2661,7 +2661,6 @@ def global_preview_command(args):
     from .zarr_zone import build_global_preview
 
     zarr_dir = Path(args.zarr_dir)
-    output_path = Path(args.output)
     year = args.year
     num_levels = args.levels
     num_workers = args.workers
@@ -2678,7 +2677,6 @@ def global_preview_command(args):
     console.print(
         f"[bold]Building global preview store[/bold]\n"
         f"  Input:   {zarr_dir}\n"
-        f"  Output:  {output_path}\n"
         f"  Year:    {year}\n"
         f"  Levels:  {num_levels}\n"
         f"  Workers: {num_workers}"
@@ -2688,7 +2686,6 @@ def global_preview_command(args):
 
     result = build_global_preview(
         zarr_dir=zarr_dir,
-        output_path=output_path,
         year=year,
         zones=zones,
         num_levels=num_levels,
@@ -3396,12 +3393,6 @@ Directory Structure:
         "zarr_dir",
         type=Path,
         help="Directory containing utm*_YYYY.zarr stores",
-    )
-    global_preview_parser.add_argument(
-        "--output",
-        type=Path,
-        required=True,
-        help="Output path for global preview store",
     )
     global_preview_parser.add_argument(
         "--year",
