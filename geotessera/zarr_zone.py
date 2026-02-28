@@ -1118,10 +1118,15 @@ def _ensure_global_store(store_path: Path, num_levels: int) -> None:
             shape = root["0/rgb"].shape
             if shape == (GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W, GLOBAL_NUM_BANDS):
                 return
-            raise ValueError(
-                f"Existing store has shape {shape}, expected "
-                f"({GLOBAL_LEVEL0_H}, {GLOBAL_LEVEL0_W}, {GLOBAL_NUM_BANDS})"
+            # Old-format store with different dimensions — replace it
+            import shutil
+            logger.warning(
+                "Existing store %s has shape %s (expected %s), "
+                "replacing with fixed global grid",
+                store_path, shape,
+                (GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W, GLOBAL_NUM_BANDS),
             )
+            shutil.rmtree(str(store_path))
 
     root = zarr.open_group(str(store_path), mode="w", zarr_format=3)
     h, w = GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W
