@@ -764,10 +764,15 @@ def compute_rgb_chunk(
     stretch_min: List[float],
     stretch_max: List[float],
 ) -> np.ndarray:
-    """Compute an RGBA uint8 preview from embedding + scales."""
+    """Compute an RGBA uint8 preview from embedding + scales.
+
+    Only NaN scales are treated as no-data (water / no coverage).
+    Pixels with ``scales == 0`` are valid — the dequantised value is
+    simply 0.
+    """
     h, w = scales.shape[:2]
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
-    valid = np.isfinite(scales) & (scales != 0)
+    valid = np.isfinite(scales)
     scales_safe = np.where(valid, scales, 0.0)
 
     for i, band_idx in enumerate(band_indices):
@@ -793,6 +798,9 @@ def _sample_chunk_stats(
 ) -> Optional[np.ndarray]:
     """Read one chunk and return subsampled dequantised values.
 
+    Only NaN scales are treated as no-data; ``scales == 0`` pixels are
+    included (dequantised value is simply 0).
+
     Args:
         band_slice: If given, read only these bands (e.g. slice(0,3) for RGB).
                     If None, read all bands.
@@ -804,7 +812,7 @@ def _sample_chunk_stats(
     c0, c1 = cj * chunk_w, min(cj * chunk_w + chunk_w, emb_shape[1])
 
     scales_chunk = np.asarray(scales_arr[r0:r1, c0:c1])
-    valid = np.isfinite(scales_chunk) & (scales_chunk != 0)
+    valid = np.isfinite(scales_chunk)
     if not np.any(valid):
         return None
 
@@ -911,7 +919,7 @@ def write_preview_pass(
         c0, c1 = cj * chunk_w, min(cj * chunk_w + chunk_w, emb_shape[1])
 
         scales_chunk = np.asarray(scales_arr[r0:r1, c0:c1])
-        if np.all(~np.isfinite(scales_chunk) | (scales_chunk == 0)):
+        if np.all(~np.isfinite(scales_chunk)):
             return False
 
         emb_chunk = np.asarray(emb_arr[r0:r1, c0:c1, :])
@@ -1263,28 +1271,45 @@ def _reproject_chunk(
         0, -src_pixel, src_origin_n - r_min * src_pixel,
     )
 
-    dst_data = np.full(
-        (GLOBAL_NUM_BANDS, tile_h, tile_w), np.nan, dtype=np.float32,
-    )
+    # Mask invalid source pixels (alpha < 128) as NaN so that
+    # Resampling.average excludes them instead of diluting valid
+    # neighbours with zeros.  Only reproject the 3 RGB bands.
+    alpha_band = src_data[3]
+    invalid = alpha_band < 128
+    for b in range(3):
+        src_data[b][invalid] = np.nan
+    rgb_src = src_data[:3]
+    del src_data
+
+    rgb_dst = np.full((3, tile_h, tile_w), np.nan, dtype=np.float32)
 
     try:
         rasterio.warp.reproject(
-            source=src_data,
-            destination=dst_data,
+            source=rgb_src,
+            destination=rgb_dst,
             src_transform=win_transform,
             src_crs=f"EPSG:{src_epsg}",
             dst_transform=dst_transform,
             dst_crs="EPSG:4326",
             resampling=Resampling.average,
+            src_nodata=np.nan,
+            dst_nodata=np.nan,
         )
     except Exception:
         return False
 
-    del src_data
-    dst_data = np.nan_to_num(dst_data, nan=0.0)
-    dst_data = np.clip(dst_data, 0, 255).astype(np.uint8)
-    out = np.transpose(dst_data, (1, 2, 0))
-    del dst_data
+    del rgb_src
+    # Derive alpha from valid reprojected RGB (finite and non-zero).
+    has_data = np.any(np.isfinite(rgb_dst) & (rgb_dst != 0), axis=0)
+    rgb_dst = np.nan_to_num(rgb_dst, nan=0.0)
+    rgb_dst = np.clip(rgb_dst, 0, 255).astype(np.uint8)
+    rgb_out = np.transpose(rgb_dst, (1, 2, 0))  # (h, w, 3)
+    del rgb_dst
+
+    out = np.zeros((tile_h, tile_w, GLOBAL_NUM_BANDS), dtype=np.uint8)
+    out[:, :, :3] = rgb_out
+    out[:, :, 3] = np.where(has_data, 255, 0).astype(np.uint8)
+    del rgb_out
 
     if not out.any():
         return False
