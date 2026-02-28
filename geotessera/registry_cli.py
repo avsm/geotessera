@@ -3409,8 +3409,8 @@ Directory Structure:
     global_preview_parser.add_argument(
         "--levels",
         type=int,
-        default=7,
-        help="Number of multiscale levels (default: 7)",
+        default=10,
+        help="Number of multiscale levels (default: 10)",
     )
     global_preview_parser.add_argument(
         "--workers",
