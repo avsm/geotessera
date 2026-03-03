@@ -961,14 +961,16 @@ def add_rgb_to_existing_store(
     try:
         _ = store["rgb"]
     except KeyError:
+        from zarr.codecs import BloscCodec
         emb_shape = store["embeddings"].shape
         store.create_array(
             "rgb",
             shape=(emb_shape[0], emb_shape[1], 4),
-            chunks=(1024, 1024, 4),
+            chunks=(INNER_CHUNK, INNER_CHUNK, 4),
+            shards=(SHARD_SIZE, SHARD_SIZE, 4),
             dtype=np.uint8,
             fill_value=np.uint8(0),
-            compressors=None,
+            compressors=BloscCodec(cname="zstd", clevel=3),
             dimension_names=["northing", "easting", "rgba"],
         )
 
