@@ -848,7 +848,7 @@ def compute_stretch_from_store(
     emb_arr = store["embeddings"]
     scales_arr = store["scales"]
     emb_shape = emb_arr.shape
-    chunk_h, chunk_w = emb_arr.chunks[:2]
+    chunk_h, chunk_w = SHARD_SIZE, SHARD_SIZE
     n_rows = math.ceil(emb_shape[0] / chunk_h)
     n_cols = math.ceil(emb_shape[1] / chunk_w)
 
@@ -915,7 +915,7 @@ def write_preview_pass(
     out_arr = store[array_name]
 
     emb_shape = emb_arr.shape
-    chunk_h, chunk_w = emb_arr.chunks[:2]
+    chunk_h, chunk_w = SHARD_SIZE, SHARD_SIZE
     n_rows = math.ceil(emb_shape[0] / chunk_h)
     n_cols = math.ceil(emb_shape[1] / chunk_w)
 
