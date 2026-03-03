@@ -403,6 +403,164 @@ def write_tile_to_store(
     store["scales"][row_start : row_start + h, col_start : col_start + w] = scales
 
 
+def _write_tiles_batched(
+    store: "zarr.Group",
+    tile_infos: List[TileInfo],
+    zone_grid: ZoneGrid,
+    console: Optional["rich.console.Console"] = None,
+) -> Tuple[int, int]:
+    """Write tiles batched by shard for efficient sharded I/O.
+
+    Instead of writing one tile at a time (causing repeated shard
+    read-decompress-modify-compress-write cycles), this reads each tile once,
+    splits its data into shard-aligned buffers, and writes each shard exactly
+    once.  Tiles are processed sorted by row so completed shard rows can be
+    flushed incrementally, bounding memory to ~2 shard-rows of buffers.
+
+    Returns (tiles_written, errors).
+    """
+    height = zone_grid.height_px
+    width = zone_grid.width_px
+    n_shard_cols = width // SHARD_SIZE
+
+    # Pre-compute pixel offsets (fast, no I/O) and sort by row
+    positioned = []
+    for ti in tile_infos:
+        row, col = tile_pixel_offset(ti, zone_grid)
+        positioned.append((row, col, ti))
+    positioned.sort(key=lambda x: (x[0], x[1]))
+
+    # Shard buffers: {(shard_row, shard_col): (emb_buf, scales_buf)}
+    shard_bufs: Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray]] = {}
+    tiles_written = 0
+    errors = 0
+    flushed_up_to = -1  # highest shard-row index fully flushed
+
+    def _get_buf(sr: int, sc: int):
+        if (sr, sc) not in shard_bufs:
+            shard_bufs[(sr, sc)] = (
+                np.zeros((SHARD_SIZE, SHARD_SIZE, N_BANDS), dtype=np.int8),
+                np.full((SHARD_SIZE, SHARD_SIZE), np.float32("nan")),
+            )
+        return shard_bufs[(sr, sc)]
+
+    def _flush_rows_up_to(max_sr: int):
+        """Write and free all shard buffers for shard rows <= max_sr."""
+        nonlocal flushed_up_to
+        for sr in range(flushed_up_to + 1, max_sr + 1):
+            for sc in range(n_shard_cols):
+                if (sr, sc) in shard_bufs:
+                    r = sr * SHARD_SIZE
+                    c = sc * SHARD_SIZE
+                    emb_buf, scales_buf = shard_bufs.pop((sr, sc))
+                    store["embeddings"][
+                        r : r + SHARD_SIZE, c : c + SHARD_SIZE, :
+                    ] = emb_buf
+                    store["scales"][
+                        r : r + SHARD_SIZE, c : c + SHARD_SIZE
+                    ] = scales_buf
+        flushed_up_to = max_sr
+
+    # Optional progress bar
+    progress_ctx = None
+    progress_obj = None
+    progress_task = None
+    if console is not None:
+        from rich.progress import (
+            Progress, SpinnerColumn, BarColumn, TextColumn,
+            MofNCompleteColumn, TimeElapsedColumn,
+        )
+        progress_ctx = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(), MofNCompleteColumn(), TimeElapsedColumn(),
+            TextColumn("•"),
+            TextColumn("[dim]{task.fields[status]}", justify="left"),
+            console=console,
+        )
+        progress_obj = progress_ctx.__enter__()
+        progress_task = progress_obj.add_task(
+            "Writing tiles (batched)", total=len(positioned), status="starting...",
+        )
+
+    try:
+        for row, col, ti in positioned:
+            try:
+                emb, scales, _, _ = _read_single_tile(ti, zone_grid)
+            except Exception as e:
+                logger.warning(f"Failed tile ({ti.lon}, {ti.lat}): {e}")
+                errors += 1
+                if progress_obj is not None:
+                    progress_obj.update(
+                        progress_task, status=f"({ti.lon:.2f}, {ti.lat:.2f})",
+                    )
+                    progress_obj.advance(progress_task)
+                continue
+
+            tiles_written += 1
+            h, w = scales.shape[:2]
+
+            # Flush shard rows that no future tile can touch.
+            # All remaining tiles have row_start >= row, so shard rows
+            # below row // SHARD_SIZE are complete.
+            completable = row // SHARD_SIZE - 1
+            if completable > flushed_up_to:
+                _flush_rows_up_to(completable)
+
+            # Decompose tile into shard-aligned pieces
+            sr_start = row // SHARD_SIZE
+            sr_end = (row + h - 1) // SHARD_SIZE
+            sc_start = col // SHARD_SIZE
+            sc_end = (col + w - 1) // SHARD_SIZE
+
+            for sr in range(sr_start, sr_end + 1):
+                for sc in range(sc_start, sc_end + 1):
+                    emb_buf, scales_buf = _get_buf(sr, sc)
+
+                    shard_top = sr * SHARD_SIZE
+                    shard_left = sc * SHARD_SIZE
+
+                    # Tile-local region overlapping this shard
+                    t_top = max(0, shard_top - row)
+                    t_bot = min(h, shard_top + SHARD_SIZE - row)
+                    t_left = max(0, shard_left - col)
+                    t_right = min(w, shard_left + SHARD_SIZE - col)
+
+                    # Shard-buffer region
+                    s_top = max(0, row - shard_top)
+                    s_bot = s_top + (t_bot - t_top)
+                    s_left = max(0, col - shard_left)
+                    s_right = s_left + (t_right - t_left)
+
+                    emb_buf[s_top:s_bot, s_left:s_right, :] = (
+                        emb[t_top:t_bot, t_left:t_right, :]
+                    )
+                    scales_buf[s_top:s_bot, s_left:s_right] = (
+                        scales[t_top:t_bot, t_left:t_right]
+                    )
+
+            if progress_obj is not None:
+                progress_obj.update(
+                    progress_task, status=f"({ti.lon:.2f}, {ti.lat:.2f})",
+                )
+                progress_obj.advance(progress_task)
+
+        # Flush remaining shard rows
+        max_sr = height // SHARD_SIZE - 1
+        _flush_rows_up_to(max_sr)
+
+        if progress_obj is not None:
+            status = f"done ({tiles_written} tiles)"
+            if errors:
+                status += f" ({errors} errors)"
+            progress_obj.update(progress_task, status=status)
+    finally:
+        if progress_ctx is not None:
+            progress_ctx.__exit__(None, None, None)
+
+    return tiles_written, errors
+
+
 # =============================================================================
 # Landmask handling
 # =============================================================================
@@ -690,45 +848,10 @@ def build_zone_stores(
             include_rgb=rgb,
         )
 
-        # Write tiles: read each tile from disk, write directly to store
-        errors = 0
-        tiles_written = 0
-
-        if console is not None:
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(), MofNCompleteColumn(), TimeElapsedColumn(),
-                TextColumn("•"),
-                TextColumn("[dim]{task.fields[status]}", justify="left"),
-                console=console,
-            ) as progress:
-                task = progress.add_task(
-                    "Writing tiles", total=len(tile_infos), status="starting...",
-                )
-                for ti in tile_infos:
-                    try:
-                        emb, scales, row, col = _read_single_tile(ti, zone_grid)
-                        write_tile_to_store(store, emb, scales, row, col)
-                        tiles_written += 1
-                    except Exception as e:
-                        logger.warning(f"Failed tile ({ti.lon}, {ti.lat}): {e}")
-                        errors += 1
-                    progress.update(task, status=f"({ti.lon:.2f}, {ti.lat:.2f})")
-                    progress.advance(task)
-                status = f"done ({tiles_written} tiles)"
-                if errors:
-                    status += f" ({errors} errors)"
-                progress.update(task, status=status)
-        else:
-            for ti in tile_infos:
-                try:
-                    emb, scales, row, col = _read_single_tile(ti, zone_grid)
-                    write_tile_to_store(store, emb, scales, row, col)
-                    tiles_written += 1
-                except Exception as e:
-                    logger.warning(f"Failed tile ({ti.lon}, {ti.lat}): {e}")
-                    errors += 1
+        # Write tiles batched by shard — each shard written exactly once
+        tiles_written, errors = _write_tiles_batched(
+            store, tile_infos, zone_grid, console=console,
+        )
 
         # Optional preview passes
         if rgb:
