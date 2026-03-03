@@ -4,15 +4,15 @@ This module provides tools for building and reading Zarr v3 stores that
 consolidate all tiles within a UTM zone into a single store per year.
 This enables efficient spatial subsetting and cloud-native access.
 
-Store layout (uncompressed):
+Store layout (sharded, zstd-compressed):
     utm{zone:02d}_{year}.zarr/
-        embeddings        # int8    (northing, easting, band)  chunks=(1024, 1024, 128)
-        scales            # float32 (northing, easting)        chunks=(1024, 1024)
-        rgb               # uint8   (northing, easting, rgba)  chunks=(1024, 1024, 4)  [optional]
+        embeddings        # int8    (H, W, 128)  chunks=(4,4,128)   shards=(256,256,128)
+        scales            # float32 (H, W)       chunks=(4,4)       shards=(256,256)
+        rgb               # uint8   (H, W, 4)    chunks=(4,4,4)     shards=(256,256,4)   [optional]
 
 NaN in scales indicates no-data (water or no coverage).
-Embeddings are high-entropy quantised values; compression gives negligible
-benefit so we store uncompressed.
+Per-pixel inner chunks enable O(2KB) single-pixel lookups via HTTP range
+requests.  Tile-aligned shards (256x256) keep file counts reasonable.
 """
 
 import logging
