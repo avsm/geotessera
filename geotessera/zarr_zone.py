@@ -418,12 +418,10 @@ def _write_tiles_batched(
     once.  Tiles are processed sorted by row so completed shard rows can be
     flushed incrementally, bounding memory to a few shard-rows of buffers.
 
-    Parallelism is applied at two levels:
-      - **Tile reads**: a background thread pool pre-reads upcoming tiles so
-        disk I/O overlaps with compositing and shard flushing.
-      - **Shard flushes**: completed shard buffers are compressed and written
-        to disk in parallel via a thread pool (zarr releases the GIL during
-        compression and I/O).
+    Tile reads happen sequentially in the main thread (good for spinning
+    disks and avoids GIL contention with numpy).  Shard flushes — dominated
+    by zstd compression of 4096 inner chunks per shard — run in a thread
+    pool so compression overlaps with the next tile read.
 
     Returns (tiles_written, errors).
     """
@@ -480,16 +478,6 @@ def _write_tiles_batched(
                     )
         flushed_up_to = max_sr
 
-    # --- Pre-read tiles in background threads ---
-    def _prefetch_tile(item):
-        """Read one tile from disk (runs in reader thread pool)."""
-        row, col, ti = item
-        try:
-            emb, scales, _, _ = _read_single_tile(ti, zone_grid)
-            return (row, col, ti, emb, scales, None)
-        except Exception as e:
-            return (row, col, ti, None, None, e)
-
     # Optional progress bar
     progress_ctx = None
     progress_obj = None
@@ -512,28 +500,15 @@ def _write_tiles_batched(
             "Writing tiles (batched)", total=len(positioned), status="starting...",
         )
 
-    # Use separate pools for reading and flushing so disk reads
-    # overlap with compression/write.
-    read_workers = max(1, workers // 2)
-    flush_workers = max(1, workers - read_workers)
-
     try:
-        with (
-            ThreadPoolExecutor(max_workers=read_workers,
-                               thread_name_prefix="tile-read") as read_pool,
-            ThreadPoolExecutor(max_workers=flush_workers,
-                               thread_name_prefix="shard-flush") as flush_pool,
-        ):
-            # Submit reads preserving sorted order via map (returns results
-            # in submission order, but reads execute in parallel).
-            prefetch_iter = read_pool.map(
-                _prefetch_tile, positioned,
-                chunksize=max(1, min(8, len(positioned) // read_workers)),
-            )
-
-            for row, col, ti, emb, scales, err in prefetch_iter:
-                if err is not None:
-                    logger.warning(f"Failed tile ({ti.lon}, {ti.lat}): {err}")
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="shard-flush",
+        ) as flush_pool:
+            for row, col, ti in positioned:
+                try:
+                    emb, scales, _, _ = _read_single_tile(ti, zone_grid)
+                except Exception as e:
+                    logger.warning(f"Failed tile ({ti.lon}, {ti.lat}): {e}")
                     errors += 1
                     if progress_obj is not None:
                         progress_obj.update(
@@ -547,9 +522,13 @@ def _write_tiles_batched(
                 h, w = scales.shape[:2]
 
                 # Flush shard rows that no future tile can touch.
+                # All remaining tiles have row_start >= row, so shard rows
+                # below row // SHARD_SIZE are complete.
                 completable = row // SHARD_SIZE - 1
                 if completable > flushed_up_to:
-                    # Drain previous flush batch before reusing the pool
+                    # Drain previous flush batch, then submit the next one.
+                    # Shard writes run in the background while we read the
+                    # next tile, so compression overlaps with disk reads.
                     _drain_futures()
                     _flush_rows_up_to(completable, flush_pool)
 
