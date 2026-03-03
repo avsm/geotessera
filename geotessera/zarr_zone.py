@@ -40,6 +40,10 @@ GLOBAL_NUM_BANDS = 4
 GLOBAL_DEFAULT_LEVELS = 10
 GLOBAL_BATCH_CHUNK_ROWS = 64  # chunk-rows per dask compute batch
 
+# Zone store sharding
+SHARD_SIZE = 256   # shard spatial dimension (pixels), aligned to tile size
+INNER_CHUNK = 4    # inner chunk spatial dimension (pixels)
+
 
 # =============================================================================
 # Data types
@@ -217,14 +221,21 @@ def compute_zone_grid(tile_infos: List[TileInfo], year: int) -> ZoneGrid:
     extent_right = _snap_to_grid(max_easting, pixel_size, snap_floor=False)
     extent_bottom = _snap_to_grid(min_northing, pixel_size, snap_floor=True)
 
+    width_px = round((extent_right - origin_easting) / pixel_size)
+    height_px = round((origin_northing - extent_bottom) / pixel_size)
+
+    # Snap to shard boundary so shards are never partial
+    width_px = math.ceil(width_px / SHARD_SIZE) * SHARD_SIZE
+    height_px = math.ceil(height_px / SHARD_SIZE) * SHARD_SIZE
+
     return ZoneGrid(
         zone=zone,
         year=year,
         canonical_epsg=zone_canonical_epsg(zone),
         origin_easting=origin_easting,
         origin_northing=origin_northing,
-        width_px=round((extent_right - origin_easting) / pixel_size),
-        height_px=round((origin_northing - extent_bottom) / pixel_size),
+        width_px=width_px,
+        height_px=height_px,
         pixel_size=pixel_size,
         tiles=tile_infos,
     )
