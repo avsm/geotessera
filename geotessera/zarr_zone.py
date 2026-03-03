@@ -307,6 +307,7 @@ def create_zone_store(
 ) -> "zarr.Group":
     """Create a new Zarr v3 store for a UTM zone."""
     import zarr
+    from zarr.codecs import BloscCodec
 
     store_path = output_dir / _store_name(zone_grid.zone, zone_grid.year)
 
@@ -319,19 +320,15 @@ def create_zone_store(
     store.create_array(
         "embeddings",
         shape=(zone_grid.height_px, zone_grid.width_px, N_BANDS),
-        chunks=(1024, 1024, N_BANDS),
-        dtype=np.int8,
-        fill_value=np.int8(0),
-        compressors=None,
+        chunks=(INNER_CHUNK, INNER_CHUNK, N_BANDS), shards=(SHARD_SIZE, SHARD_SIZE, N_BANDS),
+        dtype=np.int8, fill_value=np.int8(0), compressors=BloscCodec(cname="zstd", clevel=3),
         dimension_names=["northing", "easting", "band"],
     )
     store.create_array(
         "scales",
         shape=(zone_grid.height_px, zone_grid.width_px),
-        chunks=(1024, 1024),
-        dtype=np.float32,
-        fill_value=np.float32("nan"),
-        compressors=None,
+        chunks=(INNER_CHUNK, INNER_CHUNK), shards=(SHARD_SIZE, SHARD_SIZE),
+        dtype=np.float32, fill_value=np.float32("nan"), compressors=BloscCodec(cname="zstd", clevel=3),
         dimension_names=["northing", "easting"],
     )
 
@@ -340,10 +337,8 @@ def create_zone_store(
         store.create_array(
             name,
             shape=(zone_grid.height_px, zone_grid.width_px, 4),
-            chunks=(1024, 1024, 4),
-            dtype=np.uint8,
-            fill_value=np.uint8(0),
-            compressors=None,
+            chunks=(INNER_CHUNK, INNER_CHUNK, 4), shards=(SHARD_SIZE, SHARD_SIZE, 4),
+            dtype=np.uint8, fill_value=np.uint8(0), compressors=BloscCodec(cname="zstd", clevel=3),
             dimension_names=["northing", "easting", "rgba"],
         )
 
