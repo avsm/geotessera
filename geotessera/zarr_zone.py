@@ -1606,41 +1606,58 @@ def _reproject_zone(
     chunks_written = 0
     chunks_total = n_chunk_rows * n_chunk_cols
 
-    for batch_start in range(0, n_chunk_rows, GLOBAL_BATCH_CHUNK_ROWS):
-        batch_end = min(batch_start + GLOBAL_BATCH_CHUNK_ROWS, n_chunk_rows)
+    def _run_batches(progress_cb=None):
+        nonlocal chunks_written
+        for batch_start in range(0, n_chunk_rows, GLOBAL_BATCH_CHUNK_ROWS):
+            batch_end = min(batch_start + GLOBAL_BATCH_CHUNK_ROWS, n_chunk_rows)
 
-        tasks = []
-        for cr_offset in range(batch_start, batch_end):
-            cr = chunk_row_start + cr_offset
-            for cc_offset in range(n_chunk_cols):
-                cc = chunk_col_start + cc_offset
-                task = dask.delayed(_reproject_chunk)(
-                    global_arr=global_arr,
-                    chunk_row=cr,
-                    chunk_col=cc,
-                    src_arr=src_arr,
-                    src_epsg=zone_epsg,
-                    src_pixel=src_pixel,
-                    src_origin_e=src_origin_e,
-                    src_origin_n=src_origin_n,
-                    src_h=src_h,
-                    src_w=src_w,
-                    to_utm=to_utm,
-                )
-                tasks.append(task)
+            tasks = []
+            for cr_offset in range(batch_start, batch_end):
+                cr = chunk_row_start + cr_offset
+                for cc_offset in range(n_chunk_cols):
+                    cc = chunk_col_start + cc_offset
+                    task = dask.delayed(_reproject_chunk)(
+                        global_arr=global_arr,
+                        chunk_row=cr,
+                        chunk_col=cc,
+                        src_arr=src_arr,
+                        src_epsg=zone_epsg,
+                        src_pixel=src_pixel,
+                        src_origin_e=src_origin_e,
+                        src_origin_n=src_origin_n,
+                        src_h=src_h,
+                        src_w=src_w,
+                        to_utm=to_utm,
+                    )
+                    tasks.append(task)
 
-        results = dask.compute(*tasks, scheduler="threads",
-                               num_workers=workers)
-        batch_written = sum(1 for r in results if r)
-        chunks_written += batch_written
+            results = dask.compute(*tasks, scheduler="threads",
+                                   num_workers=workers)
+            batch_written = sum(1 for r in results if r)
+            chunks_written += batch_written
+            batch_size = (batch_end - batch_start) * n_chunk_cols
+            if progress_cb is not None:
+                progress_cb(batch_size)
 
-        if console is not None:
-            done = min((batch_end) * n_chunk_cols, chunks_total)
-            pct = int(100 * done / chunks_total)
-            console.print(
-                f"      [{pct:3d}%] {done}/{chunks_total} chunks "
-                f"({chunks_written} with data)"
+    if console is not None:
+        from rich.progress import (
+            Progress, SpinnerColumn, BarColumn, TextColumn,
+            MofNCompleteColumn, TimeElapsedColumn, TimeRemainingColumn,
+        )
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(), MofNCompleteColumn(),
+            TimeElapsedColumn(), TimeRemainingColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task(
+                f"Reprojecting zone {zone_num:02d}", total=chunks_total,
             )
+            _run_batches(lambda n: progress.advance(task, n))
+        console.print(f"    {chunks_written} chunks with data")
+    else:
+        _run_batches()
 
     return (row_start, row_end, col_start, col_end)
 
