@@ -37,7 +37,11 @@ dependencies = [
     "xarray",
     "rioxarray",
     "zarr",
-    "dask"
+    "dask",
+    "pystac",
+    "ndpyramid",
+    "topozarr>=0.0.4",
+    "xproj>=0.2.1",
 ]
 
 [project.urls]
@@ -57,6 +61,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["geotessera*"]
+
+[tool.setuptools.package-data]
+"geotessera.viewer" = ["*.html"]
 
 [dependency-groups]
 dev = [
