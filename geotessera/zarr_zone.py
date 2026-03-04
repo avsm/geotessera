@@ -664,10 +664,15 @@ def gather_tile_infos(
         tile_to_embedding_paths, tile_to_landmask_filename,
     )
 
-    # Get tiles for this year from MultiIndex
+    # Get tiles for this year from MultiIndex, filtering to those with data
     gdf = registry._registry_gdf
     try:
         year_slice = gdf.loc[year]
+        # Filter to tiles that have actual embedding data in the registry
+        valid = year_slice["file_size"] > 0
+        if "scales_size" in year_slice.columns:
+            valid = valid & (year_slice["scales_size"] > 0)
+        year_slice = year_slice[valid]
         tiles = [
             (year, lon_i / 100.0, lat_i / 100.0)
             for lon_i, lat_i in year_slice.index.unique()
