@@ -715,6 +715,33 @@ def apply_landmask_to_scales(
     return scales
 
 
+def _load_landmask_slice(
+    landmask_path: str,
+    row_start: int,
+    row_end: int,
+    col_start: int,
+    col_end: int,
+) -> np.ndarray:
+    """Load a sub-region of a landmask GeoTIFF using a rasterio window.
+
+    Returns a 2D uint8 array where 0 = water.  If the landmask cannot be
+    read (missing file, shape mismatch, etc.) returns all-ones (all land)
+    so that no pixels are masked.
+    """
+    import rasterio
+    from rasterio.windows import Window
+
+    try:
+        with rasterio.open(landmask_path) as src:
+            window = Window.from_slices(
+                (row_start, row_end), (col_start, col_end),
+            )
+            return src.read(1, window=window)
+    except Exception as e:
+        logger.warning(f"Failed to read landmask slice from {landmask_path}: {e}")
+        return np.ones((row_end - row_start, col_end - col_start), dtype=np.uint8)
+
+
 # =============================================================================
 # Tile reading
 # =============================================================================
