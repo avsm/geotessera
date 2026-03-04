@@ -1010,11 +1010,6 @@ def build_zone_stores(
     output_dir.mkdir(parents=True, exist_ok=True)
     created_stores: List[Path] = []
 
-    from rich.progress import (
-        Progress, SpinnerColumn, BarColumn, TextColumn,
-        MofNCompleteColumn, TimeElapsedColumn,
-    )
-
     for zone_num, tile_infos in sorted(zones_dict.items()):
         zone_grid = compute_zone_grid(tile_infos, year)
         store_name = _store_name(zone_grid.zone, zone_grid.year)
@@ -1037,11 +1032,26 @@ def build_zone_stores(
             include_rgb=rgb,
         )
 
-        # Write tiles batched by shard — each shard written exactly once
-        tiles_written, errors = _write_tiles_batched(
-            store, tile_infos, zone_grid,
-            workers=workers, console=console,
+        # Build shard index: precompute which tiles overlap each shard
+        shard_specs = build_shard_index(tile_infos, zone_grid)
+        if console is not None:
+            n_total = (
+                zone_grid.height_px // SHARD_SIZE
+                * (zone_grid.width_px // SHARD_SIZE)
+            )
+            console.print(
+                f"  {len(shard_specs):,} non-empty shards "
+                f"(of {n_total:,} total)"
+            )
+
+        # Write shards in parallel — each shard is independent
+        results = _run_parallel(
+            lambda spec: _write_one_shard(spec, store),
+            shard_specs, workers, console,
+            label="Writing shards",
         )
+        tiles_written = len(tile_infos)
+        errors = len(shard_specs) - len(results)
 
         # Optional preview passes
         if rgb:
