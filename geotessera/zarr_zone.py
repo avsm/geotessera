@@ -1608,36 +1608,32 @@ def _reproject_zone(
 
     def _run_batches(progress_cb=None):
         nonlocal chunks_written
-        for batch_start in range(0, n_chunk_rows, GLOBAL_BATCH_CHUNK_ROWS):
-            batch_end = min(batch_start + GLOBAL_BATCH_CHUNK_ROWS, n_chunk_rows)
+        for cr_offset in range(n_chunk_rows):
+            cr = chunk_row_start + cr_offset
 
             tasks = []
-            for cr_offset in range(batch_start, batch_end):
-                cr = chunk_row_start + cr_offset
-                for cc_offset in range(n_chunk_cols):
-                    cc = chunk_col_start + cc_offset
-                    task = dask.delayed(_reproject_chunk)(
-                        global_arr=global_arr,
-                        chunk_row=cr,
-                        chunk_col=cc,
-                        src_arr=src_arr,
-                        src_epsg=zone_epsg,
-                        src_pixel=src_pixel,
-                        src_origin_e=src_origin_e,
-                        src_origin_n=src_origin_n,
-                        src_h=src_h,
-                        src_w=src_w,
-                        to_utm=to_utm,
-                    )
-                    tasks.append(task)
+            for cc_offset in range(n_chunk_cols):
+                cc = chunk_col_start + cc_offset
+                task = dask.delayed(_reproject_chunk)(
+                    global_arr=global_arr,
+                    chunk_row=cr,
+                    chunk_col=cc,
+                    src_arr=src_arr,
+                    src_epsg=zone_epsg,
+                    src_pixel=src_pixel,
+                    src_origin_e=src_origin_e,
+                    src_origin_n=src_origin_n,
+                    src_h=src_h,
+                    src_w=src_w,
+                    to_utm=to_utm,
+                )
+                tasks.append(task)
 
             results = dask.compute(*tasks, scheduler="threads",
                                    num_workers=workers)
-            batch_written = sum(1 for r in results if r)
-            chunks_written += batch_written
-            batch_size = (batch_end - batch_start) * n_chunk_cols
+            chunks_written += sum(1 for r in results if r)
             if progress_cb is not None:
-                progress_cb(batch_size)
+                progress_cb(n_chunk_cols)
 
     if console is not None:
         from rich.progress import (
