@@ -167,6 +167,54 @@ def _run_parallel(fn, items, workers, console=None, label="Processing"):
     return results
 
 
+def _run_parallel_processes(fn, items, workers, store_path,
+                            console=None, label="Processing"):
+    """Run fn(item) in a ProcessPoolExecutor with per-worker zarr store.
+
+    Unlike _run_parallel (threads), this uses separate OS processes so
+    CPU-bound work (numpy, blosc compression) runs truly in parallel.
+    """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    items = list(items)
+    results = []
+
+    def _execute(pool):
+        futures = {pool.submit(fn, item): item for item in items}
+        for future in as_completed(futures):
+            item = futures[future]
+            try:
+                results.append((item, future.result()))
+            except Exception as e:
+                logger.warning(f"{label} failed for {item}: {e}")
+            yield item
+
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        initializer=_init_shard_worker,
+        initargs=(store_path,),
+    ) as pool:
+        if console is not None:
+            from rich.progress import (
+                Progress, SpinnerColumn, BarColumn, TextColumn,
+                MofNCompleteColumn, TimeElapsedColumn,
+            )
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(), MofNCompleteColumn(), TimeElapsedColumn(),
+                console=console,
+            ) as progress:
+                task = progress.add_task(label, total=len(items))
+                for _ in _execute(pool):
+                    progress.advance(task)
+        else:
+            for _ in _execute(pool):
+                pass
+
+    return results
+
+
 # =============================================================================
 # UTM helpers
 # =============================================================================
@@ -599,6 +647,24 @@ def _write_one_shard(
     store["scales"][r : r + SHARD_SIZE, c : c + SHARD_SIZE] = scales_buf
 
 
+# -- Process-pool helpers for shard writing ------------------------------------
+# Each worker process opens its own zarr store handle to avoid GIL contention.
+
+_worker_store = None
+
+
+def _init_shard_worker(store_path: str) -> None:
+    """Process pool initializer: open the zarr store once per worker."""
+    global _worker_store
+    import zarr
+    _worker_store = zarr.open_group(store_path, mode="r+", zarr_format=3)
+
+
+def _write_one_shard_worker(spec: ShardSpec) -> None:
+    """Top-level picklable wrapper for process pool execution."""
+    _write_one_shard(spec, _worker_store)
+
+
 # =============================================================================
 # Tile reading
 # =============================================================================
@@ -863,10 +929,11 @@ def build_zone_stores(
                 f"(of {n_total:,} total)"
             )
 
-        # Write shards in parallel — each shard is independent
-        results = _run_parallel(
-            lambda spec: _write_one_shard(spec, store),
-            shard_specs, workers, console,
+        # Write shards in parallel using processes (bypasses GIL)
+        store_path = str(output_dir / _store_name(zone_grid.zone, zone_grid.year))
+        results = _run_parallel_processes(
+            _write_one_shard_worker,
+            shard_specs, workers, store_path, console,
             label="Writing shards",
         )
         tiles_written = len(tile_infos)
