@@ -176,10 +176,7 @@ Build a zone store with RGB from the Cambridge tiles:
   $ geotessera-registry zarr-build \
   >   "$TESTDIR/cb_tiles_zarr" \
   >   --output-dir "$TESTDIR/zarr_global_test" \
-  >   --year 2024 \
-  >   --rgb 2>&1 | grep -E '(RGB preview|Zone)' | head -3 | sed 's/ *$//'
-  * (glob)
-  * (glob)
+  >   --year 2024 2>&1 | grep -E 'Zone' | head -3 | sed 's/ *$//'
   * (glob)
 
 Build global preview store from the zone store:

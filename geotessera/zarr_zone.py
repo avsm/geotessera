@@ -442,7 +442,6 @@ def create_zone_store(
     output_dir: Path,
     geotessera_version: str = "unknown",
     dataset_version: str = "v1",
-    include_rgb: bool = False,
 ) -> "zarr.Group":
     """Create a new Zarr v3 store for a UTM zone."""
     import zarr
@@ -470,16 +469,6 @@ def create_zone_store(
         dtype=np.float32, fill_value=np.float32("nan"), compressors=BloscCodec(cname="zstd", clevel=3),
         dimension_names=["northing", "easting"],
     )
-
-    # Optional preview arrays
-    for name in (["rgb"] if include_rgb else []):
-        store.create_array(
-            name,
-            shape=(zone_grid.height_px, zone_grid.width_px, 4),
-            chunks=(INNER_CHUNK, INNER_CHUNK, 4), shards=(SHARD_SIZE, SHARD_SIZE, 4),
-            dtype=np.uint8, fill_value=np.uint8(0), compressors=BloscCodec(cname="zstd", clevel=3),
-            dimension_names=["northing", "easting", "rgba"],
-        )
 
     # Coordinate arrays
     easting_coords = (
@@ -854,7 +843,6 @@ def build_zone_stores(
     geotessera_version: str = "unknown",
     dataset_version: str = "v1",
     console: Optional["rich.console.Console"] = None,
-    rgb: bool = True,
     workers: Optional[int] = None,
 ) -> List[Path]:
     """Build zone-wide Zarr stores from local tile data.
@@ -914,7 +902,6 @@ def build_zone_stores(
             zone_grid, output_dir,
             geotessera_version=geotessera_version,
             dataset_version=dataset_version,
-            include_rgb=rgb,
         )
 
         # Build shard index: precompute which tiles overlap each shard
@@ -938,29 +925,6 @@ def build_zone_stores(
         )
         tiles_written = len(tile_infos)
         errors = len(shard_specs) - len(results)
-
-        # Optional preview passes
-        if rgb:
-            stretch = compute_stretch_from_store(store, workers=workers, console=console)
-            if console is not None:
-                console.print(
-                    f"  RGB stretch: min={[f'{v:.2f}' for v in stretch['min']]}, "
-                    f"max={[f'{v:.2f}' for v in stretch['max']]}"
-                )
-            written = write_preview_pass(
-                store, "rgb",
-                lambda emb, sc: compute_rgb_chunk(
-                    emb, sc, RGB_PREVIEW_BANDS, stretch["min"], stretch["max"]
-                ),
-                workers=workers, console=console, label="Writing RGB preview",
-            )
-            store.attrs.update({
-                "has_rgb_preview": True,
-                "rgb_bands": list(RGB_PREVIEW_BANDS),
-                "rgb_stretch": stretch,
-            })
-            if console is not None:
-                console.print(f"  [green]RGB preview: {written} chunks written[/green]")
 
         created_stores.append(output_dir / store_name)
 
@@ -1810,7 +1774,40 @@ def build_global_preview(
             f"{sorted(zone_stores.keys())}"
         )
 
-    # 2. Read zone metadata
+    # 2. Generate missing RGB previews (parallelised across zones)
+    missing_rgb = []
+    for zone_num, store_path in sorted(zone_stores.items()):
+        store = zarr.open_group(str(store_path), mode="r")
+        if "rgb" not in store:
+            missing_rgb.append((zone_num, store_path))
+
+    if missing_rgb:
+        if console is not None:
+            console.print(
+                f"  Generating RGB for {len(missing_rgb)} zone(s): "
+                f"{[z for z, _ in missing_rgb]}"
+            )
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        # Each zone gets a fair share of workers (min 1)
+        per_zone = max(1, workers // max(len(missing_rgb), 1))
+        with ProcessPoolExecutor(max_workers=len(missing_rgb)) as pool:
+            futures = {
+                pool.submit(
+                    add_rgb_to_existing_store, sp, workers=per_zone, console=None,
+                ): zn
+                for zn, sp in missing_rgb
+            }
+            for future in as_completed(futures):
+                zn = futures[future]
+                try:
+                    future.result()
+                    if console is not None:
+                        console.print(f"    Zone {zn}: RGB done")
+                except Exception as e:
+                    if console is not None:
+                        console.print(f"    [red]Zone {zn}: RGB failed: {e}[/red]")
+
+    # 3. Read zone metadata
     zone_infos: Dict[int, dict] = {}
     for zone_num, store_path in sorted(zone_stores.items()):
         store = zarr.open_group(str(store_path), mode="r")
@@ -1818,7 +1815,7 @@ def build_global_preview(
         if "rgb" not in store:
             if console is not None:
                 console.print(
-                    f"  [yellow]Zone {zone_num}: no rgb array, skipping[/yellow]"
+                    f"  [yellow]Zone {zone_num}: rgb still missing, skipping[/yellow]"
                 )
             continue
         zone_infos[zone_num] = {
@@ -1831,7 +1828,7 @@ def build_global_preview(
     if not zone_infos:
         raise FileNotFoundError("No zone stores with rgb arrays found")
 
-    # 3. Ensure global store exists
+    # 4. Ensure global store exists
     output_path = zarr_dir / f"global_rgb_{year}.zarr"
     if console is not None:
         console.print(f"  Output: {output_path}")
@@ -1842,7 +1839,7 @@ def build_global_preview(
             f"@ {GLOBAL_BASE_RES} deg, {num_levels} levels"
         )
 
-    # 4. Reproject each zone and update pyramid
+    # 5. Reproject each zone and update pyramid
     for zone_num, zinfo in sorted(zone_infos.items()):
         if console is not None:
             console.print(
@@ -1875,7 +1872,7 @@ def build_global_preview(
         )
         gc.collect()
 
-    # 5. Re-consolidate metadata
+    # 6. Re-consolidate metadata
     import warnings
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="Consolidated metadata")

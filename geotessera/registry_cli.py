@@ -2602,8 +2602,6 @@ def zarr_build_command(args):
         console.print(f"  Zones: {', '.join(str(z) for z in zone_list)}")
     if args.dry_run:
         console.print("  [dim](dry run)[/dim]")
-    if args.rgb:
-        console.print("  [green]+RGB preview[/green]")
 
     # Find registry directory: explicit flag, or auto-detect from base_dir
     registry_dir = args.registry_dir
@@ -2642,7 +2640,6 @@ def zarr_build_command(args):
         geotessera_version=gt_version,
         dataset_version=args.dataset_version,
         console=console,
-        rgb=args.rgb,
         workers=args.workers,
     )
 
@@ -3370,11 +3367,6 @@ Directory Structure:
         type=int,
         default=None,
         help="Number of threads for parallel I/O (default: cpu_count, max 16)",
-    )
-    zarr_build_parser.add_argument(
-        "--rgb",
-        action="store_true",
-        help="Generate RGB preview array during build (slow, can add later with --rgb-only)",
     )
     zarr_build_parser.add_argument(
         "--rgb-only",
