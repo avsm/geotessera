@@ -81,6 +81,36 @@ class ZoneGrid:
     tiles: List[TileInfo] = field(default_factory=list)
 
 
+@dataclass
+class ShardTileOverlap:
+    """One tile's contribution to one shard — precomputed slice coordinates."""
+
+    embedding_path: str
+    scales_path: str
+    landmask_path: str
+    # Tile-local region to read
+    t_row_start: int
+    t_row_end: int
+    t_col_start: int
+    t_col_end: int
+    # Shard-buffer region to write into
+    s_row_start: int
+    s_row_end: int
+    s_col_start: int
+    s_col_end: int
+
+
+@dataclass
+class ShardSpec:
+    """Everything a shard worker needs to write one complete shard."""
+
+    sr: int  # shard row index
+    sc: int  # shard col index
+    row_px: int  # pixel row in zone grid (sr * SHARD_SIZE)
+    col_px: int  # pixel col in zone grid (sc * SHARD_SIZE)
+    tiles: List[ShardTileOverlap]
+
+
 # =============================================================================
 # Progress helpers — eliminate repeated console/no-console branching
 # =============================================================================
