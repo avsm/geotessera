@@ -742,6 +742,49 @@ def _load_landmask_slice(
         return np.ones((row_end - row_start, col_end - col_start), dtype=np.uint8)
 
 
+def _write_one_shard(
+    spec: ShardSpec,
+    store: "zarr.Group",
+) -> None:
+    """Assemble and write a single shard — one self-contained unit of work.
+
+    Mmap-reads tile embeddings (kernel page cache handles sharing between
+    workers), loads scales/landmask slices, applies masking on the small
+    shard-sized region, and writes once to the zarr store.
+    """
+    emb_buf = np.zeros((SHARD_SIZE, SHARD_SIZE, N_BANDS), dtype=np.int8)
+    scales_buf = np.full((SHARD_SIZE, SHARD_SIZE), np.float32("nan"))
+
+    for ov in spec.tiles:
+        # Embedding: mmap read-only, slice out shard region (page-cache shared)
+        emb = np.load(ov.embedding_path, mmap_mode="r")
+        emb_buf[ov.s_row_start : ov.s_row_end, ov.s_col_start : ov.s_col_end, :] = (
+            emb[ov.t_row_start : ov.t_row_end, ov.t_col_start : ov.t_col_end, :]
+        )
+
+        # Scales: mmap + copy the small slice so we can mutate it
+        scales_mmap = np.load(ov.scales_path, mmap_mode="r")
+        s = scales_mmap[
+            ov.t_row_start : ov.t_row_end, ov.t_col_start : ov.t_col_end
+        ].copy()
+
+        # Landmask: windowed read for just this region
+        lm = _load_landmask_slice(
+            ov.landmask_path,
+            ov.t_row_start, ov.t_row_end,
+            ov.t_col_start, ov.t_col_end,
+        )
+        s[lm == 0] = np.float32("nan")
+        s[~np.isfinite(s)] = np.float32("nan")
+
+        scales_buf[ov.s_row_start : ov.s_row_end, ov.s_col_start : ov.s_col_end] = s
+
+    # Single zarr write per array — one shard, one pass
+    r, c = spec.row_px, spec.col_px
+    store["embeddings"][r : r + SHARD_SIZE, c : c + SHARD_SIZE, :] = emb_buf
+    store["scales"][r : r + SHARD_SIZE, c : c + SHARD_SIZE] = scales_buf
+
+
 # =============================================================================
 # Tile reading
 # =============================================================================
