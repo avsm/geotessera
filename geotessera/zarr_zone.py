@@ -285,6 +285,67 @@ def tile_pixel_offset(
     return row_start, col_start
 
 
+def build_shard_index(
+    tile_infos: List[TileInfo],
+    zone_grid: ZoneGrid,
+) -> List[ShardSpec]:
+    """Build a shard index: for each non-empty shard, list overlapping tile slices.
+
+    Pure arithmetic — no file I/O.  Returns only shards that have at least
+    one tile overlap (empty shards are left as zarr fill values).
+    """
+    shard_map: Dict[Tuple[int, int], List[ShardTileOverlap]] = {}
+
+    for ti in tile_infos:
+        row, col = tile_pixel_offset(ti, zone_grid)
+        h, w = ti.height, ti.width
+
+        sr_start = row // SHARD_SIZE
+        sr_end = (row + h - 1) // SHARD_SIZE
+        sc_start = col // SHARD_SIZE
+        sc_end = (col + w - 1) // SHARD_SIZE
+
+        for sr in range(sr_start, sr_end + 1):
+            for sc in range(sc_start, sc_end + 1):
+                shard_top = sr * SHARD_SIZE
+                shard_left = sc * SHARD_SIZE
+
+                t_row_start = max(0, shard_top - row)
+                t_row_end = min(h, shard_top + SHARD_SIZE - row)
+                t_col_start = max(0, shard_left - col)
+                t_col_end = min(w, shard_left + SHARD_SIZE - col)
+
+                s_row_start = max(0, row - shard_top)
+                s_row_end = s_row_start + (t_row_end - t_row_start)
+                s_col_start = max(0, col - shard_left)
+                s_col_end = s_col_start + (t_col_end - t_col_start)
+
+                ov = ShardTileOverlap(
+                    embedding_path=ti.embedding_path,
+                    scales_path=ti.scales_path,
+                    landmask_path=ti.landmask_path,
+                    t_row_start=t_row_start,
+                    t_row_end=t_row_end,
+                    t_col_start=t_col_start,
+                    t_col_end=t_col_end,
+                    s_row_start=s_row_start,
+                    s_row_end=s_row_end,
+                    s_col_start=s_col_start,
+                    s_col_end=s_col_end,
+                )
+                shard_map.setdefault((sr, sc), []).append(ov)
+
+    specs = []
+    for (sr, sc), overlaps in sorted(shard_map.items()):
+        specs.append(ShardSpec(
+            sr=sr, sc=sc,
+            row_px=sr * SHARD_SIZE,
+            col_px=sc * SHARD_SIZE,
+            tiles=overlaps,
+        ))
+    return specs
+
+
 def compute_tile_grid(lon: float, lat: float, pixel_size: float = 10.0):
     """Compute expected UTM EPSG, transform, and pixel dimensions for a tile.
 
