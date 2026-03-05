@@ -1961,6 +1961,7 @@ def _run_rgb_generation_parallel(
                 zone_stretch[zn] = {"min": s_min, "max": s_max}
 
             if progress is not None:
+                progress.update(stretch_task, visible=False)
                 for zn, st in zone_stretch.items():
                     progress.console.print(
                         f"    Zone {zn} stretch: "
