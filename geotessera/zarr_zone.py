@@ -1025,8 +1025,13 @@ def compute_stretch_from_store(
     workers: int = 8,
     console: Optional["rich.console.Console"] = None,
     progress_callback=None,
+    sample_fraction: float = 0.1,
 ) -> dict:
-    """Compute percentile stretch for RGB bands from an existing store."""
+    """Compute percentile stretch for RGB bands from an existing store.
+
+    Samples a fraction of chunks (default 10%) to estimate percentiles,
+    rather than reading the entire store.
+    """
     emb_arr = store["embeddings"]
     scales_arr = store["scales"]
     emb_shape = emb_arr.shape
@@ -1035,7 +1040,14 @@ def compute_stretch_from_store(
     n_cols = math.ceil(emb_shape[1] / chunk_w)
 
     band_slice = slice(RGB_PREVIEW_BANDS[0], RGB_PREVIEW_BANDS[-1] + 1)
-    chunk_indices = [(ci, cj) for ci in range(n_rows) for cj in range(n_cols)]
+    all_indices = [(ci, cj) for ci in range(n_rows) for cj in range(n_cols)]
+
+    # Sample a subset of chunks for stretch estimation
+    n_sample = max(1, int(len(all_indices) * sample_fraction))
+    rng = np.random.default_rng(42)
+    sample_indices = [
+        all_indices[i] for i in rng.choice(len(all_indices), n_sample, replace=False)
+    ]
 
     results = _run_parallel(
         lambda idx: _sample_chunk_stats(
@@ -1043,8 +1055,8 @@ def compute_stretch_from_store(
             chunk_h, chunk_w, emb_shape,
             band_slice=band_slice,
         ),
-        chunk_indices, workers, console,
-        label=f"Computing stretch ({workers} threads)",
+        sample_indices, workers, console,
+        label=f"Sampling stretch ({n_sample}/{len(all_indices)} chunks)",
         progress_callback=progress_callback,
     )
 
@@ -1171,23 +1183,20 @@ def add_rgb_to_existing_store(
     if workers is None:
         workers = _default_workers()
 
-    def _stretch_cb(completed, total):
+    def _cb(phase, completed, total):
         if progress_callback is not None:
-            progress_callback("stretch", completed, total)
-
-    def _rgb_cb(completed, total):
-        if progress_callback is not None:
-            progress_callback("rgb", completed, total)
+            progress_callback(phase, completed, total)
 
     if console is not None:
-        console.print(f"  Pass 1: Computing band statistics ({workers} threads)...")
+        console.print(f"  Sampling stretch...")
 
     stretch = compute_stretch_from_store(
-        store, workers=workers, console=console, progress_callback=_stretch_cb,
+        store, workers=workers, console=console,
+        progress_callback=lambda c, t: _cb("stretch", c, t),
     )
     if console is not None:
         console.print(f"  Stretch: min={stretch['min']}, max={stretch['max']}")
-        console.print("  Pass 2: Writing RGB preview...")
+        console.print(f"  Writing RGB preview...")
 
     written = write_preview_pass(
         store, "rgb",
@@ -1195,7 +1204,7 @@ def add_rgb_to_existing_store(
             emb, sc, RGB_PREVIEW_BANDS, stretch["min"], stretch["max"]
         ),
         workers=workers, console=console, label="Writing RGB preview",
-        progress_callback=_rgb_cb,
+        progress_callback=lambda c, t: _cb("rgb", c, t),
     )
 
     store.attrs.update({
@@ -1813,7 +1822,6 @@ def _run_rgb_generation_parallel(
 
     queue = multiprocessing.Manager().Queue()
 
-    # Each zone gets two progress bars: stretch (pass 1) and rgb (pass 2)
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -1822,13 +1830,12 @@ def _run_rgb_generation_parallel(
         console=console,
     ) as progress:
         tasks = {}
+        zone_phase = {}
         for zn, _ in missing_rgb:
-            tasks[(zn, "stretch")] = progress.add_task(
-                f"  Zone {zn} stretch", total=None, visible=True,
+            tasks[zn] = progress.add_task(
+                f"  Zone {zn}", total=None, visible=True,
             )
-            tasks[(zn, "rgb")] = progress.add_task(
-                f"  Zone {zn} RGB", total=None, visible=True,
-            )
+            zone_phase[zn] = None
 
         work_items = [
             (sp, per_zone, queue, zn) for zn, sp in missing_rgb
@@ -1846,11 +1853,20 @@ def _run_rgb_generation_parallel(
                 zn, phase, completed, total = msg
                 if phase == "done":
                     done_zones.add(zn)
-                    progress.console.print(f"    Zone {zn}: RGB done")
+                    progress.console.print(f"    Zone {zn}: done")
                     continue
-                task_id = tasks.get((zn, phase))
+                task_id = tasks.get(zn)
                 if task_id is not None:
-                    progress.update(task_id, completed=completed, total=total)
+                    # Reset bar when phase changes
+                    if phase != zone_phase.get(zn):
+                        zone_phase[zn] = phase
+                        progress.reset(task_id, total=total)
+                    label = "stretch" if phase == "stretch" else "RGB"
+                    progress.update(
+                        task_id,
+                        description=f"  Zone {zn} {label}",
+                        completed=completed, total=total,
+                    )
 
             # Collect any exceptions
             for f in futures:
