@@ -966,8 +966,8 @@ def compute_rgb_chunk(
         raw = embedding_int8[:, :, band_idx].astype(np.float32)
         dequant = raw * scales_safe
         lo, hi = stretch_min[i], stretch_max[i]
-        normalised = (dequant - lo) / (hi - lo)
-        rgba[:, :, i] = np.clip(normalised * 255, 0, 255).astype(np.uint8)
+        normalised = np.clip((dequant - lo) / max(hi - lo, 1e-10), 0.0, 1.0)
+        rgba[:, :, i] = (normalised * 255).astype(np.uint8)
 
     inv = ~valid
     rgba[inv, :3] = 0
@@ -1409,6 +1409,37 @@ def _ensure_global_store(store_path: Path, num_levels: int) -> None:
         zarr.consolidate_metadata(str(store_path))
 
 
+# Per-worker state for reprojection process pool
+_reproj_worker_global_arr = None
+_reproj_worker_src_arr = None
+_reproj_worker_to_utm = None
+
+
+def _init_reproj_worker(global_store_path: str, zone_store_path: str, zone_epsg: int):
+    """Process pool initializer: open zarr stores and create transformer."""
+    global _reproj_worker_global_arr, _reproj_worker_src_arr, _reproj_worker_to_utm
+    import zarr
+    from pyproj import Transformer
+    global_root = zarr.open_group(global_store_path, mode="r+", zarr_format=3)
+    _reproj_worker_global_arr = global_root["0/rgb"]
+    zone_store = zarr.open_group(zone_store_path, mode="r")
+    _reproj_worker_src_arr = zone_store["rgb"]
+    _reproj_worker_to_utm = Transformer.from_crs(
+        "EPSG:4326", f"EPSG:{zone_epsg}", always_xy=True,
+    )
+
+
+def _reproject_chunk_worker(args) -> bool:
+    """Process pool worker for reprojection."""
+    chunk_row, chunk_col, src_epsg, src_pixel, src_origin_e, src_origin_n, src_h, src_w = args
+    return _reproject_chunk(
+        _reproj_worker_global_arr, chunk_row, chunk_col,
+        _reproj_worker_src_arr, src_epsg, src_pixel,
+        src_origin_e, src_origin_n, src_h, src_w,
+        _reproj_worker_to_utm,
+    )
+
+
 def _reproject_chunk(
     global_arr,
     chunk_row: int,
@@ -1563,13 +1594,12 @@ def _reproject_zone(
 ) -> Tuple[int, int, int, int]:
     """Reproject one zone's RGB into level 0 of the global store.
 
-    Uses dask.delayed to parallelise chunk-level reprojection tasks.
+    Uses ProcessPoolExecutor to parallelise chunk-level reprojection.
     Each task writes to a unique chunk position, eliminating write races.
 
     Returns (row_start, row_end, col_start, col_end) in pixel coords,
     snapped to chunk boundaries.
     """
-    import dask
     import zarr
     from pyproj import Transformer
 
@@ -1635,46 +1665,22 @@ def _reproject_zone(
             f"({n_chunk_rows}x{n_chunk_cols} = {total_chunks} chunks)"
         )
 
-    global_root = zarr.open_group(str(store_path), mode="r+", zarr_format=3)
-    global_arr = global_root["0/rgb"]
-    zone_store = zarr.open_group(str(zone_store_path), mode="r")
-    src_arr = zone_store["rgb"]
+    from concurrent.futures import ProcessPoolExecutor, as_completed
 
-    to_utm = Transformer.from_crs(
-        "EPSG:4326", f"EPSG:{zone_epsg}", always_xy=True,
-    )
-
-    chunks_written = 0
     chunks_total = n_chunk_rows * n_chunk_cols
 
-    def _run_batches(progress_cb=None):
-        nonlocal chunks_written
-        for cr_offset in range(n_chunk_rows):
-            cr = chunk_row_start + cr_offset
+    # Build flat list of work items (all serializable scalars)
+    work_items = []
+    for cr_offset in range(n_chunk_rows):
+        cr = chunk_row_start + cr_offset
+        for cc_offset in range(n_chunk_cols):
+            cc = chunk_col_start + cc_offset
+            work_items.append((
+                cr, cc, zone_epsg, src_pixel,
+                src_origin_e, src_origin_n, src_h, src_w,
+            ))
 
-            tasks = []
-            for cc_offset in range(n_chunk_cols):
-                cc = chunk_col_start + cc_offset
-                task = dask.delayed(_reproject_chunk)(
-                    global_arr=global_arr,
-                    chunk_row=cr,
-                    chunk_col=cc,
-                    src_arr=src_arr,
-                    src_epsg=zone_epsg,
-                    src_pixel=src_pixel,
-                    src_origin_e=src_origin_e,
-                    src_origin_n=src_origin_n,
-                    src_h=src_h,
-                    src_w=src_w,
-                    to_utm=to_utm,
-                )
-                tasks.append(task)
-
-            results = dask.compute(*tasks, scheduler="threads",
-                                   num_workers=workers)
-            chunks_written += sum(1 for r in results if r)
-            if progress_cb is not None:
-                progress_cb(n_chunk_cols)
+    chunks_written = 0
 
     if console is not None:
         from rich.progress import (
@@ -1688,13 +1694,42 @@ def _reproject_zone(
             TimeElapsedColumn(), TimeRemainingColumn(),
             console=console,
         ) as progress:
-            task = progress.add_task(
+            ptask = progress.add_task(
                 f"Reprojecting zone {zone_num:02d}", total=chunks_total,
             )
-            _run_batches(lambda n: progress.advance(task, n))
+            with ProcessPoolExecutor(
+                max_workers=workers,
+                initializer=_init_reproj_worker,
+                initargs=(str(store_path), str(zone_store_path), zone_epsg),
+            ) as pool:
+                futures = {
+                    pool.submit(_reproject_chunk_worker, item): item
+                    for item in work_items
+                }
+                for future in as_completed(futures):
+                    try:
+                        if future.result():
+                            chunks_written += 1
+                    except Exception as e:
+                        logger.warning(f"Reproject chunk failed: {e}")
+                    progress.advance(ptask)
         console.print(f"    {chunks_written} chunks with data")
     else:
-        _run_batches()
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_init_reproj_worker,
+            initargs=(str(store_path), str(zone_store_path), zone_epsg),
+        ) as pool:
+            futures = {
+                pool.submit(_reproject_chunk_worker, item): item
+                for item in work_items
+            }
+            for future in as_completed(futures):
+                try:
+                    if future.result():
+                        chunks_written += 1
+                except Exception:
+                    pass
 
     return (row_start, row_end, col_start, col_end)
 
