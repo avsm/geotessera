@@ -1797,30 +1797,59 @@ def build_global_preview(
             missing_rgb.append((zone_num, store_path))
 
     if missing_rgb:
-        if console is not None:
-            console.print(
-                f"  Generating RGB for {len(missing_rgb)} zone(s): "
-                f"{[z for z, _ in missing_rgb]}"
-            )
         from concurrent.futures import ProcessPoolExecutor, as_completed
         # Each zone gets a fair share of workers (min 1)
         per_zone = max(1, workers // max(len(missing_rgb), 1))
-        with ProcessPoolExecutor(max_workers=len(missing_rgb)) as pool:
-            futures = {
-                pool.submit(
-                    add_rgb_to_existing_store, sp, workers=per_zone, console=None,
-                ): zn
-                for zn, sp in missing_rgb
-            }
-            for future in as_completed(futures):
-                zn = futures[future]
-                try:
+
+        if console is not None:
+            from rich.progress import (
+                Progress, SpinnerColumn, BarColumn, TextColumn,
+                MofNCompleteColumn, TimeElapsedColumn, TimeRemainingColumn,
+            )
+            console.print(
+                f"  Generating RGB for {len(missing_rgb)} zone(s): "
+                f"{[z for z, _ in missing_rgb]} "
+                f"({per_zone} workers each)"
+            )
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(), MofNCompleteColumn(),
+                TimeElapsedColumn(), TimeRemainingColumn(),
+                console=console,
+            ) as progress:
+                task = progress.add_task(
+                    "Generating RGB previews", total=len(missing_rgb),
+                )
+                with ProcessPoolExecutor(max_workers=len(missing_rgb)) as pool:
+                    futures = {
+                        pool.submit(
+                            add_rgb_to_existing_store, sp,
+                            workers=per_zone, console=None,
+                        ): zn
+                        for zn, sp in missing_rgb
+                    }
+                    for future in as_completed(futures):
+                        zn = futures[future]
+                        try:
+                            future.result()
+                            progress.console.print(f"    Zone {zn}: RGB done")
+                        except Exception as e:
+                            progress.console.print(
+                                f"    [red]Zone {zn}: RGB failed: {e}[/red]"
+                            )
+                        progress.advance(task)
+        else:
+            with ProcessPoolExecutor(max_workers=len(missing_rgb)) as pool:
+                futures = {
+                    pool.submit(
+                        add_rgb_to_existing_store, sp,
+                        workers=per_zone, console=None,
+                    ): zn
+                    for zn, sp in missing_rgb
+                }
+                for future in as_completed(futures):
                     future.result()
-                    if console is not None:
-                        console.print(f"    Zone {zn}: RGB done")
-                except Exception as e:
-                    if console is not None:
-                        console.print(f"    [red]Zone {zn}: RGB failed: {e}[/red]")
 
     # 3. Read zone metadata
     zone_infos: Dict[int, dict] = {}
