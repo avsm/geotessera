@@ -21,7 +21,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -1782,98 +1782,247 @@ def _coarsen_zone_pyramid(
         prev_col_start, prev_col_end = lc_start, lc_end
 
 
-def _rgb_worker(args):
-    """Subprocess target: generate RGB for one zone, sending progress to queue."""
-    store_path, per_zone, queue, zone_num = args
-    def _cb(phase, completed, total):
-        queue.put((zone_num, phase, completed, total))
-    add_rgb_to_existing_store(
-        store_path, workers=per_zone, console=None, progress_callback=_cb,
+# ---------------------------------------------------------------------------
+# Multi-zone RGB generation with a single shared process pool
+# ---------------------------------------------------------------------------
+
+# Per-worker state: each process opens zone stores lazily.
+_rgb_worker_stores: Dict[str, Any] = {}
+
+
+def _init_rgb_pool() -> None:
+    """Process pool initializer — reset per-worker store cache."""
+    global _rgb_worker_stores
+    _rgb_worker_stores = {}
+
+
+def _get_rgb_store(store_path_str: str):
+    """Lazily open and cache a zarr store in the current worker process."""
+    import zarr
+    global _rgb_worker_stores
+    if store_path_str not in _rgb_worker_stores:
+        _rgb_worker_stores[store_path_str] = zarr.open_group(
+            store_path_str, mode="r+", zarr_format=3,
+        )
+    return _rgb_worker_stores[store_path_str]
+
+
+def _stretch_sample_worker(args):
+    """Process pool worker: sample one chunk for stretch estimation."""
+    store_path_str, ci, cj = args
+    store = _get_rgb_store(store_path_str)
+    emb_shape = store["embeddings"].shape
+    band_slice = slice(RGB_PREVIEW_BANDS[0], RGB_PREVIEW_BANDS[-1] + 1)
+    result = _sample_chunk_stats(
+        store["embeddings"], store["scales"], ci, cj,
+        SHARD_SIZE, SHARD_SIZE, emb_shape,
+        band_slice=band_slice,
     )
-    queue.put((zone_num, "done", 0, 0))
+    return result
+
+
+def _rgb_chunk_worker(args):
+    """Process pool worker: compute and write RGB for one chunk."""
+    store_path_str, ci, cj, stretch_min, stretch_max = args
+    store = _get_rgb_store(store_path_str)
+    emb_arr = store["embeddings"]
+    scales_arr = store["scales"]
+    out_arr = store["rgb"]
+    emb_shape = emb_arr.shape
+
+    r0, r1 = ci * SHARD_SIZE, min(ci * SHARD_SIZE + SHARD_SIZE, emb_shape[0])
+    c0, c1 = cj * SHARD_SIZE, min(cj * SHARD_SIZE + SHARD_SIZE, emb_shape[1])
+
+    scales_chunk = np.asarray(scales_arr[r0:r1, c0:c1])
+    if np.all(~np.isfinite(scales_chunk)):
+        return False
+
+    emb_chunk = np.asarray(emb_arr[r0:r1, c0:c1, :])
+    rgba = compute_rgb_chunk(
+        emb_chunk, scales_chunk, RGB_PREVIEW_BANDS, stretch_min, stretch_max,
+    )
+    out_arr[r0:r1, c0:c1, :] = rgba
+    return True
+
+
+def _ensure_rgb_array(store_path: Path) -> None:
+    """Create the rgb array in a store if it doesn't exist."""
+    import zarr
+    from zarr.codecs import BloscCodec
+    store = zarr.open_group(str(store_path), mode="r+")
+    try:
+        _ = store["rgb"]
+    except KeyError:
+        emb_shape = store["embeddings"].shape
+        store.create_array(
+            "rgb",
+            shape=(emb_shape[0], emb_shape[1], 4),
+            chunks=(INNER_CHUNK, INNER_CHUNK, 4),
+            shards=(SHARD_SIZE, SHARD_SIZE, 4),
+            dtype=np.uint8,
+            fill_value=np.uint8(0),
+            compressors=BloscCodec(cname="zstd", clevel=3),
+            dimension_names=["northing", "easting", "rgba"],
+        )
 
 
 def _run_rgb_generation_parallel(
     missing_rgb: list,
-    per_zone: int,
+    workers: int,
     console=None,
+    sample_fraction: float = 0.1,
 ) -> None:
-    """Generate RGB previews for multiple zones in parallel with progress."""
-    import multiprocessing
+    """Generate RGB previews for multiple zones using a single process pool.
+
+    All ``workers`` processes work on chunks across all zones, ensuring
+    full CPU utilisation regardless of the number of zones.
+    """
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
-    if not console:
-        # No progress display — just run in parallel
-        with ProcessPoolExecutor(max_workers=len(missing_rgb)) as pool:
-            futures = [
-                pool.submit(
-                    add_rgb_to_existing_store, sp, workers=per_zone, console=None,
-                )
-                for _, sp in missing_rgb
-            ]
-            for f in as_completed(futures):
-                f.result()
-        return
+    # 1. Ensure rgb arrays exist (must be done in main process before
+    #    workers try to write).
+    for _zn, sp in missing_rgb:
+        _ensure_rgb_array(sp)
 
-    from rich.progress import (
-        Progress, SpinnerColumn, BarColumn, TextColumn,
-        MofNCompleteColumn, TimeElapsedColumn, TimeRemainingColumn,
-    )
-
-    queue = multiprocessing.Manager().Queue()
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(), MofNCompleteColumn(),
-        TimeElapsedColumn(), TimeRemainingColumn(),
-        console=console,
-    ) as progress:
-        tasks = {}
-        zone_phase = {}
-        for zn, _ in missing_rgb:
-            tasks[zn] = progress.add_task(
-                f"  Zone {zn}", total=None, visible=True,
-            )
-            zone_phase[zn] = None
-
-        work_items = [
-            (sp, per_zone, queue, zn) for zn, sp in missing_rgb
+    # 2. Build chunk indices per zone
+    zone_chunk_info: Dict[int, dict] = {}
+    for zone_num, store_path in missing_rgb:
+        import zarr
+        store = zarr.open_group(str(store_path), mode="r")
+        emb_shape = store["embeddings"].shape
+        n_rows = math.ceil(emb_shape[0] / SHARD_SIZE)
+        n_cols = math.ceil(emb_shape[1] / SHARD_SIZE)
+        all_indices = [(ci, cj) for ci in range(n_rows) for cj in range(n_cols)]
+        n_sample = max(1, int(len(all_indices) * sample_fraction))
+        rng = np.random.default_rng(42 + zone_num)
+        sample_indices = [
+            all_indices[i]
+            for i in rng.choice(len(all_indices), n_sample, replace=False)
         ]
-        done_zones = set()
+        zone_chunk_info[zone_num] = {
+            "store_path": str(store_path),
+            "all_indices": all_indices,
+            "sample_indices": sample_indices,
+        }
 
-        with ProcessPoolExecutor(max_workers=len(missing_rgb)) as pool:
-            futures = [pool.submit(_rgb_worker, item) for item in work_items]
+    # 3. Stretch: sample chunks across all zones in one pool
+    stretch_items = []
+    for zn, info in zone_chunk_info.items():
+        for ci, cj in info["sample_indices"]:
+            stretch_items.append((zn, (info["store_path"], ci, cj)))
 
-            while len(done_zones) < len(missing_rgb):
-                try:
-                    msg = queue.get(timeout=0.5)
-                except Exception:
+    total_stretch = len(stretch_items)
+    total_rgb = sum(len(info["all_indices"]) for info in zone_chunk_info.values())
+
+    if console is not None:
+        from rich.progress import (
+            Progress, SpinnerColumn, BarColumn, TextColumn,
+            MofNCompleteColumn, TimeElapsedColumn, TimeRemainingColumn,
+        )
+        console.print(
+            f"  Sampling stretch ({total_stretch} chunks) "
+            f"then writing RGB ({total_rgb} chunks) "
+            f"across {len(missing_rgb)} zone(s) with {workers} workers"
+        )
+
+    def _run_with_progress(progress=None, stretch_task=None, rgb_task=None):
+        zone_samples: Dict[int, list] = {zn: [] for zn in zone_chunk_info}
+
+        with ProcessPoolExecutor(
+            max_workers=workers, initializer=_init_rgb_pool,
+        ) as pool:
+            # --- Stretch phase ---
+            futures = {
+                pool.submit(_stretch_sample_worker, item): zn
+                for zn, item in stretch_items
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                zn = futures[future]
+                if result is not None:
+                    zone_samples[zn].append(result)
+                if progress is not None and stretch_task is not None:
+                    progress.advance(stretch_task)
+
+            # Compute per-zone stretch
+            zone_stretch: Dict[int, dict] = {}
+            for zn, samples in zone_samples.items():
+                if not samples:
+                    zone_stretch[zn] = {
+                        "min": [0.0, 0.0, 0.0], "max": [1.0, 1.0, 1.0],
+                    }
                     continue
-                zn, phase, completed, total = msg
-                if phase == "done":
-                    done_zones.add(zn)
-                    progress.console.print(f"    Zone {zn}: done")
-                    continue
-                task_id = tasks.get(zn)
-                if task_id is not None:
-                    # Reset bar when phase changes
-                    if phase != zone_phase.get(zn):
-                        zone_phase[zn] = phase
-                        progress.reset(task_id, total=total)
-                    label = "stretch" if phase == "stretch" else "RGB"
-                    progress.update(
-                        task_id,
-                        description=f"  Zone {zn} {label}",
-                        completed=completed, total=total,
+                all_rgb = np.concatenate(samples, axis=0)
+                s_min = [float(np.percentile(all_rgb[:, i], 2)) for i in range(3)]
+                s_max = [float(np.percentile(all_rgb[:, i], 98)) for i in range(3)]
+                for i in range(3):
+                    if s_max[i] <= s_min[i]:
+                        s_max[i] = s_min[i] + 1.0
+                zone_stretch[zn] = {"min": s_min, "max": s_max}
+
+            if progress is not None:
+                for zn, st in zone_stretch.items():
+                    progress.console.print(
+                        f"    Zone {zn} stretch: "
+                        f"min={[f'{v:.2f}' for v in st['min']]}, "
+                        f"max={[f'{v:.2f}' for v in st['max']]}"
                     )
 
-            # Collect any exceptions
-            for f in futures:
+            # --- RGB phase ---
+            rgb_items = []
+            for zn, info in zone_chunk_info.items():
+                st = zone_stretch[zn]
+                for ci, cj in info["all_indices"]:
+                    rgb_items.append((
+                        zn, (info["store_path"], ci, cj, st["min"], st["max"]),
+                    ))
+
+            futures = {
+                pool.submit(_rgb_chunk_worker, item): zn
+                for zn, item in rgb_items
+            }
+            written = 0
+            for future in as_completed(futures):
                 try:
-                    f.result()
+                    if future.result():
+                        written += 1
                 except Exception as e:
-                    progress.console.print(f"    [red]RGB failed: {e}[/red]")
+                    logger.warning(f"RGB chunk failed: {e}")
+                if progress is not None and rgb_task is not None:
+                    progress.advance(rgb_task)
+
+        # Update store attrs
+        for zn, info in zone_chunk_info.items():
+            import zarr
+            store = zarr.open_group(info["store_path"], mode="r+")
+            store.attrs.update({
+                "has_rgb_preview": True,
+                "rgb_bands": list(RGB_PREVIEW_BANDS),
+                "rgb_stretch": zone_stretch[zn],
+            })
+
+        if progress is not None:
+            progress.console.print(
+                f"    RGB complete: {written} chunks with data"
+            )
+
+    if console is not None:
+        from rich.progress import (
+            Progress, SpinnerColumn, BarColumn, TextColumn,
+            MofNCompleteColumn, TimeElapsedColumn, TimeRemainingColumn,
+        )
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(), MofNCompleteColumn(),
+            TimeElapsedColumn(), TimeRemainingColumn(),
+            console=console,
+        ) as progress:
+            stretch_task = progress.add_task("Stretch", total=total_stretch)
+            rgb_task = progress.add_task("RGB", total=total_rgb)
+            _run_with_progress(progress, stretch_task, rgb_task)
+    else:
+        _run_with_progress()
 
 
 def build_global_preview(
@@ -1932,18 +2081,8 @@ def build_global_preview(
             missing_rgb.append((zone_num, store_path))
 
     if missing_rgb:
-        from concurrent.futures import ProcessPoolExecutor, as_completed
-        # Each zone gets a fair share of workers (min 1)
-        per_zone = max(1, workers // max(len(missing_rgb), 1))
-
-        if console is not None:
-            console.print(
-                f"  Generating RGB for {len(missing_rgb)} zone(s): "
-                f"{[z for z, _ in missing_rgb]} "
-                f"({per_zone} workers each)"
-            )
         _run_rgb_generation_parallel(
-            missing_rgb, per_zone, console=console,
+            missing_rgb, workers=workers, console=console,
         )
 
     # 3. Read zone metadata
