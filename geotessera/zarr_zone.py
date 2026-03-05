@@ -116,7 +116,8 @@ class ShardSpec:
 # =============================================================================
 
 
-def _run_parallel(fn, items, workers, console=None, label="Processing"):
+def _run_parallel(fn, items, workers, console=None, label="Processing",
+                   progress_callback=None):
     """Run fn(item) in a ThreadPoolExecutor, with optional Rich progress.
 
     Args:
@@ -125,6 +126,9 @@ def _run_parallel(fn, items, workers, console=None, label="Processing"):
         workers: Number of threads.
         console: Optional Rich Console for progress display.
         label: Description for the progress bar.
+        progress_callback: Optional callable(completed, total) called after
+            each item completes.  Used for cross-process progress reporting
+            when ``console`` is not available.
 
     Returns:
         List of (item, result) tuples for successful calls.
@@ -134,8 +138,10 @@ def _run_parallel(fn, items, workers, console=None, label="Processing"):
 
     items = list(items)
     results = []
+    completed = 0
 
     def _execute(pool):
+        nonlocal completed
         futures = {pool.submit(fn, item): item for item in items}
         for future in as_completed(futures):
             item = futures[future]
@@ -143,6 +149,7 @@ def _run_parallel(fn, items, workers, console=None, label="Processing"):
                 results.append((item, future.result()))
             except Exception as e:
                 logger.warning(f"{label} failed for {item}: {e}")
+            completed += 1
             yield item
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -162,7 +169,8 @@ def _run_parallel(fn, items, workers, console=None, label="Processing"):
                     progress.advance(task)
         else:
             for _ in _execute(pool):
-                pass
+                if progress_callback is not None:
+                    progress_callback(completed, len(items))
 
     return results
 
@@ -1016,6 +1024,7 @@ def compute_stretch_from_store(
     p_high: float = 98,
     workers: int = 8,
     console: Optional["rich.console.Console"] = None,
+    progress_callback=None,
 ) -> dict:
     """Compute percentile stretch for RGB bands from an existing store."""
     emb_arr = store["embeddings"]
@@ -1036,6 +1045,7 @@ def compute_stretch_from_store(
         ),
         chunk_indices, workers, console,
         label=f"Computing stretch ({workers} threads)",
+        progress_callback=progress_callback,
     )
 
     samples = [r for _, r in results if r is not None]
@@ -1066,6 +1076,7 @@ def write_preview_pass(
     workers: int = 8,
     console: Optional["rich.console.Console"] = None,
     label: str = "Writing preview",
+    progress_callback=None,
 ) -> int:
     """Write a preview array by iterating over chunks in parallel.
 
@@ -1111,6 +1122,7 @@ def write_preview_pass(
     results = _run_parallel(
         _process_chunk, chunk_indices, workers, console,
         label=f"{label} ({workers} threads)",
+        progress_callback=progress_callback,
     )
 
     return sum(1 for _, wrote in results if wrote)
@@ -1125,8 +1137,17 @@ def add_rgb_to_existing_store(
     store_path: Path,
     workers: Optional[int] = None,
     console: Optional["rich.console.Console"] = None,
+    progress_callback=None,
 ) -> None:
-    """Add RGB preview array to an existing Zarr store."""
+    """Add RGB preview array to an existing Zarr store.
+
+    Args:
+        store_path: Path to the Zarr store.
+        workers: Number of threads for parallel I/O.
+        console: Optional Rich Console for local progress display.
+        progress_callback: Optional callable(phase, completed, total) for
+            cross-process progress.  ``phase`` is ``"stretch"`` or ``"rgb"``.
+    """
     import zarr
 
     store = zarr.open_group(str(store_path), mode="r+")
@@ -1150,10 +1171,20 @@ def add_rgb_to_existing_store(
     if workers is None:
         workers = _default_workers()
 
+    def _stretch_cb(completed, total):
+        if progress_callback is not None:
+            progress_callback("stretch", completed, total)
+
+    def _rgb_cb(completed, total):
+        if progress_callback is not None:
+            progress_callback("rgb", completed, total)
+
     if console is not None:
         console.print(f"  Pass 1: Computing band statistics ({workers} threads)...")
 
-    stretch = compute_stretch_from_store(store, workers=workers, console=console)
+    stretch = compute_stretch_from_store(
+        store, workers=workers, console=console, progress_callback=_stretch_cb,
+    )
     if console is not None:
         console.print(f"  Stretch: min={stretch['min']}, max={stretch['max']}")
         console.print("  Pass 2: Writing RGB preview...")
@@ -1164,6 +1195,7 @@ def add_rgb_to_existing_store(
             emb, sc, RGB_PREVIEW_BANDS, stretch["min"], stretch["max"]
         ),
         workers=workers, console=console, label="Writing RGB preview",
+        progress_callback=_rgb_cb,
     )
 
     store.attrs.update({
@@ -1741,6 +1773,93 @@ def _coarsen_zone_pyramid(
         prev_col_start, prev_col_end = lc_start, lc_end
 
 
+def _rgb_worker(args):
+    """Subprocess target: generate RGB for one zone, sending progress to queue."""
+    store_path, per_zone, queue, zone_num = args
+    def _cb(phase, completed, total):
+        queue.put((zone_num, phase, completed, total))
+    add_rgb_to_existing_store(
+        store_path, workers=per_zone, console=None, progress_callback=_cb,
+    )
+    queue.put((zone_num, "done", 0, 0))
+
+
+def _run_rgb_generation_parallel(
+    missing_rgb: list,
+    per_zone: int,
+    console=None,
+) -> None:
+    """Generate RGB previews for multiple zones in parallel with progress."""
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    if not console:
+        # No progress display — just run in parallel
+        with ProcessPoolExecutor(max_workers=len(missing_rgb)) as pool:
+            futures = [
+                pool.submit(
+                    add_rgb_to_existing_store, sp, workers=per_zone, console=None,
+                )
+                for _, sp in missing_rgb
+            ]
+            for f in as_completed(futures):
+                f.result()
+        return
+
+    from rich.progress import (
+        Progress, SpinnerColumn, BarColumn, TextColumn,
+        MofNCompleteColumn, TimeElapsedColumn, TimeRemainingColumn,
+    )
+
+    queue = multiprocessing.Manager().Queue()
+
+    # Each zone gets two progress bars: stretch (pass 1) and rgb (pass 2)
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(), MofNCompleteColumn(),
+        TimeElapsedColumn(), TimeRemainingColumn(),
+        console=console,
+    ) as progress:
+        tasks = {}
+        for zn, _ in missing_rgb:
+            tasks[(zn, "stretch")] = progress.add_task(
+                f"  Zone {zn} stretch", total=None, visible=True,
+            )
+            tasks[(zn, "rgb")] = progress.add_task(
+                f"  Zone {zn} RGB", total=None, visible=True,
+            )
+
+        work_items = [
+            (sp, per_zone, queue, zn) for zn, sp in missing_rgb
+        ]
+        done_zones = set()
+
+        with ProcessPoolExecutor(max_workers=len(missing_rgb)) as pool:
+            futures = [pool.submit(_rgb_worker, item) for item in work_items]
+
+            while len(done_zones) < len(missing_rgb):
+                try:
+                    msg = queue.get(timeout=0.5)
+                except Exception:
+                    continue
+                zn, phase, completed, total = msg
+                if phase == "done":
+                    done_zones.add(zn)
+                    progress.console.print(f"    Zone {zn}: RGB done")
+                    continue
+                task_id = tasks.get((zn, phase))
+                if task_id is not None:
+                    progress.update(task_id, completed=completed, total=total)
+
+            # Collect any exceptions
+            for f in futures:
+                try:
+                    f.result()
+                except Exception as e:
+                    progress.console.print(f"    [red]RGB failed: {e}[/red]")
+
+
 def build_global_preview(
     zarr_dir: Path,
     year: int,
@@ -1802,54 +1921,14 @@ def build_global_preview(
         per_zone = max(1, workers // max(len(missing_rgb), 1))
 
         if console is not None:
-            from rich.progress import (
-                Progress, SpinnerColumn, BarColumn, TextColumn,
-                MofNCompleteColumn, TimeElapsedColumn, TimeRemainingColumn,
-            )
             console.print(
                 f"  Generating RGB for {len(missing_rgb)} zone(s): "
                 f"{[z for z, _ in missing_rgb]} "
                 f"({per_zone} workers each)"
             )
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(), MofNCompleteColumn(),
-                TimeElapsedColumn(), TimeRemainingColumn(),
-                console=console,
-            ) as progress:
-                task = progress.add_task(
-                    "Generating RGB previews", total=len(missing_rgb),
-                )
-                with ProcessPoolExecutor(max_workers=len(missing_rgb)) as pool:
-                    futures = {
-                        pool.submit(
-                            add_rgb_to_existing_store, sp,
-                            workers=per_zone, console=None,
-                        ): zn
-                        for zn, sp in missing_rgb
-                    }
-                    for future in as_completed(futures):
-                        zn = futures[future]
-                        try:
-                            future.result()
-                            progress.console.print(f"    Zone {zn}: RGB done")
-                        except Exception as e:
-                            progress.console.print(
-                                f"    [red]Zone {zn}: RGB failed: {e}[/red]"
-                            )
-                        progress.advance(task)
-        else:
-            with ProcessPoolExecutor(max_workers=len(missing_rgb)) as pool:
-                futures = {
-                    pool.submit(
-                        add_rgb_to_existing_store, sp,
-                        workers=per_zone, console=None,
-                    ): zn
-                    for zn, sp in missing_rgb
-                }
-                for future in as_completed(futures):
-                    future.result()
+        _run_rgb_generation_parallel(
+            missing_rgb, per_zone, console=console,
+        )
 
     # 3. Read zone metadata
     zone_infos: Dict[int, dict] = {}
