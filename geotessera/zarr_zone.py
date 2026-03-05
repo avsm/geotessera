@@ -1845,6 +1845,33 @@ def _rgb_chunk_worker(args):
     return True
 
 
+def _nonempty_shard_indices(store_path: Path, array_name: str = "scales") -> set:
+    """Return set of (ci, cj) shard indices that have data on disk.
+
+    Zarr v3 sharded arrays store shard files at ``{array}/c/{ci}/{cj}``.
+    Shards that were never written have no file and are guaranteed to be
+    all fill-value (NaN for scales), so we can skip them entirely.
+    """
+    chunks_dir = store_path / array_name / "c"
+    result = set()
+    if not chunks_dir.is_dir():
+        return result
+    for row_dir in chunks_dir.iterdir():
+        if not row_dir.is_dir():
+            continue
+        try:
+            ci = int(row_dir.name)
+        except ValueError:
+            continue
+        for col_file in row_dir.iterdir():
+            try:
+                cj = int(col_file.name)
+            except ValueError:
+                continue
+            result.add((ci, cj))
+    return result
+
+
 def _ensure_rgb_array(store_path: Path) -> None:
     """Create the rgb array in a store if it doesn't exist."""
     import zarr
@@ -1884,24 +1911,29 @@ def _run_rgb_generation_parallel(
     for _zn, sp in missing_rgb:
         _ensure_rgb_array(sp)
 
-    # 2. Build chunk indices per zone
+    # 2. Build chunk indices per zone (only shards with data on disk)
     zone_chunk_info: Dict[int, dict] = {}
+    total_skipped = 0
     for zone_num, store_path in missing_rgb:
         import zarr
         store = zarr.open_group(str(store_path), mode="r")
         emb_shape = store["embeddings"].shape
         n_rows = math.ceil(emb_shape[0] / SHARD_SIZE)
         n_cols = math.ceil(emb_shape[1] / SHARD_SIZE)
-        all_indices = [(ci, cj) for ci in range(n_rows) for cj in range(n_cols)]
-        n_sample = max(1, int(len(all_indices) * sample_fraction))
+        total_possible = n_rows * n_cols
+        existing = _nonempty_shard_indices(store_path)
+        data_indices = [(ci, cj) for ci in range(n_rows) for cj in range(n_cols)
+                        if (ci, cj) in existing]
+        total_skipped += total_possible - len(data_indices)
+        n_sample = max(1, int(len(data_indices) * sample_fraction))
         rng = np.random.default_rng(42 + zone_num)
         sample_indices = [
-            all_indices[i]
-            for i in rng.choice(len(all_indices), n_sample, replace=False)
+            data_indices[i]
+            for i in rng.choice(len(data_indices), n_sample, replace=False)
         ]
         zone_chunk_info[zone_num] = {
             "store_path": str(store_path),
-            "all_indices": all_indices,
+            "data_indices": data_indices,
             "sample_indices": sample_indices,
         }
 
@@ -1912,7 +1944,7 @@ def _run_rgb_generation_parallel(
             stretch_items.append((zn, (info["store_path"], ci, cj)))
 
     total_stretch = len(stretch_items)
-    total_rgb = sum(len(info["all_indices"]) for info in zone_chunk_info.values())
+    total_rgb = sum(len(info["data_indices"]) for info in zone_chunk_info.values())
 
     if console is not None:
         from rich.progress import (
@@ -1923,6 +1955,7 @@ def _run_rgb_generation_parallel(
             f"  Sampling stretch ({total_stretch} chunks) "
             f"then writing RGB ({total_rgb} chunks) "
             f"across {len(missing_rgb)} zone(s) with {workers} workers"
+            f" ({total_skipped} empty shards skipped)"
         )
 
     def _run_with_progress(progress=None, stretch_task=None, rgb_task=None):
@@ -1973,7 +2006,7 @@ def _run_rgb_generation_parallel(
             rgb_items = []
             for zn, info in zone_chunk_info.items():
                 st = zone_stretch[zn]
-                for ci, cj in info["all_indices"]:
+                for ci, cj in info["data_indices"]:
                     rgb_items.append((
                         zn, (info["store_path"], ci, cj, st["min"], st["max"]),
                     ))
