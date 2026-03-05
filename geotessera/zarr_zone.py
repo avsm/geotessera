@@ -1788,10 +1788,12 @@ def build_global_preview(
         )
 
     # 2. Generate missing RGB previews (parallelised across zones)
+    #    Check has_rgb_preview attr (not just array existence) because the
+    #    array may exist but be empty from a failed or interrupted build.
     missing_rgb = []
     for zone_num, store_path in sorted(zone_stores.items()):
         store = zarr.open_group(str(store_path), mode="r")
-        if "rgb" not in store:
+        if not store.attrs.get("has_rgb_preview", False):
             missing_rgb.append((zone_num, store_path))
 
     if missing_rgb:
@@ -1825,7 +1827,7 @@ def build_global_preview(
     for zone_num, store_path in sorted(zone_stores.items()):
         store = zarr.open_group(str(store_path), mode="r")
         attrs = dict(store.attrs)
-        if "rgb" not in store:
+        if not attrs.get("has_rgb_preview", False):
             if console is not None:
                 console.print(
                     f"  [yellow]Zone {zone_num}: rgb still missing, skipping[/yellow]"
