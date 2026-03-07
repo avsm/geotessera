@@ -822,6 +822,32 @@ def check_command(args):
 
     checked_tiles = 0
 
+    truncated_files: list = []
+
+    def _check_npy_integrity(path: str) -> Optional[str]:
+        """Verify a .npy file header matches its file size.
+
+        Returns an error message if truncated, None if OK.
+        """
+        try:
+            file_size = os.path.getsize(path)
+            # Read numpy header to get dtype and shape without mmap
+            with open(path, "rb") as f:
+                version = np.lib.format.read_magic(f)
+                shape, fortran, dtype = np.lib.format._read_array_header(f, version)
+                header_size = f.tell()
+            expected_data = int(np.prod(shape)) * dtype.itemsize
+            expected_total = header_size + expected_data
+            if file_size < expected_total:
+                return (
+                    f"truncated: {file_size:,} bytes on disk, "
+                    f"expected {expected_total:,} "
+                    f"(shape={shape}, dtype={dtype})"
+                )
+        except Exception as e:
+            return f"unreadable: {e}"
+        return None
+
     def validate_tile(tile_info: TileInfo):
         """Callback to validate each tile."""
         nonlocal checked_tiles
@@ -832,6 +858,13 @@ def check_command(args):
             raise FileNotFoundError(f"Missing embedding: {tile_info.embedding_path}")
         if not os.path.exists(tile_info.scales_path):
             raise FileNotFoundError(f"Missing scales: {tile_info.scales_path}")
+
+        # Check .npy file integrity (detects truncated downloads)
+        for path in [tile_info.embedding_path, tile_info.scales_path]:
+            if path.endswith(".npy"):
+                err = _check_npy_integrity(path)
+                if err is not None:
+                    truncated_files.append((path, err))
 
         # Verify hashes if requested
         if verify_hashes:
@@ -881,21 +914,48 @@ def check_command(args):
             return 1
 
     # Show results
+    has_errors = len(truncated_files) > 0
     summary_table = Table(show_header=False, box=None)
-    summary_table.add_row("🔍 Tiles checked:", f"{checked_tiles:,}")
-    summary_table.add_row("✅ Status:", "All checks passed")
+    summary_table.add_row("Tiles checked:", f"{checked_tiles:,}")
+    summary_table.add_row("Truncated files:", f"{len(truncated_files):,}")
     if verify_hashes:
-        summary_table.add_row("🔐 Hash verification:", "All hashes verified")
+        summary_table.add_row("Hash verification:", "All hashes verified")
     else:
-        summary_table.add_row("🔐 Hash verification:", "Skipped (use --verify-hashes)")
+        summary_table.add_row("Hash verification:", "Skipped (use --verify-hashes)")
 
-    console.print(
-        Panel(
-            summary_table,
-            title="[bold green]✅ Tessera Structure Check Complete[/bold green]",
-            border_style="green",
+    if has_errors:
+        console.print(
+            Panel(
+                summary_table,
+                title="[bold red]Tessera Structure Check: errors found[/bold red]",
+                border_style="red",
+            )
         )
-    )
+        console.print(
+            f"\n[red]Truncated .npy files ({len(truncated_files)}):[/red]"
+        )
+        for path, err in sorted(truncated_files):
+            console.print(f"  {path}")
+            console.print(f"    [dim]{err}[/dim]")
+
+        # Write truncated files list
+        output_dir = Path(base_dir)
+        truncated_file = output_dir / "truncated_files.txt"
+        with open(truncated_file, "w") as f:
+            for path, err in sorted(truncated_files):
+                f.write(f"{path}\t{err}\n")
+        console.print(
+            f"\n[dim]Truncated file list written to {truncated_file}[/dim]"
+        )
+    else:
+        summary_table.add_row("Status:", "All checks passed")
+        console.print(
+            Panel(
+                summary_table,
+                title="[bold green]Tessera Structure Check Complete[/bold green]",
+                border_style="green",
+            )
+        )
 
     # Display warning summary if there are any skipped directories
     if warnings:
@@ -941,7 +1001,7 @@ def check_command(args):
                 f"[dim]Written {len(missing_scales)} paths to {missing_scales_file}[/dim]"
             )
 
-    return 0
+    return 1 if has_errors else 0
 
 
 def list_command(args):
