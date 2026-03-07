@@ -53,6 +53,7 @@ from .core import GeoTessera, dequantize_embedding
 from . import visualization
 from . import web
 from . import registry
+from . import zarr_zone
 
 try:
     import importlib.metadata
@@ -62,4 +63,4 @@ except importlib.metadata.PackageNotFoundError:
     # Fallback for development installs
     __version__ = "unknown"
 
-__all__ = ["GeoTessera", "dequantize_embedding", "visualization", "web", "registry"]
+__all__ = ["GeoTessera", "dequantize_embedding", "visualization", "web", "registry", "zarr_zone"]

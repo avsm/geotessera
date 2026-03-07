@@ -2523,6 +2523,422 @@ def file_check_command(args):
     return 0
 
 
+def zarr_build_command(args):
+    """Build zone-wide Zarr stores from local tile data."""
+    from .zarr_zone import build_zone_stores, add_rgb_to_existing_store
+    from .registry import Registry
+
+    base_dir = args.base_dir
+    output_dir = args.output_dir or os.path.join(base_dir, "zarr")
+    year = args.year
+
+    # Handle --rgb-only mode: add RGB to existing stores
+    if args.rgb_only:
+        zarr_dir = Path(output_dir)
+        if not zarr_dir.is_dir():
+            console.print(f"[red]Error: directory not found: {zarr_dir}[/red]")
+            return 1
+
+        # Parse zone filter for --rgb-only mode too
+        zone_filter = None
+        if args.zones:
+            try:
+                zone_filter = {int(z.strip()) for z in args.zones.split(",")}
+            except ValueError:
+                console.print("[red]Error: --zones must be comma-separated integers[/red]")
+                return 1
+
+        def _store_matches(p):
+            """Check if a .zarr store name matches the zone filter."""
+            if zone_filter is None:
+                return True
+            # Store names are like utm30_2025.zarr
+            try:
+                zone_num = int(p.name.split("_")[0].replace("utm", ""))
+                return zone_num in zone_filter
+            except (ValueError, IndexError):
+                return True  # include unrecognised names
+
+        zarr_stores = sorted(
+            p for p in zarr_dir.iterdir()
+            if p.is_dir() and p.name.endswith(".zarr") and _store_matches(p)
+        )
+
+        if not zarr_stores:
+            console.print(f"[yellow]No .zarr stores found in {zarr_dir}[/yellow]")
+            return 1
+
+        console.print(
+            f"[bold]Adding RGB preview to existing stores[/bold]\n"
+            f"  Directory: {zarr_dir}\n"
+            f"  Stores: {len(zarr_stores)}"
+        )
+        if zone_filter:
+            console.print(f"  Zones: {', '.join(str(z) for z in sorted(zone_filter))}")
+
+        for store_path in zarr_stores:
+            console.print(f"\n  [cyan]{store_path.name}[/cyan]")
+            add_rgb_to_existing_store(store_path, workers=args.workers, console=console)
+
+        console.print(f"\n[bold green]RGB preview added to {len(zarr_stores)} store(s)[/bold green]")
+        return 0
+
+    # Parse zone filter
+    zone_list = None
+    if args.zones:
+        try:
+            zone_list = [int(z.strip()) for z in args.zones.split(",")]
+        except ValueError:
+            console.print("[red]Error: --zones must be comma-separated integers[/red]")
+            return 1
+
+    console.print(
+        f"[bold]Building zone Zarr stores[/bold]\n"
+        f"  Base dir: {base_dir}\n"
+        f"  Output: {output_dir}\n"
+        f"  Year: {year}"
+    )
+    if zone_list:
+        console.print(f"  Zones: {', '.join(str(z) for z in zone_list)}")
+    if args.dry_run:
+        console.print("  [dim](dry run)[/dim]")
+
+    # Find registry directory: explicit flag, or auto-detect from base_dir
+    registry_dir = args.registry_dir
+    if registry_dir is None:
+        # Search base_dir and its parents for registry.parquet
+        candidate = Path(base_dir)
+        for _ in range(3):  # check base_dir and up to 2 parents
+            if (candidate / "registry.parquet").exists():
+                registry_dir = str(candidate)
+                break
+            candidate = candidate.parent
+        if registry_dir is None:
+            registry_dir = base_dir
+        if registry_dir != base_dir:
+            console.print(f"  Registry: {registry_dir}")
+
+    registry = Registry(
+        version=args.dataset_version,
+        embeddings_dir=base_dir,
+        registry_dir=registry_dir,
+    )
+
+    try:
+        import importlib.metadata
+
+        gt_version = importlib.metadata.version("geotessera")
+    except Exception:
+        gt_version = "unknown"
+
+    created = build_zone_stores(
+        registry=registry,
+        output_dir=Path(output_dir),
+        year=year,
+        zones=zone_list,
+        dry_run=args.dry_run,
+        geotessera_version=gt_version,
+        dataset_version=args.dataset_version,
+        console=console,
+        workers=args.workers,
+    )
+
+    if not args.dry_run and created:
+        console.print(f"\n[bold green]Created {len(created)} Zarr store(s):[/bold green]")
+        for p in created:
+            console.print(f"  {p}")
+    elif not args.dry_run and not created:
+        console.print("[yellow]No stores created (no matching tiles found)[/yellow]")
+
+    return 0
+
+
+def global_preview_command(args):
+    """Build global EPSG:4326 preview store from per-zone UTM stores."""
+    from .zarr_zone import build_global_preview
+
+    zarr_dir = Path(args.zarr_dir)
+    year = args.year
+    num_levels = args.levels
+    num_workers = args.workers
+
+    # Parse zones into list of ints
+    zones = None
+    if args.zones:
+        try:
+            zones = [int(z.strip()) for z in args.zones.split(",")]
+        except ValueError:
+            console.print("[red]Error: --zones must be comma-separated integers[/red]")
+            return 1
+
+    console.print(
+        f"[bold]Building global preview store[/bold]\n"
+        f"  Input:   {zarr_dir}\n"
+        f"  Year:    {year}\n"
+        f"  Levels:  {num_levels}\n"
+        f"  Workers: {num_workers}"
+    )
+    if zones:
+        console.print(f"  Zones:   {', '.join(str(z) for z in zones)}")
+
+    result = build_global_preview(
+        zarr_dir=zarr_dir,
+        year=year,
+        zones=zones,
+        num_levels=num_levels,
+        workers=num_workers,
+        console=console,
+    )
+
+    console.print(f"\n[bold green]Global preview store written to {result}[/bold green]")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# stac-index command
+# ---------------------------------------------------------------------------
+
+
+def _store_bbox_wgs84(attrs: dict) -> list[float]:
+    """Compute the WGS84 bounding box [west, south, east, north] from store attrs.
+
+    Each store covers exactly one UTM zone, so longitude is determined directly
+    from the zone number.  Latitude is derived by reprojecting the northing
+    extremes at the zone's central meridian.
+    """
+    from pyproj import Transformer
+
+    utm_zone = attrs["utm_zone"]
+    west = (utm_zone - 1) * 6 - 180
+    east = utm_zone * 6 - 180
+
+    transform = attrs["transform"]
+    pixel_size = transform[0]
+    origin_northing = transform[5]
+    height_px = attrs["grid_height"]
+    epsg = attrs["crs_epsg"]
+
+    n_max = origin_northing
+    n_min = origin_northing - height_px * pixel_size
+
+    # Reproject northing at the central meridian (500 000 m false easting)
+    transformer = Transformer.from_crs(f"EPSG:{epsg}", "EPSG:4326", always_xy=True)
+    _, lats = transformer.transform([500_000, 500_000], [n_min, n_max])
+
+    return [west, min(lats), east, max(lats)]
+
+
+def _zarr_store_to_stac_item(
+    store_path: Path, zarr_dir: Path
+):
+    """Open a single Zarr store and return a pystac Item, or None on failure."""
+    import zarr
+    import pystac
+    from datetime import datetime, timezone
+
+    try:
+        store = zarr.open_group(str(store_path), mode="r")
+        attrs = dict(store.attrs)
+    except Exception as e:
+        logger.warning("Skipping %s: cannot open (%s)", store_path.name, e)
+        return None
+
+    # Required attributes
+    required = ["utm_zone", "crs_epsg", "transform", "year"]
+    missing = [k for k in required if k not in attrs]
+    if missing:
+        logger.warning("Skipping %s: missing attrs %s", store_path.name, missing)
+        return None
+
+    # Read grid dimensions from the scales array
+    try:
+        scales_shape = store["scales"].shape
+        attrs["grid_height"] = scales_shape[0]
+        attrs["grid_width"] = scales_shape[1]
+    except Exception as e:
+        logger.warning("Skipping %s: cannot read scales shape (%s)", store_path.name, e)
+        return None
+
+    # Compute bounding box
+    try:
+        bbox = _store_bbox_wgs84(attrs)
+    except Exception as e:
+        logger.warning("Skipping %s: bbox computation failed (%s)", store_path.name, e)
+        return None
+
+    year = attrs["year"]
+    item_id = store_path.name.removesuffix(".zarr")
+    dt = datetime(year, 1, 1, tzinfo=timezone.utc)
+
+    # Build WGS84 polygon from bbox
+    west, south, east, north = bbox
+    geometry = {
+        "type": "Polygon",
+        "coordinates": [[
+            [west, south],
+            [east, south],
+            [east, north],
+            [west, north],
+            [west, south],
+        ]],
+    }
+
+    # Determine number of bands
+    try:
+        n_bands = store["embeddings"].shape[2]
+    except Exception:
+        n_bands = 128
+
+    properties = {
+        "utm_zone": attrs["utm_zone"],
+        "crs_epsg": attrs["crs_epsg"],
+        "pixel_size_m": attrs.get("pixel_size_m", attrs["transform"][0]),
+        "grid_width": attrs["grid_width"],
+        "grid_height": attrs["grid_height"],
+        "n_bands": n_bands,
+        "has_rgb_preview": attrs.get("has_rgb_preview", False),
+        "geotessera_version": attrs.get("geotessera_version", "unknown"),
+    }
+
+    item = pystac.Item(
+        id=item_id,
+        geometry=geometry,
+        bbox=bbox,
+        datetime=dt,
+        properties=properties,
+    )
+
+    # Asset href is a placeholder — will be updated in stac_index_command
+    # once we know the item's JSON output location
+    item.add_asset(
+        "zarr",
+        pystac.Asset(
+            href=store_path.name,
+            media_type="application/x-zarr-v3",
+            roles=["data"],
+            title="Zarr v3 embedding store",
+        ),
+    )
+
+    return item
+
+
+def stac_index_command(args):
+    """Scan a directory of Zarr stores and generate a static STAC catalog."""
+    import pystac
+    from datetime import datetime, timezone
+
+    zarr_dir = Path(args.zarr_dir).resolve()
+    output_dir = Path(args.output_dir).resolve() if args.output_dir else zarr_dir
+
+    if not zarr_dir.is_dir():
+        console.print(f"[red]Error:[/red] {zarr_dir} is not a directory")
+        return 1
+
+    # Discover .zarr stores matching utm{ZZ}_{YYYY}.zarr
+    import re
+    store_pattern = re.compile(r"^utm(\d{2})_(\d{4})\.zarr$")
+    store_paths = sorted(
+        p for p in zarr_dir.iterdir()
+        if p.is_dir() and store_pattern.match(p.name)
+    )
+
+    if not store_paths:
+        console.print(f"[red]Error:[/red] No utm*_*.zarr stores found in {zarr_dir}")
+        return 1
+
+    console.print(f"Found {len(store_paths)} Zarr store(s) in {zarr_dir}")
+
+    # Build items grouped by year
+    items_by_year: dict[int, list["pystac.Item"]] = defaultdict(list)
+    skipped = 0
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Reading store metadata", total=len(store_paths))
+        for sp in store_paths:
+            item = _zarr_store_to_stac_item(sp, zarr_dir)
+            if item is not None:
+                year = item.datetime.year
+                # Fix asset href to be relative to the item's JSON location
+                # Item JSON will be at: output_dir/geotessera-{year}/{item.id}/{item.id}.json
+                item_json_dir = output_dir / f"geotessera-{year}" / item.id
+                zarr_asset = item.assets["zarr"]
+                zarr_asset.href = os.path.relpath(sp, item_json_dir)
+                items_by_year[year].append(item)
+            else:
+                skipped += 1
+            progress.advance(task)
+
+    if not items_by_year:
+        console.print("[red]Error:[/red] No valid stores found")
+        return 1
+
+    if skipped:
+        console.print(f"[yellow]Skipped {skipped} store(s) with errors[/yellow]")
+
+    # Create root catalog
+    catalog = pystac.Catalog(
+        id="geotessera",
+        title="Geotessera Embedding Stores",
+        description="Static STAC catalog of Geotessera Zarr v3 embedding stores",
+    )
+
+    # Create one collection per year
+    for year in sorted(items_by_year):
+        items = items_by_year[year]
+
+        # Union bounding box
+        all_bboxes = [it.bbox for it in items]
+        extent_bbox = [
+            min(b[0] for b in all_bboxes),
+            min(b[1] for b in all_bboxes),
+            max(b[2] for b in all_bboxes),
+            max(b[3] for b in all_bboxes),
+        ]
+
+        spatial_extent = pystac.SpatialExtent(bboxes=[extent_bbox])
+        temporal_extent = pystac.TemporalExtent(intervals=[
+            [
+                datetime(year, 1, 1, tzinfo=timezone.utc),
+                datetime(year, 12, 31, 23, 59, 59, tzinfo=timezone.utc),
+            ]
+        ])
+
+        collection = pystac.Collection(
+            id=f"geotessera-{year}",
+            title=f"Geotessera {year}",
+            description=f"Geotessera embedding stores for {year}",
+            extent=pystac.Extent(spatial=spatial_extent, temporal=temporal_extent),
+        )
+
+        for item in items:
+            collection.add_item(item)
+
+        catalog.add_child(collection)
+
+    # Normalize hrefs and save
+    catalog.normalize_hrefs(str(output_dir))
+    catalog.save(catalog_type=pystac.CatalogType.SELF_CONTAINED)
+
+    # Summary
+    total_items = sum(len(v) for v in items_by_year.values())
+    console.print(
+        f"\n{emoji('✅ ')}STAC catalog written to {output_dir}\n"
+        f"  {len(items_by_year)} collection(s), {total_items} item(s)"
+    )
+    for year in sorted(items_by_year):
+        zones = sorted(it.properties["utm_zone"] for it in items_by_year[year])
+        console.print(f"  {year}: UTM zones {zones}")
+
+    return 0
+
+
 def main():
     """Main entry point for the geotessera-registry CLI tool."""
     # Configure logging with rich handler
@@ -2754,6 +3170,104 @@ Directory Structure:
     )
     file_scan_parser.set_defaults(func=file_scan_command)
 
+    # Zarr-build command
+    zarr_build_parser = subparsers.add_parser(
+        "zarr-build",
+        help="Build zone-wide Zarr stores from local tile data",
+    )
+    zarr_build_parser.add_argument(
+        "base_dir",
+        help="Base directory containing downloaded tile data "
+        "(global_0.1_degree_representation/ and global_0.1_degree_tiff_all/)",
+    )
+    zarr_build_parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Output directory for Zarr stores (default: BASE_DIR/zarr)",
+    )
+    zarr_build_parser.add_argument(
+        "--year",
+        type=int,
+        default=2024,
+        help="Year of embeddings to build (default: 2024)",
+    )
+    zarr_build_parser.add_argument(
+        "--zones",
+        type=str,
+        default=None,
+        help="Comma-separated UTM zone numbers to build (e.g., '30' or '30,31'). "
+        "Useful for testing a single zone.",
+    )
+    zarr_build_parser.add_argument(
+        "--dataset-version",
+        type=str,
+        default="v1",
+        help="Tessera dataset version (default: v1)",
+    )
+    zarr_build_parser.add_argument(
+        "--registry-dir",
+        type=str,
+        default=None,
+        help="Directory containing registry.parquet and landmasks.parquet "
+        "(default: auto-detected from base_dir)",
+    )
+    zarr_build_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show zone breakdown without building stores",
+    )
+    zarr_build_parser.add_argument(
+        "--workers",
+        "-j",
+        type=int,
+        default=None,
+        help="Number of threads for parallel I/O (default: cpu_count, max 16)",
+    )
+    zarr_build_parser.add_argument(
+        "--rgb-only",
+        action="store_true",
+        help="Add RGB preview to existing stores without rebuilding "
+        "(scans existing .zarr stores in output dir)",
+    )
+    zarr_build_parser.set_defaults(func=zarr_build_command)
+
+    # Global-preview command
+    global_preview_parser = subparsers.add_parser(
+        "global-preview",
+        help="Build global EPSG:4326 preview store from per-zone UTM stores",
+    )
+    global_preview_parser.add_argument(
+        "zarr_dir",
+        type=Path,
+        help="Directory containing utm*_YYYY.zarr stores",
+    )
+    global_preview_parser.add_argument(
+        "--year",
+        type=int,
+        default=2025,
+        help="Year to process (default: 2025)",
+    )
+    global_preview_parser.add_argument(
+        "--zones",
+        type=str,
+        default=None,
+        help="Comma-separated UTM zones to include (default: all)",
+    )
+    global_preview_parser.add_argument(
+        "--levels",
+        type=int,
+        default=10,
+        help="Number of multiscale levels (default: 10)",
+    )
+    global_preview_parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Number of parallel reprojection workers (default: 4)",
+    )
+    global_preview_parser.set_defaults(func=global_preview_command)
+
     # File-check command
     file_check_parser = subparsers.add_parser(
         "file-check",
@@ -2765,6 +3279,23 @@ Directory Structure:
         help="Parquet files to check for duplicates (output from file-scan command)",
     )
     file_check_parser.set_defaults(func=file_check_command)
+
+    # Stac-index command
+    stac_index_parser = subparsers.add_parser(
+        "stac-index",
+        help="Generate a static STAC catalog from a directory of Zarr stores",
+    )
+    stac_index_parser.add_argument(
+        "zarr_dir",
+        help="Directory containing utm*_*.zarr stores",
+    )
+    stac_index_parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Output directory for STAC JSON files (default: same as zarr_dir)",
+    )
+    stac_index_parser.set_defaults(func=stac_index_command)
 
     args = parser.parse_args()
 

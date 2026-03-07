@@ -37,7 +37,11 @@ dependencies = [
     "xarray",
     "rioxarray",
     "zarr",
-    "dask"
+    "dask",
+    "pystac",
+    "ndpyramid",
+    "topozarr>=0.0.4",
+    "xproj>=0.2.1",
 ]
 
 [project.urls]

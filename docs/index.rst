@@ -19,7 +19,10 @@ Key Features
 ------------
 
 * **Global Coverage**: Access embeddings for any terrestrial location worldwide where data exists
-* **Flexible Formats**: Export as numpy arrays for analysis or GeoTIFF for GIS integration
+* **Flexible Formats**: Export as numpy arrays, GeoTIFF, or Zarr for GIS and cloud workflows
+* **Zone-Wide Zarr Stores**: Consolidate tiles into sharded Zarr v3 stores for efficient spatial access
+* **Global RGB Previews**: Build multiscale EPSG:4326 preview pyramids from zone stores
+* **STAC Catalogs**: Generate static STAC catalogs for standardised metadata and discovery
 * **Projection Preservation**: Native UTM projections preserved from landmask tiles
 * **High Resolution**: 10m spatial resolution
 * **Temporal Compression**: Full year of satellite observations in each embedding
@@ -65,6 +68,9 @@ Download embeddings in your preferred format::
     # Download as quantized numpy arrays (for analysis, includes scales and landmask TIFFs)
     geotessera download --bbox "-0.2,51.4,0.1,51.6" --format npy --year 2024 --output ./london_arrays
     # NPY format includes: quantized .npy, _scales.npy, and landmask .tiff files
+
+    # Download as Zarr (cloud-native format for chunked access)
+    geotessera download --bbox "-0.2,51.4,0.1,51.6" --format zarr --year 2024 --output ./london_zarr
 
     # Download by country name with precise boundary filtering
     geotessera download --country "United Kingdom" --year 2024 --output ./uk_tiles
@@ -180,7 +186,21 @@ Data Flow
         ↓
     Output Format
         ├── NumPy arrays → Direct analysis
-        └── GeoTIFF → GIS integration
+        ├── GeoTIFF → GIS integration
+        └── Zarr → Cloud-native access
+
+    Zone-Wide Zarr Stores (geotessera-registry)
+        ↓
+    Group tiles by UTM zone
+        ↓
+    Sharded Zarr v3 store per zone
+        ├── embeddings  (int8, H×W×128)
+        ├── scales      (float32, H×W)
+        └── rgb         (uint8, H×W×4, optional)
+        ↓
+    Global EPSG:4326 RGB preview pyramid
+        ↓
+    STAC catalog for discovery
 
 **Storage Note**: Only the Parquet registry (~few MB) is cached locally. All embedding data
 is downloaded on-demand to temporary files and immediately cleaned up, resulting in zero
@@ -203,6 +223,62 @@ The registry can be loaded from multiple sources:
 2. **Local file** (via ``--registry-path`` parameter)
 3. **Local directory** (via ``--registry-dir`` parameter, looks for ``registry.parquet``)
 4. **Custom URL** (via ``--registry-url`` parameter)
+
+Zone-Wide Zarr Stores
+---------------------
+
+For large-scale processing, GeoTessera can consolidate per-tile embeddings
+into zone-wide Zarr v3 stores.  Each store covers one UTM zone for one year
+and uses sharded arrays for efficient cloud-native access.
+
+**Store Layout**::
+
+    utm{zone:02d}_{year}.zarr/
+        embeddings        # int8    (H, W, 128)  shards=(256,256,128)
+        scales            # float32 (H, W)       shards=(256,256)
+        rgb               # uint8   (H, W, 4)    shards=(256,256,4)   [optional]
+        easting           # float64 coordinate array
+        northing          # float64 coordinate array
+        band              # int32   coordinate array
+
+**Key Design Decisions**:
+
+* **Sharding**: 256x256 pixel shards aligned to tile boundaries, with 4x4
+  inner chunks.  This allows single-pixel HTTP range lookups (~2KB each)
+  while keeping the file count manageable.
+* **Compression**: Zstd via Blosc for all arrays.
+* **NaN masking**: Water and no-coverage pixels are indicated by NaN in
+  the ``scales`` array.  Embeddings at NaN-scales pixels are zeroed.
+* **Coordinate system**: Each store uses its zone's canonical northern-hemisphere
+  UTM EPSG code.  Southern hemisphere tiles are shifted to a continuous
+  northing axis by subtracting the 10,000,000 m false northing.
+
+**Building Zone Stores**::
+
+    # Build stores (shard-first parallel writes)
+    geotessera-registry zarr-build /data/tessera --year 2024
+
+    # Add RGB false-colour preview to existing stores
+    geotessera-registry zarr-build /data/tessera --rgb-only
+
+    # Build global EPSG:4326 preview pyramid
+    geotessera-registry global-preview /data/zarr --year 2024
+
+    # Generate STAC catalog
+    geotessera-registry stac-index /data/zarr
+
+**Reading from Python**::
+
+    from geotessera.zarr_zone import read_region_from_zone, open_zone_store
+
+    # Read a spatial subset (UTM coordinates)
+    embeddings, scales, attrs = read_region_from_zone(
+        'utm30_2024.zarr',
+        bbox=(500000, 5700000, 510000, 5710000),
+    )
+
+    # Open as xarray Dataset
+    ds = open_zone_store('utm30_2024.zarr')
 
 Understanding Tessera Embeddings
 --------------------------------

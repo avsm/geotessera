@@ -509,6 +509,169 @@ Use Zarr format for efficient cloud-based analysis::
     # Zarr's chunked storage allows reading only needed data
     # ideal for large-scale cloud-based workflows
 
+Zone-Wide Zarr Store Workflow
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Build consolidated Zarr v3 stores that merge all tiles in a UTM zone into
+a single store per year.  This enables efficient spatial subsetting and
+cloud-native access via HTTP range requests::
+
+    # 1. Download tiles (NPY format is the source for zone stores)
+    geotessera download \
+        --country "United Kingdom" \
+        --format npy \
+        --year 2024 \
+        --output ./uk_tiles
+
+    # 2. Build zone-wide Zarr stores (one per UTM zone)
+    geotessera-registry zarr-build ./uk_tiles \
+        --output-dir ./uk_zarr \
+        --year 2024
+
+    # 3. Build a global EPSG:4326 RGB preview pyramid
+    geotessera-registry global-preview ./uk_zarr --year 2024
+
+    # 4. Generate a STAC catalog for the stores
+    geotessera-registry stac-index ./uk_zarr
+
+    # 5. Read a spatial subset from the zone store (Python)
+    # from geotessera.zarr_zone import read_region_from_zone
+    # embeddings, scales, attrs = read_region_from_zone(
+    #     'uk_zarr/utm30_2024.zarr',
+    #     bbox=(500000, 5700000, 510000, 5710000),
+    # )
+
+Registry CLI (geotessera-registry)
+----------------------------------
+
+The ``geotessera-registry`` tool is used by data maintainers to build
+registries, zone-wide Zarr stores, and previews.
+
+zarr-build
+~~~~~~~~~~
+
+Build zone-wide Zarr v3 stores from downloaded tile data.
+
+**Usage**::
+
+    geotessera-registry zarr-build BASE_DIR [OPTIONS]
+
+**Required Arguments**:
+
+* ``BASE_DIR`` - Base directory containing downloaded tile data
+
+**Options**:
+
+* ``--output-dir PATH`` - Output directory for Zarr stores (default: BASE_DIR/zarr)
+* ``--year INT`` - Year of embeddings to build (default: 2024)
+* ``--zones TEXT`` - Comma-separated UTM zone numbers (e.g., '30' or '30,31')
+* ``--dataset-version TEXT`` - Tessera dataset version (default: v1)
+* ``--registry-dir PATH`` - Directory containing registry.parquet (auto-detected)
+* ``--dry-run`` - Show zone breakdown without building stores
+* ``-j, --workers INT`` - Number of parallel workers (default: cpu_count, max 16)
+* ``--rgb-only`` - Add RGB preview to existing stores without rebuilding
+
+**Examples**::
+
+    # Build all zones for 2024
+    geotessera-registry zarr-build /data/tessera --year 2024
+
+    # Build only UTM zone 30 (for testing)
+    geotessera-registry zarr-build /data/tessera --zones 30 --year 2024
+
+    # Preview what would be built (dry run)
+    geotessera-registry zarr-build /data/tessera --dry-run --year 2024
+
+    # Add RGB preview to existing stores
+    geotessera-registry zarr-build /data/tessera --rgb-only --year 2024
+
+**Output Store Layout**:
+
+Each output store is a Zarr v3 directory::
+
+    utm{zone:02d}_{year}.zarr/
+        embeddings        # int8    (H, W, 128)  sharded (256x256x128)
+        scales            # float32 (H, W)       sharded (256x256)
+        rgb               # uint8   (H, W, 4)    sharded (256x256x4)   [optional]
+        easting           # float64 (W,)         coordinate array
+        northing          # float64 (H,)         coordinate array
+        band              # int32   (128,)        coordinate array
+
+Sharding uses 256x256 pixel shards with 4x4 inner chunks, enabling
+efficient single-pixel lookups (~2KB per HTTP range request).
+
+global-preview
+~~~~~~~~~~~~~~
+
+Build a global EPSG:4326 RGB preview pyramid from per-zone UTM stores.
+
+**Usage**::
+
+    geotessera-registry global-preview ZARR_DIR [OPTIONS]
+
+**Required Arguments**:
+
+* ``ZARR_DIR`` - Directory containing utm*_YYYY.zarr stores
+
+**Options**:
+
+* ``--year INT`` - Year to process (default: 2025)
+* ``--zones TEXT`` - Comma-separated UTM zones to include (default: all)
+* ``--levels INT`` - Number of multiscale levels (default: 10)
+* ``--workers INT`` - Number of parallel reprojection workers (default: 4)
+
+**Examples**::
+
+    # Build global preview from all zone stores
+    geotessera-registry global-preview /data/zarr --year 2024
+
+    # Build with more workers for faster processing
+    geotessera-registry global-preview /data/zarr --year 2024 --workers 8
+
+    # Build only for specific zones
+    geotessera-registry global-preview /data/zarr --year 2024 --zones 30,31
+
+**Output**:
+
+Creates ``global_rgb_{year}.zarr`` in the input directory with multiscale
+pyramid levels.  The store uses EPSG:4326 coordinates and includes
+consolidated metadata with ``multiscales`` and ``spatial`` attributes,
+compatible with the topozarr standard.
+
+stac-index
+~~~~~~~~~~
+
+Generate a static STAC catalog from a directory of Zarr stores.
+
+**Usage**::
+
+    geotessera-registry stac-index ZARR_DIR [OPTIONS]
+
+**Required Arguments**:
+
+* ``ZARR_DIR`` - Directory containing utm*_*.zarr stores
+
+**Options**:
+
+* ``--output-dir PATH`` - Output directory for STAC JSON files (default: same as ZARR_DIR)
+
+**Examples**::
+
+    # Generate STAC catalog
+    geotessera-registry stac-index /data/zarr
+
+    # Generate to a separate output directory
+    geotessera-registry stac-index /data/zarr --output-dir /data/stac
+
+**Output**:
+
+Creates a self-contained STAC catalog with one collection per year.
+Each Zarr store becomes a STAC item with:
+
+* WGS84 bounding box derived from UTM zone geometry
+* Zarr v3 asset with relative path to the store
+* Properties including UTM zone, EPSG code, pixel size, and grid dimensions
+
 Troubleshooting
 ---------------
 
