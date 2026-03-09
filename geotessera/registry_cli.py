@@ -2712,11 +2712,11 @@ def _store_bbox_wgs84(attrs: dict) -> list[float]:
     west = (utm_zone - 1) * 6 - 180
     east = utm_zone * 6 - 180
 
-    transform = attrs["transform"]
+    transform = attrs["spatial:transform"]
     pixel_size = transform[0]
     origin_northing = transform[5]
     height_px = attrs["grid_height"]
-    epsg = attrs["crs_epsg"]
+    epsg = int(attrs["proj:code"].split(":")[1])
 
     n_max = origin_northing
     n_min = origin_northing - height_px * pixel_size
@@ -2744,7 +2744,7 @@ def _zarr_store_to_stac_item(
         return None
 
     # Required attributes
-    required = ["utm_zone", "crs_epsg", "transform", "year"]
+    required = ["utm_zone", "proj:code", "spatial:transform", "year"]
     missing = [k for k in required if k not in attrs]
     if missing:
         logger.warning("Skipping %s: missing attrs %s", store_path.name, missing)
@@ -2791,8 +2791,8 @@ def _zarr_store_to_stac_item(
 
     properties = {
         "utm_zone": attrs["utm_zone"],
-        "crs_epsg": attrs["crs_epsg"],
-        "pixel_size_m": attrs.get("pixel_size_m", attrs["transform"][0]),
+        "proj:code": attrs["proj:code"],
+        "pixel_size_m": attrs.get("pixel_size_m", attrs["spatial:transform"][0]),
         "grid_width": attrs["grid_width"],
         "grid_height": attrs["grid_height"],
         "n_bands": n_bands,
@@ -2936,6 +2936,62 @@ def stac_index_command(args):
         zones = sorted(it.properties["utm_zone"] for it in items_by_year[year])
         console.print(f"  {year}: UTM zones {zones}")
 
+    return 0
+
+
+def zarr_migrate_attrs_command(args):
+    """Migrate existing Zarr store attrs to GeoZarr convention format."""
+    from .zarr_zone import migrate_store_attrs
+
+    zarr_dir = Path(args.zarr_dir)
+    if not zarr_dir.is_dir():
+        console.print(f"[red]Error: {zarr_dir} is not a directory[/red]")
+        return 1
+
+    # Find all .zarr stores (zone stores only, not global)
+    stores = sorted(
+        p for p in zarr_dir.iterdir()
+        if p.is_dir() and p.name.endswith(".zarr") and not p.name.startswith("global_")
+    )
+
+    if not stores:
+        console.print(f"[yellow]No .zarr stores found in {zarr_dir}[/yellow]")
+        return 1
+
+    action = "Would migrate" if args.dry_run else "Migrating"
+    console.print(
+        f"[bold]{action} {len(stores)} store(s) in {zarr_dir}[/bold]"
+    )
+    if args.dry_run:
+        console.print("[dim](dry run — no changes will be made)[/dim]")
+
+    migrated = 0
+    skipped = 0
+    for store_path in stores:
+        result = migrate_store_attrs(store_path, dry_run=args.dry_run)
+        status = result.pop("status")
+        if status == "already_migrated":
+            console.print(f"  {store_path.name}: [dim]already migrated[/dim]")
+            skipped += 1
+        else:
+            removed = result.pop("_removed", [])
+            console.print(f"  {store_path.name}: [green]{status}[/green]")
+            for key, value in sorted(result.items()):
+                if key == "zarr_conventions":
+                    names = [c["name"] for c in value]
+                    console.print(f"    + zarr_conventions: {names}")
+                elif key == "proj:wkt2":
+                    console.print(f"    + proj:wkt2: [dim](WKT2 string)[/dim]")
+                else:
+                    console.print(f"    + {key}: {value}")
+            for key in removed:
+                console.print(f"    - {key}")
+            migrated += 1
+
+    console.print(
+        f"\n[bold]{'Would migrate' if args.dry_run else 'Migrated'}: "
+        f"{migrated}, skipped: {skipped}[/bold]"
+    )
     return 0
 
 
@@ -3296,6 +3352,22 @@ Directory Structure:
         help="Output directory for STAC JSON files (default: same as zarr_dir)",
     )
     stac_index_parser.set_defaults(func=stac_index_command)
+
+    # zarr-migrate-attrs command
+    migrate_parser = subparsers.add_parser(
+        "zarr-migrate-attrs",
+        help="Migrate existing Zarr store attributes to GeoZarr convention format",
+    )
+    migrate_parser.add_argument(
+        "zarr_dir",
+        help="Directory containing .zarr stores to migrate",
+    )
+    migrate_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would change without modifying stores",
+    )
+    migrate_parser.set_defaults(func=zarr_migrate_attrs_command)
 
     args = parser.parse_args()
 

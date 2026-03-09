@@ -278,7 +278,7 @@ class Tile:
         store = zarr.open_group(str(self._zone_store_path), mode="r")
         attrs = dict(store.attrs)
 
-        transform_list = attrs["transform"]
+        transform_list = attrs["spatial:transform"]
         pixel_size = transform_list[0]
         origin_easting = transform_list[2]
         origin_northing = transform_list[5]

@@ -54,6 +54,105 @@ GLOBAL_BATCH_CHUNK_ROWS = 64  # chunk-rows per dask compute batch
 SHARD_SIZE = 256   # shard spatial dimension (pixels), aligned to tile size
 INNER_CHUNK = 4    # inner chunk spatial dimension (pixels)
 
+# GeoZarr convention registration entries
+PROJ_CONVENTION = {
+    "schema_url": "https://raw.githubusercontent.com/zarr-conventions/geo-proj/refs/tags/v1/schema.json",
+    "spec_url": "https://github.com/zarr-conventions/geo-proj/blob/v1/README.md",
+    "uuid": "f17cb550-5864-4468-aeb7-f3180cfb622f",
+    "name": "proj:",
+    "description": "Coordinate reference system information for geospatial data",
+}
+SPATIAL_CONVENTION = {
+    "schema_url": "https://raw.githubusercontent.com/zarr-conventions/spatial/refs/tags/v1/schema.json",
+    "spec_url": "https://github.com/zarr-conventions/spatial/blob/v1/README.md",
+    "uuid": "689b58e2-cf7b-45e0-9fff-9cfc0883d6b4",
+    "name": "spatial:",
+    "description": "Spatial coordinate transformations and mappings",
+}
+MULTISCALES_CONVENTION = {
+    "schema_url": "https://raw.githubusercontent.com/zarr-conventions/multiscales/refs/tags/v1/schema.json",
+    "spec_url": "https://github.com/zarr-conventions/multiscales/blob/v1/README.md",
+    "uuid": "d35379db-88df-4056-af3a-620245f8e347",
+    "name": "multiscales",
+    "description": "Multiscale layout of zarr datasets",
+}
+
+
+def migrate_store_attrs(store_path: "Path", dry_run: bool = False) -> dict:
+    """Migrate a zone store's attrs from legacy keys to GeoZarr convention keys.
+
+    Rewrites in-place. Idempotent — skips stores that already have convention keys.
+
+    Returns a dict summarising what was changed (or would be changed if dry_run).
+    """
+    import zarr
+
+    store = zarr.open_group(str(store_path), mode="r" if dry_run else "r+")
+    attrs = dict(store.attrs)
+    changes = {}
+
+    # Skip if already migrated
+    if "proj:code" in attrs and "spatial:transform" in attrs:
+        return {"status": "already_migrated"}
+
+    # --- proj: convention ---
+    epsg = attrs.get("crs_epsg")
+    crs_wkt = attrs.get("crs_wkt", "")
+    if epsg is not None:
+        changes["proj:code"] = f"EPSG:{epsg}"
+    if crs_wkt:
+        changes["proj:wkt2"] = crs_wkt
+    elif epsg is not None:
+        # Generate WKT2 from EPSG code
+        try:
+            from pyproj import CRS
+            changes["proj:wkt2"] = CRS.from_epsg(epsg).to_wkt()
+        except Exception:
+            pass
+
+    # --- spatial: convention ---
+    transform = attrs.get("transform")
+    if transform is not None:
+        changes["spatial:transform"] = list(transform)
+        changes["spatial:dimensions"] = ["northing", "easting"]
+        changes["spatial:registration"] = "pixel"
+
+        pixel_size = transform[0]
+        origin_easting = transform[2]
+        origin_northing = transform[5]
+
+        # Compute shape from the scales array
+        try:
+            scales_shape = store["scales"].shape
+            height_px, width_px = scales_shape[0], scales_shape[1]
+            changes["spatial:shape"] = [height_px, width_px]
+            # Compute bbox
+            easting_min = origin_easting
+            easting_max = origin_easting + width_px * pixel_size
+            northing_max = origin_northing
+            northing_min = origin_northing - height_px * pixel_size
+            changes["spatial:bbox"] = [
+                easting_min, northing_min, easting_max, northing_max,
+            ]
+        except Exception:
+            pass
+
+    # --- Convention registration ---
+    changes["zarr_conventions"] = [PROJ_CONVENTION, SPATIAL_CONVENTION]
+
+    # --- Remove legacy keys ---
+    legacy_keys = ["crs_epsg", "crs_wkt", "transform"]
+
+    if not dry_run:
+        store.attrs.update(changes)
+        for key in legacy_keys:
+            if key in attrs:
+                del store.attrs[key]
+
+    changes["_removed"] = [k for k in legacy_keys if k in attrs]
+    changes["status"] = "migrated"
+    return changes
+
 
 # =============================================================================
 # Data types
@@ -482,15 +581,30 @@ def create_zone_store(
     except ImportError:
         crs_wkt = ""
 
+    # Compute spatial:bbox from the grid extent
+    easting_min = zone_grid.origin_easting
+    easting_max = zone_grid.origin_easting + zone_grid.width_px * zone_grid.pixel_size
+    northing_max = zone_grid.origin_northing
+    northing_min = zone_grid.origin_northing - zone_grid.height_px * zone_grid.pixel_size
+
     store.attrs.update({
-        "utm_zone": zone_grid.zone,
-        "year": zone_grid.year,
-        "crs_epsg": zone_grid.canonical_epsg,
-        "crs_wkt": crs_wkt,
-        "transform": [
+        # Convention registration
+        "zarr_conventions": [PROJ_CONVENTION, SPATIAL_CONVENTION],
+        # proj: convention
+        "proj:code": f"EPSG:{zone_grid.canonical_epsg}",
+        "proj:wkt2": crs_wkt,
+        # spatial: convention
+        "spatial:dimensions": ["northing", "easting"],
+        "spatial:transform": [
             zone_grid.pixel_size, 0.0, zone_grid.origin_easting,
             0.0, -zone_grid.pixel_size, zone_grid.origin_northing,
         ],
+        "spatial:shape": [zone_grid.height_px, zone_grid.width_px],
+        "spatial:bbox": [easting_min, northing_min, easting_max, northing_max],
+        "spatial:registration": "pixel",
+        # Application-specific metadata (not part of conventions)
+        "utm_zone": zone_grid.zone,
+        "year": zone_grid.year,
         "pixel_size_m": zone_grid.pixel_size,
         "geotessera_version": geotessera_version,
         "tessera_dataset_version": dataset_version,
@@ -1163,8 +1277,8 @@ def _utm_array_to_xarray(
     dask_arr = da.from_zarr(arr)  # (northing, easting, band)
 
     store_attrs = dict(store.attrs)
-    transform = list(store_attrs["transform"])
-    epsg = int(store_attrs["crs_epsg"])
+    transform = list(store_attrs["spatial:transform"])
+    epsg = int(store_attrs["proj:code"].split(":")[1])
 
     pixel_size = transform[0]
     origin_e = transform[2]
@@ -1223,7 +1337,7 @@ def read_region_from_zone(
     store = zarr.open_group(str(path), mode="r")
     attrs = dict(store.attrs)
 
-    transform = attrs["transform"]
+    transform = attrs["spatial:transform"]
     pixel_size = transform[0]
     origin_easting = transform[2]
     origin_northing = transform[5]
@@ -1312,12 +1426,27 @@ def _ensure_global_store(store_path: Path, num_levels: int) -> None:
     from topozarr.metadata import create_multiscale_metadata
     actual_levels = len([k for k in root.keys() if k.isdigit()])
     ms_attrs = create_multiscale_metadata(actual_levels, "EPSG:4326", "mean")
-    ms_attrs["multiscales"]["crs"] = "EPSG:4326"
+    # topozarr already sets zarr_conventions with multiscales + proj:, and sets proj:code
+    # Add spatial: convention to the registration list
+    if "zarr_conventions" in ms_attrs:
+        ms_attrs["zarr_conventions"].append(SPATIAL_CONVENTION)
+    else:
+        ms_attrs["zarr_conventions"] = [
+            MULTISCALES_CONVENTION, PROJ_CONVENTION, SPATIAL_CONVENTION,
+        ]
+    # Add spatial: convention attributes
     west, south, east, north = GLOBAL_BOUNDS
-    ms_attrs["spatial"] = {
-        "bounds": [west, south, east, north],
-        "resolution": GLOBAL_BASE_RES,
-    }
+    ms_attrs["spatial:dimensions"] = ["lat", "lon"]
+    ms_attrs["spatial:bbox"] = [west, south, east, north]
+    # Inject spatial:shape and spatial:transform into each multiscale layout item
+    h_lvl, w_lvl = GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W
+    res = GLOBAL_BASE_RES
+    for item in ms_attrs.get("multiscales", {}).get("layout", []):
+        item["spatial:shape"] = [h_lvl, w_lvl]
+        item["spatial:transform"] = [res, 0.0, west, 0.0, -res, north]
+        h_lvl //= 2
+        w_lvl //= 2
+        res *= 2.0
     root.attrs.update(ms_attrs)
     import warnings
     with warnings.catch_warnings():
@@ -2082,8 +2211,8 @@ def build_global_preview(
             continue
         zone_infos[zone_num] = {
             "store_path": store_path,
-            "epsg": int(attrs["crs_epsg"]),
-            "transform": list(attrs["transform"]),
+            "epsg": int(attrs["proj:code"].split(":")[1]),
+            "transform": list(attrs["spatial:transform"]),
             "shape": store["rgb"].shape,
         }
 
