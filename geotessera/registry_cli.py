@@ -2688,6 +2688,7 @@ def global_preview_command(args):
         num_levels=num_levels,
         workers=num_workers,
         console=console,
+        force=args.force,
     )
 
     console.print(f"\n[bold green]Global preview store written to {result}[/bold green]")
@@ -3321,6 +3322,11 @@ Directory Structure:
         type=int,
         default=4,
         help="Number of parallel reprojection workers (default: 4)",
+    )
+    global_preview_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Ignore zone checkpoints and reprocess all zones from scratch",
     )
     global_preview_parser.set_defaults(func=global_preview_command)
 

@@ -2145,11 +2145,16 @@ def build_global_preview(
     num_levels: int = GLOBAL_DEFAULT_LEVELS,
     workers: int = 4,
     console: Optional["rich.console.Console"] = None,
+    force: bool = False,
 ) -> Path:
     """Create or update global EPSG:4326 preview store from per-zone UTM stores.
 
     The output store is always ``{zarr_dir}/global_rgb_{year}.zarr``.
     If the store already exists, only the specified zones are re-processed.
+
+    Completed zones are checkpointed in the store attrs so that a
+    crash/OOM mid-build can be resumed without reprocessing finished
+    zones.  Pass ``force=True`` to ignore checkpoints and reprocess all.
     """
     import gc
     import zarr
@@ -2231,7 +2236,22 @@ def build_global_preview(
         )
 
     # 5. Reproject each zone and update pyramid
+    #    Track completed zones in global store attrs so we can skip them on
+    #    re-run after a crash/OOM.
+    global_root = zarr.open_group(str(output_path), mode="r+")
+    if force:
+        if "_completed_zones" in global_root.attrs:
+            del global_root.attrs["_completed_zones"]
+    completed_zones = set(global_root.attrs.get("_completed_zones", []))
+
     for zone_num, zinfo in sorted(zone_infos.items()):
+        if zone_num in completed_zones:
+            if console is not None:
+                console.print(
+                    f"\n  [dim]Zone {zone_num:02d}: already completed, skipping[/dim]"
+                )
+            continue
+
         if console is not None:
             console.print(
                 f"\n  [bold]Processing zone {zone_num:02d} "
@@ -2248,6 +2268,8 @@ def build_global_preview(
             console=console,
         )
         if row_end <= row_start or col_end <= col_start:
+            completed_zones.add(zone_num)
+            global_root.attrs["_completed_zones"] = sorted(completed_zones)
             continue
         if console is not None:
             console.print("    Building pyramid...")
@@ -2261,7 +2283,14 @@ def build_global_preview(
             workers=workers,
             console=console,
         )
+        # Mark zone as completed only after both reproject + pyramid succeed
+        completed_zones.add(zone_num)
+        global_root.attrs["_completed_zones"] = sorted(completed_zones)
         gc.collect()
+
+    # Clear checkpoint now that all zones are done
+    if "_completed_zones" in global_root.attrs:
+        del global_root.attrs["_completed_zones"]
 
     # 6. Re-consolidate metadata
     import warnings
