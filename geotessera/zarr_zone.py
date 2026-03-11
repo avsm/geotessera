@@ -1503,7 +1503,7 @@ def _reproject_chunk(
     Each call writes to a unique (chunk_row, chunk_col) position, so concurrent
     calls to different positions are safe.
 
-    Returns True if any non-zero data was written.
+    Returns True if any non-zero data was written (including pre-existing data).
     """
     import warnings
 
@@ -1521,6 +1521,14 @@ def _reproject_chunk(
     tile_w = min(GLOBAL_CHUNK, GLOBAL_LEVEL0_W - col0)
     if tile_h <= 0 or tile_w <= 0:
         return False
+
+    # Skip if this chunk is already fully populated (resume after crash).
+    # Reading 512x512x4 uint8 (~1 MB) is much cheaper than reprojecting.
+    existing = np.asarray(
+        global_arr[row0 : row0 + tile_h, col0 : col0 + tile_w, :]
+    )
+    if existing[:, :, 3].all():  # alpha channel fully non-zero
+        return True
 
     tile_west = west + col0 * GLOBAL_BASE_RES
     tile_north = north - row0 * GLOBAL_BASE_RES
@@ -1636,14 +1644,15 @@ def _reproject_zone(
     zone_shape: tuple,
     workers: int,
     console: Optional["rich.console.Console"] = None,
-) -> Tuple[int, int, int, int]:
+    force: bool = False,
+) -> Tuple[int, int, int, int, bool]:
     """Reproject one zone's RGB into level 0 of the global store.
 
     Uses ProcessPoolExecutor to parallelise chunk-level reprojection.
     Each task writes to a unique chunk position, eliminating write races.
 
-    Returns (row_start, row_end, col_start, col_end) in pixel coords,
-    snapped to chunk boundaries.
+    Returns (row_start, row_end, col_start, col_end, did_work) where
+    did_work is False if the zone was already fully populated (skipped).
     """
     from pyproj import Transformer
 
@@ -1694,12 +1703,44 @@ def _reproject_zone(
     if col_end <= col_start or row_end <= row_start:
         if console is not None:
             console.print(f"    [yellow]Zone {zone_num}: no output region[/yellow]")
-        return (0, 0, 0, 0)
+        return (0, 0, 0, 0, False)
 
     n_chunk_rows = (row_end - row_start) // GLOBAL_CHUNK
     n_chunk_cols = (col_end - col_start) // GLOBAL_CHUNK
     chunk_row_start = row_start // GLOBAL_CHUNK
     chunk_col_start = col_start // GLOBAL_CHUNK
+
+    # Quick check: sample interior pixels to see if zone is already done.
+    # Use 10% inset from edges to avoid UTM boundary chunks shared with
+    # adjacent zones.
+    if not force:
+        import zarr as _zarr
+        _root = _zarr.open_group(str(store_path), mode="r")
+        _rgb = _root["0/rgb"]
+        margin_r = max(GLOBAL_CHUNK, (row_end - row_start) // 10)
+        margin_c = max(GLOBAL_CHUNK, (col_end - col_start) // 10)
+        inner_r0 = row_start + margin_r
+        inner_r1 = row_end - margin_r
+        inner_c0 = col_start + margin_c
+        inner_c1 = col_end - margin_c
+        if inner_r1 > inner_r0 and inner_c1 > inner_c0:
+            import random
+            rng = random.Random(zone_num)  # deterministic per zone
+            n_samples = min(8, n_chunk_rows * n_chunk_cols)
+            all_populated = True
+            for _ in range(n_samples):
+                sr = rng.randint(inner_r0, inner_r1 - 1)
+                sc = rng.randint(inner_c0, inner_c1 - 1)
+                alpha = int(np.asarray(_rgb[sr, sc, 3]))
+                if alpha == 0:
+                    all_populated = False
+                    break
+            if all_populated:
+                if console is not None:
+                    console.print(
+                        f"    Zone {zone_num:02d}: level-0 already populated, skipping"
+                    )
+                return (row_start, row_end, col_start, col_end, False)
 
     if console is not None:
         total_chunks = n_chunk_rows * n_chunk_cols
@@ -1775,7 +1816,7 @@ def _reproject_zone(
                 except Exception:
                     pass
 
-    return (row_start, row_end, col_start, col_end)
+    return (row_start, row_end, col_start, col_end, True)
 
 
 def _coarsen_zone_pyramid(
@@ -2236,28 +2277,17 @@ def build_global_preview(
         )
 
     # 5. Reproject each zone and update pyramid
-    #    Track completed zones in global store attrs so we can skip them on
-    #    re-run after a crash/OOM.
-    global_root = zarr.open_group(str(output_path), mode="r+")
-    if force:
-        if "_completed_zones" in global_root.attrs:
-            del global_root.attrs["_completed_zones"]
-    completed_zones = set(global_root.attrs.get("_completed_zones", []))
-
+    #    Resume is automatic: _reproject_zone samples level-0 interior pixels
+    #    and skips zones that are already populated.  Within a partially-done
+    #    zone, _reproject_chunk skips chunks whose alpha is already non-zero.
+    #    Pass force=True to bypass these checks and reprocess everything.
     for zone_num, zinfo in sorted(zone_infos.items()):
-        if zone_num in completed_zones:
-            if console is not None:
-                console.print(
-                    f"\n  [dim]Zone {zone_num:02d}: already completed, skipping[/dim]"
-                )
-            continue
-
         if console is not None:
             console.print(
                 f"\n  [bold]Processing zone {zone_num:02d} "
                 f"(EPSG:{zinfo['epsg']})[/bold]"
             )
-        row_start, row_end, col_start, col_end = _reproject_zone(
+        row_start, row_end, col_start, col_end, did_work = _reproject_zone(
             store_path=output_path,
             zone_num=zone_num,
             zone_store_path=zinfo["store_path"],
@@ -2266,10 +2296,11 @@ def build_global_preview(
             zone_shape=zinfo["shape"],
             workers=workers,
             console=console,
+            force=force,
         )
         if row_end <= row_start or col_end <= col_start:
-            completed_zones.add(zone_num)
-            global_root.attrs["_completed_zones"] = sorted(completed_zones)
+            continue
+        if not did_work:
             continue
         if console is not None:
             console.print("    Building pyramid...")
@@ -2283,14 +2314,7 @@ def build_global_preview(
             workers=workers,
             console=console,
         )
-        # Mark zone as completed only after both reproject + pyramid succeed
-        completed_zones.add(zone_num)
-        global_root.attrs["_completed_zones"] = sorted(completed_zones)
         gc.collect()
-
-    # Clear checkpoint now that all zones are done
-    if "_completed_zones" in global_root.attrs:
-        del global_root.attrs["_completed_zones"]
 
     # 6. Re-consolidate metadata
     import warnings
