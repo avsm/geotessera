@@ -2534,6 +2534,9 @@ def zarr_build_command(args):
 
     # Handle --rgb-only mode: add RGB to existing stores
     if args.rgb_only:
+        import re as _re
+        import zarr
+
         zarr_dir = Path(output_dir)
         if not zarr_dir.is_dir():
             console.print(f"[red]Error: directory not found: {zarr_dir}[/red]")
@@ -2548,39 +2551,29 @@ def zarr_build_command(args):
                 console.print("[red]Error: --zones must be comma-separated integers[/red]")
                 return 1
 
-        def _store_matches(p):
-            """Check if a .zarr store name matches the zone filter."""
-            if zone_filter is None:
-                return True
-            # Store names are like utm30_2025.zarr
-            try:
-                zone_num = int(p.name.split("_")[0].replace("utm", ""))
-                return zone_num in zone_filter
-            except (ValueError, IndexError):
-                return True  # include unrecognised names
+        year_pattern = _re.compile(r"^(\d{4})\.zarr$")
+        zone_pattern = _re.compile(r"^utm(\d{2})$")
 
-        zarr_stores = sorted(
-            p for p in zarr_dir.iterdir()
-            if p.is_dir() and p.name.endswith(".zarr") and _store_matches(p)
-        )
+        zone_count = 0
+        for entry in sorted(zarr_dir.iterdir()):
+            if not entry.is_dir() or not year_pattern.match(entry.name):
+                continue
+            root = zarr.open_group(str(entry), mode="r")
+            for zone_name in sorted(root.keys()):
+                m = zone_pattern.match(zone_name)
+                if m is None:
+                    continue
+                zone_num = int(m.group(1))
+                if zone_filter is not None and zone_num not in zone_filter:
+                    continue
+                console.print(f"\n  [cyan]{entry.name}/{zone_name}[/cyan]")
+                add_rgb_to_existing_store(entry, zone_name, workers=args.workers, console=console)
+                zone_count += 1
 
-        if not zarr_stores:
-            console.print(f"[yellow]No .zarr stores found in {zarr_dir}[/yellow]")
+        if zone_count == 0:
+            console.print(f"[yellow]No zone groups found in {zarr_dir}[/yellow]")
             return 1
-
-        console.print(
-            f"[bold]Adding RGB preview to existing stores[/bold]\n"
-            f"  Directory: {zarr_dir}\n"
-            f"  Stores: {len(zarr_stores)}"
-        )
-        if zone_filter:
-            console.print(f"  Zones: {', '.join(str(z) for z in sorted(zone_filter))}")
-
-        for store_path in zarr_stores:
-            console.print(f"\n  [cyan]{store_path.name}[/cyan]")
-            add_rgb_to_existing_store(store_path, workers=args.workers, console=console)
-
-        console.print(f"\n[bold green]RGB preview added to {len(zarr_stores)} store(s)[/bold green]")
+        console.print(f"\n[bold green]RGB preview added to {zone_count} zone(s)[/bold green]")
         return 0
 
     # Parse zone filter
@@ -2731,45 +2724,49 @@ def _store_bbox_wgs84(attrs: dict) -> list[float]:
 
 
 def _zarr_store_to_stac_item(
-    store_path: Path, zarr_dir: Path
+    zone_grp,
+    zone_name: str,
+    year: int,
+    root_attrs: dict,
+    year_store_path: Path,
+    zarr_dir: Path,
 ):
-    """Open a single Zarr store and return a pystac Item, or None on failure."""
-    import zarr
+    """Build a pystac Item from a zone group within a year store, or None on failure."""
     import pystac
     from datetime import datetime, timezone
 
+    label = f"{year_store_path.name}/{zone_name}"
+
     try:
-        store = zarr.open_group(str(store_path), mode="r")
-        attrs = dict(store.attrs)
+        attrs = dict(zone_grp.attrs)
     except Exception as e:
-        logger.warning("Skipping %s: cannot open (%s)", store_path.name, e)
+        logger.warning("Skipping %s: cannot read attrs (%s)", label, e)
         return None
 
     # Required attributes
-    required = ["utm_zone", "proj:code", "spatial:transform", "year"]
+    required = ["utm_zone", "proj:code", "spatial:transform"]
     missing = [k for k in required if k not in attrs]
     if missing:
-        logger.warning("Skipping %s: missing attrs %s", store_path.name, missing)
+        logger.warning("Skipping %s: missing attrs %s", label, missing)
         return None
 
     # Read grid dimensions from the scales array
     try:
-        scales_shape = store["scales"].shape
+        scales_shape = zone_grp["scales"].shape
         attrs["grid_height"] = scales_shape[0]
         attrs["grid_width"] = scales_shape[1]
     except Exception as e:
-        logger.warning("Skipping %s: cannot read scales shape (%s)", store_path.name, e)
+        logger.warning("Skipping %s: cannot read scales shape (%s)", label, e)
         return None
 
     # Compute bounding box
     try:
         bbox = _store_bbox_wgs84(attrs)
     except Exception as e:
-        logger.warning("Skipping %s: bbox computation failed (%s)", store_path.name, e)
+        logger.warning("Skipping %s: bbox computation failed (%s)", label, e)
         return None
 
-    year = attrs["year"]
-    item_id = store_path.name.removesuffix(".zarr")
+    item_id = f"{zone_name}_{year}"
     dt = datetime(year, 1, 1, tzinfo=timezone.utc)
 
     # Build WGS84 polygon from bbox
@@ -2787,9 +2784,18 @@ def _zarr_store_to_stac_item(
 
     # Determine number of bands
     try:
-        n_bands = store["embeddings"].shape[2]
+        n_bands = zone_grp["embeddings"].shape[2]
     except Exception:
         n_bands = 128
+
+    # Check for dataset version mismatch
+    dataset_version = root_attrs.get("tessera:dataset_version", "")
+    dir_version = year_store_path.parent.name
+    if dataset_version and dir_version and dataset_version != dir_version:
+        logger.warning(
+            "%s: dataset version %r != directory %r",
+            label, dataset_version, dir_version,
+        )
 
     properties = {
         "utm_zone": attrs["utm_zone"],
@@ -2800,6 +2806,7 @@ def _zarr_store_to_stac_item(
         "n_bands": n_bands,
         "has_rgb_preview": attrs.get("has_rgb_preview", False),
         "geotessera_version": attrs.get("geotessera_version", "unknown"),
+        "tessera:dataset_version": dataset_version,
     }
 
     item = pystac.Item(
@@ -2810,12 +2817,12 @@ def _zarr_store_to_stac_item(
         properties=properties,
     )
 
-    # Asset href is a placeholder — will be updated in stac_index_command
-    # once we know the item's JSON output location
+    # Asset href: relative path within the zarr directory
+    asset_href = f"{year_store_path.name}/{zone_name}"
     item.add_asset(
         "zarr",
         pystac.Asset(
-            href=store_path.name,
+            href=asset_href,
             media_type="application/x-zarr-v3",
             roles=["data"],
             title="Zarr v3 embedding store",
@@ -2826,7 +2833,9 @@ def _zarr_store_to_stac_item(
 
 
 def stac_index_command(args):
-    """Scan a directory of Zarr stores and generate a static STAC catalog."""
+    """Scan a directory of consolidated year Zarr stores and generate a static STAC catalog."""
+    import re
+    import zarr
     import pystac
     from datetime import datetime, timezone
 
@@ -2837,19 +2846,27 @@ def stac_index_command(args):
         console.print(f"[red]Error:[/red] {zarr_dir} is not a directory")
         return 1
 
-    # Discover .zarr stores matching utm{ZZ}_{YYYY}.zarr
-    import re
-    store_pattern = re.compile(r"^utm(\d{2})_(\d{4})\.zarr$")
-    store_paths = sorted(
-        p for p in zarr_dir.iterdir()
-        if p.is_dir() and store_pattern.match(p.name)
-    )
+    # Discover consolidated year stores ({YYYY}.zarr)
+    year_pattern = re.compile(r"^(\d{4})\.zarr$")
+    zone_pattern = re.compile(r"^utm(\d{2})$")
+    year_stores = []
+    for entry in sorted(zarr_dir.iterdir()):
+        if entry.is_dir() and year_pattern.match(entry.name):
+            year_stores.append(entry)
 
-    if not store_paths:
-        console.print(f"[red]Error:[/red] No utm*_*.zarr stores found in {zarr_dir}")
+    if not year_stores:
+        console.print(f"[red]Error:[/red] No {{YYYY}}.zarr stores found in {zarr_dir}")
         return 1
 
-    console.print(f"Found {len(store_paths)} Zarr store(s) in {zarr_dir}")
+    # Count total zone groups for progress bar
+    zone_items = []  # list of (year_store_path, zone_name)
+    for year_store_path in year_stores:
+        root = zarr.open_group(str(year_store_path), mode="r")
+        for zone_name in sorted(root.keys()):
+            if zone_pattern.match(zone_name):
+                zone_items.append((year_store_path, zone_name))
+
+    console.print(f"Found {len(year_stores)} year store(s), {len(zone_items)} zone group(s) in {zarr_dir}")
 
     # Build items grouped by year
     items_by_year: dict[int, list["pystac.Item"]] = defaultdict(list)
@@ -2862,16 +2879,23 @@ def stac_index_command(args):
         TaskProgressColumn(),
         console=console,
     ) as progress:
-        task = progress.add_task("Reading store metadata", total=len(store_paths))
-        for sp in store_paths:
-            item = _zarr_store_to_stac_item(sp, zarr_dir)
+        task = progress.add_task("Reading store metadata", total=len(zone_items))
+        for year_store_path, zone_name in zone_items:
+            root = zarr.open_group(str(year_store_path), mode="r")
+            root_attrs = dict(root.attrs)
+            year = root_attrs.get("year", int(year_store_path.name.removesuffix(".zarr")))
+            zone_grp = root[zone_name]
+            item = _zarr_store_to_stac_item(
+                zone_grp, zone_name, year, root_attrs, year_store_path, zarr_dir,
+            )
             if item is not None:
-                year = item.datetime.year
                 # Fix asset href to be relative to the item's JSON location
                 # Item JSON will be at: output_dir/geotessera-{year}/{item.id}/{item.id}.json
                 item_json_dir = output_dir / f"geotessera-{year}" / item.id
                 zarr_asset = item.assets["zarr"]
-                zarr_asset.href = os.path.relpath(sp, item_json_dir)
+                zarr_asset.href = os.path.relpath(
+                    year_store_path / zone_name, item_json_dir,
+                )
                 items_by_year[year].append(item)
             else:
                 skipped += 1
@@ -2882,7 +2906,7 @@ def stac_index_command(args):
         return 1
 
     if skipped:
-        console.print(f"[yellow]Skipped {skipped} store(s) with errors[/yellow]")
+        console.print(f"[yellow]Skipped {skipped} zone group(s) with errors[/yellow]")
 
     # Create root catalog
     catalog = pystac.Catalog(
@@ -3286,7 +3310,7 @@ Directory Structure:
         "--rgb-only",
         action="store_true",
         help="Add RGB preview to existing stores without rebuilding "
-        "(scans existing .zarr stores in output dir)",
+        "(scans {year}.zarr stores and their utm* zone groups in output dir)",
     )
     zarr_build_parser.set_defaults(func=zarr_build_command)
 
@@ -3298,7 +3322,7 @@ Directory Structure:
     global_preview_parser.add_argument(
         "zarr_dir",
         type=Path,
-        help="Directory containing utm*_YYYY.zarr stores",
+        help="Directory containing {year}.zarr stores",
     )
     global_preview_parser.add_argument(
         "--year",
@@ -3355,7 +3379,7 @@ Directory Structure:
     )
     stac_index_parser.add_argument(
         "zarr_dir",
-        help="Directory containing utm*_*.zarr stores",
+        help="Directory containing {year}.zarr stores",
     )
     stac_index_parser.add_argument(
         "--output-dir",
