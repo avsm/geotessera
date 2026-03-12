@@ -2689,6 +2689,7 @@ def global_preview_command(args):
         workers=num_workers,
         console=console,
         force=args.force,
+        skip_reproject=args.skip_reproject,
     )
 
     console.print(f"\n[bold green]Global preview store written to {result}[/bold green]")
@@ -3327,6 +3328,11 @@ Directory Structure:
         "--force",
         action="store_true",
         help="Ignore zone checkpoints and reprocess all zones from scratch",
+    )
+    global_preview_parser.add_argument(
+        "--skip-reproject",
+        action="store_true",
+        help="Skip reprojection, only rebuild pyramids (use when reprojection is done but pyramiding OOM'd)",
     )
     global_preview_parser.set_defaults(func=global_preview_command)
 

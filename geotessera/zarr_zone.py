@@ -1627,24 +1627,14 @@ def _reproject_chunk(
     return True
 
 
-def _reproject_zone(
-    store_path: Path,
-    zone_num: int,
-    zone_store_path: Path,
+def _zone_output_bounds(
     zone_epsg: int,
     zone_transform: list,
     zone_shape: tuple,
-    workers: int,
-    console: Optional["rich.console.Console"] = None,
-    force: bool = False,
-) -> Tuple[int, int, int, int, bool]:
-    """Reproject one zone's RGB into level 0 of the global store.
+) -> Tuple[int, int, int, int]:
+    """Compute the chunk-aligned output bounds for a zone in global grid pixels.
 
-    Uses ProcessPoolExecutor to parallelise chunk-level reprojection.
-    Each task writes to a unique chunk position, eliminating write races.
-
-    Returns (row_start, row_end, col_start, col_end, did_work) where
-    did_work is False if the zone was already fully populated (skipped).
+    Returns (row_start, row_end, col_start, col_end).
     """
     from pyproj import Transformer
 
@@ -1653,9 +1643,8 @@ def _reproject_zone(
     src_origin_n = zone_transform[5]
     src_h, src_w = zone_shape[:2]
 
-    west, south, east, north = GLOBAL_BOUNDS
+    west, _south, _east, north = GLOBAL_BOUNDS
 
-    # Compute zone's WGS84 bounding box
     to_4326 = Transformer.from_crs(
         f"EPSG:{zone_epsg}", "EPSG:4326", always_xy=True,
     )
@@ -1680,7 +1669,6 @@ def _reproject_zone(
     zlon_min, zlon_max = min(lons), max(lons)
     zlat_min, zlat_max = min(lats), max(lats)
 
-    # Snap to chunk boundaries (expand outward)
     col_start = max(0, (int(math.floor((zlon_min - west) / GLOBAL_BASE_RES))
                         // GLOBAL_CHUNK * GLOBAL_CHUNK))
     col_end = min(GLOBAL_LEVEL0_W,
@@ -1692,6 +1680,39 @@ def _reproject_zone(
                   ((int(math.ceil((north - zlat_min) / GLOBAL_BASE_RES))
                     + GLOBAL_CHUNK - 1) // GLOBAL_CHUNK * GLOBAL_CHUNK))
 
+    return (row_start, row_end, col_start, col_end)
+
+
+def _reproject_zone(
+    store_path: Path,
+    zone_num: int,
+    zone_store_path: Path,
+    zone_epsg: int,
+    zone_transform: list,
+    zone_shape: tuple,
+    workers: int,
+    console: Optional["rich.console.Console"] = None,
+    force: bool = False,
+) -> Tuple[int, int, int, int, bool]:
+    """Reproject one zone's RGB into level 0 of the global store.
+
+    Uses ProcessPoolExecutor to parallelise chunk-level reprojection.
+    Each task writes to a unique chunk position, eliminating write races.
+
+    Returns (row_start, row_end, col_start, col_end, did_work) where
+    did_work is False if the zone was already fully populated (skipped).
+    """
+    src_pixel = zone_transform[0]
+    src_origin_e = zone_transform[2]
+    src_origin_n = zone_transform[5]
+    src_h, src_w = zone_shape[:2]
+
+    row_start, row_end, col_start, col_end = _zone_output_bounds(
+        zone_epsg=zone_epsg,
+        zone_transform=zone_transform,
+        zone_shape=zone_shape,
+    )
+
     if col_end <= col_start or row_end <= row_start:
         if console is not None:
             console.print(f"    [yellow]Zone {zone_num}: no output region[/yellow]")
@@ -1702,37 +1723,21 @@ def _reproject_zone(
     chunk_row_start = row_start // GLOBAL_CHUNK
     chunk_col_start = col_start // GLOBAL_CHUNK
 
-    # Quick check: sample interior pixels to see if zone is already done.
-    # Use 10% inset from edges to avoid UTM boundary chunks shared with
-    # adjacent zones.
-    if not force:
-        import zarr as _zarr
-        _root = _zarr.open_group(str(store_path), mode="r")
-        _rgb = _root["0/rgb"]
-        margin_r = max(GLOBAL_CHUNK, (row_end - row_start) // 10)
-        margin_c = max(GLOBAL_CHUNK, (col_end - col_start) // 10)
-        inner_r0 = row_start + margin_r
-        inner_r1 = row_end - margin_r
-        inner_c0 = col_start + margin_c
-        inner_c1 = col_end - margin_c
-        if inner_r1 > inner_r0 and inner_c1 > inner_c0:
-            import random
-            rng = random.Random(zone_num)  # deterministic per zone
-            n_samples = min(8, n_chunk_rows * n_chunk_cols)
-            all_populated = True
-            for _ in range(n_samples):
-                sr = rng.randint(inner_r0, inner_r1 - 1)
-                sc = rng.randint(inner_c0, inner_c1 - 1)
-                alpha = int(np.asarray(_rgb[sr, sc, 3]))
-                if alpha == 0:
-                    all_populated = False
-                    break
-            if all_populated:
-                if console is not None:
-                    console.print(
-                        f"    Zone {zone_num:02d}: level-0 already populated, skipping"
-                    )
-                return (row_start, row_end, col_start, col_end, False)
+    # Resume check: a zone completion marker is written after all chunks
+    # are processed.  This is O(1) — no scanning needed.  Chunk file
+    # existence can't be used for resume because Zarr v3 doesn't write
+    # files for fill-value (zero) chunks, so "no file" is ambiguous
+    # between "processed but empty" and "not yet processed".
+    marker = store_path / f".zone_{zone_num}_done"
+    if marker.exists():
+        if force:
+            marker.unlink()
+        else:
+            if console is not None:
+                console.print(
+                    f"    Zone {zone_num:02d}: already complete (marker exists), skipping"
+                )
+            return (row_start, row_end, col_start, col_end, False)
 
     if console is not None:
         total_chunks = n_chunk_rows * n_chunk_cols
@@ -1746,78 +1751,15 @@ def _reproject_zone(
 
     chunks_total = n_chunk_rows * n_chunk_cols
 
-    # Pre-filter: use binary search on chunk file existence to find the
-    # resume frontier.  Chunks are written in row-major order, so the
-    # written set is a contiguous prefix (with a small ragged tail from
-    # in-flight workers at crash time).  Binary search is O(log n) vs
-    # O(n) linear scan — critical when n ≈ 1.8M and zone is already done.
-    chunk_dir = store_path / "0" / "rgb" / "c"
-
-    def _chunk_exists(linear_idx: int) -> bool:
-        cr = chunk_row_start + linear_idx // n_chunk_cols
-        cc = chunk_col_start + linear_idx % n_chunk_cols
-        return (chunk_dir / str(cr) / str(cc) / "0").exists()
-
     work_items = []
-    skipped = 0
-
-    if force:
-        for cr_offset in range(n_chunk_rows):
-            cr = chunk_row_start + cr_offset
-            for cc_offset in range(n_chunk_cols):
-                cc = chunk_col_start + cc_offset
-                work_items.append((
-                    cr, cc, zone_epsg, src_pixel,
-                    src_origin_e, src_origin_n, src_h, src_w,
-                ))
-    elif chunks_total > 0 and _chunk_exists(chunks_total - 1):
-        # Last chunk exists → zone is fully written
-        skipped = chunks_total
-    elif chunks_total > 0 and not _chunk_exists(0):
-        # First chunk missing → nothing written, process all (no stat calls)
-        for cr_offset in range(n_chunk_rows):
-            cr = chunk_row_start + cr_offset
-            for cc_offset in range(n_chunk_cols):
-                cc = chunk_col_start + cc_offset
-                work_items.append((
-                    cr, cc, zone_epsg, src_pixel,
-                    src_origin_e, src_origin_n, src_h, src_w,
-                ))
-    elif chunks_total > 0:
-        # Binary search for the first missing chunk in row-major order
-        lo, hi = 0, chunks_total - 1
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if _chunk_exists(mid):
-                lo = mid + 1
-            else:
-                hi = mid
-        # lo = first missing index; back up by a margin to catch gaps
-        # from out-of-order completion in the process pool
-        scan_from = max(0, lo - workers * 2)
-        skipped = scan_from
-        # Linear check only from the frontier onwards
-        for linear_idx in range(scan_from, chunks_total):
-            cr = chunk_row_start + linear_idx // n_chunk_cols
-            cc = chunk_col_start + linear_idx % n_chunk_cols
-            if _chunk_exists(linear_idx):
-                skipped += 1
-                continue
+    for cr_offset in range(n_chunk_rows):
+        cr = chunk_row_start + cr_offset
+        for cc_offset in range(n_chunk_cols):
+            cc = chunk_col_start + cc_offset
             work_items.append((
                 cr, cc, zone_epsg, src_pixel,
                 src_origin_e, src_origin_n, src_h, src_w,
             ))
-
-    if skipped and console is not None:
-        console.print(
-            f"    Skipping {skipped}/{chunks_total} already-populated chunks, "
-            f"{len(work_items)} to process"
-        )
-
-    if not work_items:
-        if console is not None:
-            console.print(f"    All chunks already populated")
-        return (row_start, row_end, col_start, col_end, False)
 
     chunks_written = 0
 
@@ -1869,6 +1811,11 @@ def _reproject_zone(
                         chunks_written += 1
                 except Exception:
                     pass
+
+    # Write zone completion marker for O(1) resume detection
+    marker.write_text(f"zone={zone_num} chunks={chunks_total} written={chunks_written}\n")
+    if console is not None:
+        console.print(f"    Wrote completion marker: {marker.name}")
 
     return (row_start, row_end, col_start, col_end, True)
 
@@ -2241,6 +2188,7 @@ def build_global_preview(
     workers: int = 4,
     console: Optional["rich.console.Console"] = None,
     force: bool = False,
+    skip_reproject: bool = False,
 ) -> Path:
     """Create or update global EPSG:4326 preview store from per-zone UTM stores.
 
@@ -2331,27 +2279,44 @@ def build_global_preview(
         )
 
     # 5. Reproject each zone and update pyramid
-    #    Resume is automatic: _reproject_zone samples level-0 interior pixels
-    #    and skips zones that are already populated.  Within a partially-done
-    #    zone, _reproject_chunk skips chunks whose alpha is already non-zero.
-    #    Pass force=True to bypass these checks and reprocess everything.
+    #    Resume is automatic via .zone_NN_done marker files.
+    #    Pass force=True to ignore markers and reprocess everything.
+    #    Pass skip_reproject=True to skip reprojection entirely and
+    #    only rebuild the pyramid (useful when reprojection is done
+    #    but the pyramiding step OOM'd).
+    if skip_reproject:
+        if console is not None:
+            console.print(
+                "\n  [yellow]--skip-reproject: skipping reprojection, "
+                "rebuilding pyramids only[/yellow]"
+            )
     for zone_num, zinfo in sorted(zone_infos.items()):
         if console is not None:
             console.print(
                 f"\n  [bold]Processing zone {zone_num:02d} "
                 f"(EPSG:{zinfo['epsg']})[/bold]"
             )
-        row_start, row_end, col_start, col_end, did_work = _reproject_zone(
-            store_path=output_path,
-            zone_num=zone_num,
-            zone_store_path=zinfo["store_path"],
-            zone_epsg=zinfo["epsg"],
-            zone_transform=zinfo["transform"],
-            zone_shape=zinfo["shape"],
-            workers=workers,
-            console=console,
-            force=force,
-        )
+
+        if skip_reproject:
+            # Compute the zone's output bounds without reprojecting
+            row_start, row_end, col_start, col_end = _zone_output_bounds(
+                zone_epsg=zinfo["epsg"],
+                zone_transform=zinfo["transform"],
+                zone_shape=zinfo["shape"],
+            )
+            did_work = True  # force pyramid rebuild
+        else:
+            row_start, row_end, col_start, col_end, did_work = _reproject_zone(
+                store_path=output_path,
+                zone_num=zone_num,
+                zone_store_path=zinfo["store_path"],
+                zone_epsg=zinfo["epsg"],
+                zone_transform=zinfo["transform"],
+                zone_shape=zinfo["shape"],
+                workers=workers,
+                console=console,
+                force=force,
+            )
         if row_end <= row_start or col_end <= col_start:
             continue
         if not did_work:
