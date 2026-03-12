@@ -655,6 +655,7 @@ def create_landmasks_parquet_database(base_dir, output_path, console):
             ) as temp_file:
                 temp_path = temp_file.name
 
+            os.chmod(temp_path, 0o644)
             gdf.to_parquet(temp_path, compression="zstd", index=False)
             os.rename(temp_path, output_path)
 
@@ -809,6 +810,7 @@ def create_parquet_database_from_filesystem(base_dir, output_path, console):
             ) as temp_file:
                 temp_path = temp_file.name
 
+            os.chmod(temp_path, 0o644)
             gdf.to_parquet(temp_path, compression="zstd", index=False)
             os.rename(temp_path, output_path)
 
@@ -2421,12 +2423,24 @@ def file_scan_command(args):
     df["lon_i"] = (df["lon"] * 100).round().astype(np.int32)
     df["lat_i"] = (df["lat"] * 100).round().astype(np.int32)
 
-    # Save to parquet
+    # Save to parquet (atomic write via temp file + rename)
+    import tempfile
+
     try:
-        # Create output directory if it doesn't exist
         output_file.parent.mkdir(parents=True, exist_ok=True)
 
-        df.to_parquet(output_file, index=False)
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=output_file.parent,
+            prefix=f".{output_file.name}_tmp_",
+            suffix=".parquet",
+            delete=False,
+        ) as temp_file:
+            temp_path = temp_file.name
+
+        os.chmod(temp_path, 0o644)
+        df.to_parquet(temp_path, index=False)
+        os.rename(temp_path, str(output_file))
 
         console.print(
             Panel.fit(
@@ -2466,6 +2480,8 @@ def file_scan_command(args):
         return 0
 
     except Exception as e:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
         console.print(f"[red]Error writing parquet file: {e}[/red]")
         import traceback
 
