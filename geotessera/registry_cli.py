@@ -2729,7 +2729,6 @@ def _zarr_store_to_stac_item(
     year: int,
     root_attrs: dict,
     year_store_path: Path,
-    zarr_dir: Path,
 ):
     """Build a pystac Item from a zone group within a year store, or None on failure."""
     import pystac
@@ -2817,12 +2816,11 @@ def _zarr_store_to_stac_item(
         properties=properties,
     )
 
-    # Asset href: relative path within the zarr directory
-    asset_href = f"{year_store_path.name}/{zone_name}"
+    # Asset href: placeholder; caller sets the final relative path
     item.add_asset(
         "zarr",
         pystac.Asset(
-            href=asset_href,
+            href=zone_name,
             media_type="application/x-zarr-v3",
             roles=["data"],
             title="Zarr v3 embedding store",
@@ -2858,15 +2856,18 @@ def stac_index_command(args):
         console.print(f"[red]Error:[/red] No {{YYYY}}.zarr stores found in {zarr_dir}")
         return 1
 
-    # Count total zone groups for progress bar
-    zone_items = []  # list of (year_store_path, zone_name)
+    # Discover zone groups and cache store roots to avoid re-opening
+    year_store_info = []  # (path, root, root_attrs, year, zone_names)
     for year_store_path in year_stores:
         root = zarr.open_group(str(year_store_path), mode="r")
-        for zone_name in sorted(root.keys()):
-            if zone_pattern.match(zone_name):
-                zone_items.append((year_store_path, zone_name))
+        root_attrs = dict(root.attrs)
+        yr = root_attrs.get("year", int(year_store_path.name.removesuffix(".zarr")))
+        zones = [n for n in sorted(root.keys()) if zone_pattern.match(n)]
+        if zones:
+            year_store_info.append((year_store_path, root, root_attrs, yr, zones))
 
-    console.print(f"Found {len(year_stores)} year store(s), {len(zone_items)} zone group(s) in {zarr_dir}")
+    total_zones = sum(len(info[4]) for info in year_store_info)
+    console.print(f"Found {len(year_stores)} year store(s), {total_zones} zone group(s) in {zarr_dir}")
 
     # Build items grouped by year
     items_by_year: dict[int, list["pystac.Item"]] = defaultdict(list)
@@ -2879,27 +2880,25 @@ def stac_index_command(args):
         TaskProgressColumn(),
         console=console,
     ) as progress:
-        task = progress.add_task("Reading store metadata", total=len(zone_items))
-        for year_store_path, zone_name in zone_items:
-            root = zarr.open_group(str(year_store_path), mode="r")
-            root_attrs = dict(root.attrs)
-            year = root_attrs.get("year", int(year_store_path.name.removesuffix(".zarr")))
-            zone_grp = root[zone_name]
-            item = _zarr_store_to_stac_item(
-                zone_grp, zone_name, year, root_attrs, year_store_path, zarr_dir,
-            )
-            if item is not None:
-                # Fix asset href to be relative to the item's JSON location
-                # Item JSON will be at: output_dir/geotessera-{year}/{item.id}/{item.id}.json
-                item_json_dir = output_dir / f"geotessera-{year}" / item.id
-                zarr_asset = item.assets["zarr"]
-                zarr_asset.href = os.path.relpath(
-                    year_store_path / zone_name, item_json_dir,
+        task = progress.add_task("Reading store metadata", total=total_zones)
+        for year_store_path, root, root_attrs, year, zone_names in year_store_info:
+            for zone_name in zone_names:
+                zone_grp = root[zone_name]
+                item = _zarr_store_to_stac_item(
+                    zone_grp, zone_name, year, root_attrs, year_store_path,
                 )
-                items_by_year[year].append(item)
-            else:
-                skipped += 1
-            progress.advance(task)
+                if item is not None:
+                    # Fix asset href to be relative to the item's JSON location
+                    # Item JSON will be at: output_dir/geotessera-{year}/{item.id}/{item.id}.json
+                    item_json_dir = output_dir / f"geotessera-{year}" / item.id
+                    zarr_asset = item.assets["zarr"]
+                    zarr_asset.href = os.path.relpath(
+                        year_store_path / zone_name, item_json_dir,
+                    )
+                    items_by_year[year].append(item)
+                else:
+                    skipped += 1
+                progress.advance(task)
 
     if not items_by_year:
         console.print("[red]Error:[/red] No valid stores found")

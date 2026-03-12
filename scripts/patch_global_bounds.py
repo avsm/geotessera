@@ -185,7 +185,7 @@ def main():
                 arr = global_grp[key.split("/")[0]][key.split("/")[1]]
                 level0_shape = arr.shape
                 break
-            except (KeyError, Exception):
+            except Exception:
                 pass
 
         if level0_shape is None:
@@ -236,7 +236,7 @@ def main():
             bounds = list(zone_bounds)
         else:
             # Fall back to existing bounds on the global_rgb group
-            grp_attrs = dict(global_grp.attrs) if hasattr(global_grp, 'attrs') else {}
+            grp_attrs = dict(global_grp.attrs)
             existing = grp_attrs.get("spatial:bbox")
             if existing:
                 print(f"  Keeping existing bounds: {existing}")
