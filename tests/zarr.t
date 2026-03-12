@@ -95,7 +95,7 @@ Note that the info command may detect NPY files that are created alongside zarr:
 
   $ geotessera info --tiles "$TESTDIR/cb_tiles_zarr" 2>&1 | grep -E 'Total tiles|Format|Years' | sed 's/ *$//'
    Total tiles: 4
-   Format:      NPY
+   Format:      NPY* (glob)
    Years:       2024
 
 Test: Zarr Archive Structure
