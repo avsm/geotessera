@@ -1833,9 +1833,9 @@ def _coarsen_zone_pyramid(
     """Update pyramid levels 1 through num_levels-1 for the affected region.
 
     Reads from the previous level and writes coarsened data to the current
-    level, processing in row-strips parallelised with dask.delayed.
+    level, processing in 2D tiles parallelised with a thread pool.
     """
-    import dask
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     import zarr
 
     root = zarr.open_group(str(store_path), mode="r+", zarr_format=3)
@@ -1895,12 +1895,43 @@ def _coarsen_zone_pyramid(
             result = np.clip(coarsened, 0, 255).astype(np.uint8)
             _cur_arr[r0 : r0 + th, c0 : c0 + tw, :] = result
 
-        tasks = [
-            dask.delayed(_coarsen_tile)(r0, c0)
+        tile_args = [
+            (r0, c0)
             for r0 in range(lr_start, lr_end, tile_size)
             for c0 in range(lc_start, lc_end, tile_size)
         ]
-        dask.compute(*tasks, scheduler="threads", num_workers=workers)
+
+        if console is not None:
+            from rich.progress import (
+                Progress, SpinnerColumn, BarColumn, TextColumn,
+                MofNCompleteColumn, TimeElapsedColumn, TimeRemainingColumn,
+            )
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(), MofNCompleteColumn(),
+                TimeElapsedColumn(), TimeRemainingColumn(),
+                console=console,
+            ) as progress:
+                ptask = progress.add_task(
+                    f"Pyramid level {lvl}", total=len(tile_args),
+                )
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = {
+                        pool.submit(_coarsen_tile, r0, c0): (r0, c0)
+                        for r0, c0 in tile_args
+                    }
+                    for future in as_completed(futures):
+                        future.result()
+                        progress.advance(ptask)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [
+                    pool.submit(_coarsen_tile, r0, c0)
+                    for r0, c0 in tile_args
+                ]
+                for future in as_completed(futures):
+                    future.result()
 
         prev_row_start, prev_row_end = lr_start, lr_end
         prev_col_start, prev_col_end = lc_start, lc_end
