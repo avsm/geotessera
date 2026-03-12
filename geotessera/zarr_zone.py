@@ -1870,33 +1870,36 @@ def _coarsen_zone_pyramid(
                 f"cols {lc_start}-{lc_end}"
             )
 
-        strip_h = GLOBAL_CHUNK
+        tile_size = GLOBAL_CHUNK  # output tile dimension
 
-        def _coarsen_strip(r0, _prev_arr=prev_arr, _cur_arr=cur_arr,
-                           _lc_start=lc_start, _lc_end=lc_end,
-                           _cur_h=cur_h):
-            r1 = min(r0 + strip_h, _cur_h)
+        def _coarsen_tile(r0, c0, _prev_arr=prev_arr, _cur_arr=cur_arr,
+                          _cur_h=cur_h, _cur_w=cur_w):
+            r1 = min(r0 + tile_size, _cur_h)
+            c1 = min(c0 + tile_size, _cur_w)
             sr0 = r0 * 2
             sr1 = min(sr0 + (r1 - r0) * 2, _prev_arr.shape[0])
-            sc0 = _lc_start * 2
-            sc1 = min(sc0 + (_lc_end - _lc_start) * 2, _prev_arr.shape[1])
-            strip = np.asarray(
+            sc0 = c0 * 2
+            sc1 = min(sc0 + (c1 - c0) * 2, _prev_arr.shape[1])
+            tile = np.asarray(
                 _prev_arr[sr0:sr1, sc0:sc1, :]
             ).astype(np.float32)
-            th = strip.shape[0] // 2
-            tw = strip.shape[1] // 2
+            th = tile.shape[0] // 2
+            tw = tile.shape[1] // 2
             if th == 0 or tw == 0:
                 return
             coarsened = (
-                strip[: th * 2, : tw * 2, :]
+                tile[: th * 2, : tw * 2, :]
                 .reshape(th, 2, tw, 2, GLOBAL_NUM_BANDS)
                 .mean(axis=(1, 3))
             )
             result = np.clip(coarsened, 0, 255).astype(np.uint8)
-            _cur_arr[r0 : r0 + th, _lc_start : _lc_start + tw, :] = result
+            _cur_arr[r0 : r0 + th, c0 : c0 + tw, :] = result
 
-        strip_starts = list(range(lr_start, lr_end, strip_h))
-        tasks = [dask.delayed(_coarsen_strip)(r0) for r0 in strip_starts]
+        tasks = [
+            dask.delayed(_coarsen_tile)(r0, c0)
+            for r0 in range(lr_start, lr_end, tile_size)
+            for c0 in range(lc_start, lc_end, tile_size)
+        ]
         dask.compute(*tasks, scheduler="threads", num_workers=workers)
 
         prev_row_start, prev_row_end = lr_start, lr_end
