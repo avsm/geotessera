@@ -1529,39 +1529,48 @@ def scan_command(args):
     repr_dir = os.path.join(base_dir, "global_0.1_degree_representation")
     tiles_dir = os.path.join(base_dir, "global_0.1_degree_tiff_all")
 
+    only = getattr(args, "only", None)
+
     # Create embeddings Parquet database
     embeddings_parquet_path = os.path.join(output_dir, "registry.parquet")
-    if os.path.exists(repr_dir):
-        if not create_parquet_database_from_filesystem(
-            base_dir, embeddings_parquet_path, console
-        ):
-            console.print("[red]Failed to create embeddings parquet database[/red]")
+    if only in (None, "embeddings"):
+        if os.path.exists(repr_dir):
+            if not create_parquet_database_from_filesystem(
+                base_dir, embeddings_parquet_path, console
+            ):
+                console.print(
+                    "[red]Failed to create embeddings parquet database[/red]"
+                )
+                return 1
+        else:
+            console.print(
+                f"[red]Error: Embeddings directory not found: {repr_dir}[/red]"
+            )
             return 1
-    else:
-        console.print(f"[red]Error: Embeddings directory not found: {repr_dir}[/red]")
-        return 1
 
     # Create landmasks Parquet database
     landmasks_parquet_path = os.path.join(output_dir, "landmasks.parquet")
-    if os.path.exists(tiles_dir):
-        if not create_landmasks_parquet_database(
-            tiles_dir, landmasks_parquet_path, console
-        ):
+    if only in (None, "landmasks"):
+        if os.path.exists(tiles_dir):
+            if not create_landmasks_parquet_database(
+                tiles_dir, landmasks_parquet_path, console
+            ):
+                console.print(
+                    "[yellow]Warning: Failed to create landmasks parquet database[/yellow]"
+                )
+                # Don't return error, landmasks are optional
+        else:
             console.print(
-                "[yellow]Warning: Failed to create landmasks parquet database[/yellow]"
+                f"[yellow]Warning: Landmasks directory not found: {tiles_dir}[/yellow]"
             )
-            # Don't return error, landmasks are optional
-    else:
-        console.print(
-            f"[yellow]Warning: Landmasks directory not found: {tiles_dir}[/yellow]"
-        )
 
     # Show final summary
     summary_lines = ["[green]✅ Registry Generation Complete[/green]\n"]
     summary_lines.append("📊 Generated outputs:")
     summary_lines.append("• Parquet databases:")
-    summary_lines.append(f"  → {embeddings_parquet_path} (embeddings)")
-    if os.path.exists(landmasks_parquet_path):
+    if only in (None, "embeddings"):
+        summary_lines.append(f"  → {embeddings_parquet_path} (embeddings)")
+    if only in (None, "landmasks") and os.path.exists(landmasks_parquet_path):
         summary_lines.append(f"  → {landmasks_parquet_path} (landmasks)")
     summary_lines.append(f"📁 Output directory: {output_dir}")
 
@@ -2784,6 +2793,12 @@ Directory Structure:
         type=str,
         default=None,
         help="Output directory for registry and parquet files (default: same as base_dir)",
+    )
+    scan_parser.add_argument(
+        "--only",
+        choices=["embeddings", "landmasks"],
+        default=None,
+        help="Only generate the specified parquet database (default: both)",
     )
     scan_parser.set_defaults(func=scan_command)
 
