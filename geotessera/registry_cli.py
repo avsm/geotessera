@@ -3020,6 +3020,131 @@ def zarr_migrate_attrs_command(args):
     return 0
 
 
+def zarr_consolidate_command(args):
+    """Consolidate per-zone Zarr stores into a single per-year store."""
+    import json as _json
+    import re
+    import zarr as _zarr
+
+    base_dir = Path(args.zarr_dir)
+    year = args.year
+    version = args.version
+    dry_run = args.dry_run
+
+    year_store = base_dir / f"{year}.zarr"
+
+    # 1. Discover zone stores
+    zone_pattern = re.compile(rf"^utm(\d{{2}})_{year}\.zarr$")
+    zone_dirs = {}
+    for entry in sorted(base_dir.iterdir()):
+        if not entry.is_dir():
+            continue
+        m = zone_pattern.match(entry.name)
+        if m:
+            zone_num = int(m.group(1))
+            zone_dirs[zone_num] = entry
+
+    # Discover global preview store
+    global_dir = base_dir / f"global_rgb_{year}.zarr"
+    has_global = global_dir.exists()
+
+    if not zone_dirs and not has_global:
+        console.print(f"[red]No stores found for year {year}[/red]")
+        return 1
+
+    console.print(f"[bold]Consolidating stores for year {year}[/bold]")
+    console.print(f"  Version:  {version}")
+    console.print(f"  Zones:    {sorted(zone_dirs.keys())}")
+    console.print(f"  Global:   {'yes' if has_global else 'no'}")
+    console.print(f"  Target:   {year_store}")
+    if dry_run:
+        console.print("  [yellow]DRY RUN — no changes will be made[/yellow]")
+
+    # 2. Check for conflicts
+    for zone_num, zone_dir in sorted(zone_dirs.items()):
+        target = year_store / f"utm{zone_num:02d}"
+        if zone_dir.exists() and target.exists():
+            console.print(
+                f"[red]Error: both {zone_dir.name} and "
+                f"{year_store.name}/utm{zone_num:02d} exist — "
+                f"ambiguous state, manual resolution required[/red]"
+            )
+            return 1
+    if has_global and (year_store / "global_rgb").exists():
+        console.print(
+            f"[red]Error: both {global_dir.name} and "
+            f"{year_store.name}/global_rgb exist — "
+            f"ambiguous state, manual resolution required[/red]"
+        )
+        return 1
+
+    # 3. Create year store root
+    if not year_store.exists():
+        console.print(f"  mkdir {year_store.name}/")
+        if not dry_run:
+            year_store.mkdir()
+
+    # Write root zarr.json (always rewritten)
+    root_meta = year_store / "zarr.json"
+    console.print(f"  write {year_store.name}/zarr.json")
+    if not dry_run:
+        from .zarr_zone import PROJ_CONVENTION, SPATIAL_CONVENTION, MULTISCALES_CONVENTION
+        meta = {
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "tessera:dataset_version": version,
+                "year": year,
+                "zarr_conventions": [
+                    PROJ_CONVENTION, SPATIAL_CONVENTION, MULTISCALES_CONVENTION,
+                ],
+            },
+        }
+        with open(str(root_meta), "w") as f:
+            _json.dump(meta, f, indent=2)
+
+    # 4. Move zone stores
+    for zone_num, zone_dir in sorted(zone_dirs.items()):
+        target = year_store / f"utm{zone_num:02d}"
+        if not zone_dir.exists() and target.exists():
+            console.print(f"  skip {zone_dir.name}/ (already migrated)")
+            continue
+        console.print(f"  rename {zone_dir.name}/ → {year_store.name}/{target.name}/")
+        if not dry_run:
+            os.rename(str(zone_dir), str(target))
+
+    # 5. Move global preview
+    if has_global:
+        target = year_store / "global_rgb"
+        if not global_dir.exists() and target.exists():
+            console.print(f"  skip {global_dir.name}/ (already migrated)")
+        else:
+            console.print(f"  rename {global_dir.name}/ → {year_store.name}/global_rgb/")
+            if not dry_run:
+                os.rename(str(global_dir), str(target))
+
+    # 6. Clean up zone completion markers
+    if not dry_run:
+        for marker in year_store.glob(".zone_*_done"):
+            console.print(f"  remove {marker.name}")
+            marker.unlink()
+
+    # 7. Consolidate metadata
+    if not dry_run:
+        console.print("  consolidating metadata...")
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Consolidated metadata")
+            _zarr.consolidate_metadata(str(year_store))
+
+    console.print(
+        f"\n[bold green]Done: {len(zone_dirs)} zone(s)"
+        f"{' + global preview' if has_global else ''}"
+        f" → {year_store.name}[/bold green]"
+    )
+    return 0
+
+
 def main():
     """Main entry point for the geotessera-registry CLI tool."""
     # Configure logging with rich handler
@@ -3403,6 +3528,35 @@ Directory Structure:
         help="Show what would change without modifying stores",
     )
     migrate_parser.set_defaults(func=zarr_migrate_attrs_command)
+
+    # zarr-consolidate command
+    consolidate_parser = subparsers.add_parser(
+        "zarr-consolidate",
+        help="Consolidate per-zone Zarr stores into a single per-year store",
+    )
+    consolidate_parser.add_argument(
+        "zarr_dir",
+        type=Path,
+        help="Directory containing utm*_YYYY.zarr stores to consolidate",
+    )
+    consolidate_parser.add_argument(
+        "--year",
+        type=int,
+        required=True,
+        help="Year to consolidate",
+    )
+    consolidate_parser.add_argument(
+        "--version",
+        type=str,
+        default="v1",
+        help="Dataset version string (default: v1)",
+    )
+    consolidate_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print operations without executing them",
+    )
+    consolidate_parser.set_defaults(func=zarr_consolidate_command)
 
     args = parser.parse_args()
 
