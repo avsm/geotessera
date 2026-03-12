@@ -1522,14 +1522,6 @@ def _reproject_chunk(
     if tile_h <= 0 or tile_w <= 0:
         return False
 
-    # Skip if this chunk is already fully populated (resume after crash).
-    # Reading 512x512x4 uint8 (~1 MB) is much cheaper than reprojecting.
-    existing = np.asarray(
-        global_arr[row0 : row0 + tile_h, col0 : col0 + tile_w, :]
-    )
-    if existing[:, :, 3].all():  # alpha channel fully non-zero
-        return True
-
     tile_west = west + col0 * GLOBAL_BASE_RES
     tile_north = north - row0 * GLOBAL_BASE_RES
     tile_east = tile_west + tile_w * GLOBAL_BASE_RES
@@ -1754,16 +1746,78 @@ def _reproject_zone(
 
     chunks_total = n_chunk_rows * n_chunk_cols
 
-    # Build flat list of work items (all serializable scalars)
+    # Pre-filter: use binary search on chunk file existence to find the
+    # resume frontier.  Chunks are written in row-major order, so the
+    # written set is a contiguous prefix (with a small ragged tail from
+    # in-flight workers at crash time).  Binary search is O(log n) vs
+    # O(n) linear scan — critical when n ≈ 1.8M and zone is already done.
+    chunk_dir = store_path / "0" / "rgb" / "c"
+
+    def _chunk_exists(linear_idx: int) -> bool:
+        cr = chunk_row_start + linear_idx // n_chunk_cols
+        cc = chunk_col_start + linear_idx % n_chunk_cols
+        return (chunk_dir / str(cr) / str(cc) / "0").exists()
+
     work_items = []
-    for cr_offset in range(n_chunk_rows):
-        cr = chunk_row_start + cr_offset
-        for cc_offset in range(n_chunk_cols):
-            cc = chunk_col_start + cc_offset
+    skipped = 0
+
+    if force:
+        for cr_offset in range(n_chunk_rows):
+            cr = chunk_row_start + cr_offset
+            for cc_offset in range(n_chunk_cols):
+                cc = chunk_col_start + cc_offset
+                work_items.append((
+                    cr, cc, zone_epsg, src_pixel,
+                    src_origin_e, src_origin_n, src_h, src_w,
+                ))
+    elif chunks_total > 0 and _chunk_exists(chunks_total - 1):
+        # Last chunk exists → zone is fully written
+        skipped = chunks_total
+    elif chunks_total > 0 and not _chunk_exists(0):
+        # First chunk missing → nothing written, process all (no stat calls)
+        for cr_offset in range(n_chunk_rows):
+            cr = chunk_row_start + cr_offset
+            for cc_offset in range(n_chunk_cols):
+                cc = chunk_col_start + cc_offset
+                work_items.append((
+                    cr, cc, zone_epsg, src_pixel,
+                    src_origin_e, src_origin_n, src_h, src_w,
+                ))
+    elif chunks_total > 0:
+        # Binary search for the first missing chunk in row-major order
+        lo, hi = 0, chunks_total - 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if _chunk_exists(mid):
+                lo = mid + 1
+            else:
+                hi = mid
+        # lo = first missing index; back up by a margin to catch gaps
+        # from out-of-order completion in the process pool
+        scan_from = max(0, lo - workers * 2)
+        skipped = scan_from
+        # Linear check only from the frontier onwards
+        for linear_idx in range(scan_from, chunks_total):
+            cr = chunk_row_start + linear_idx // n_chunk_cols
+            cc = chunk_col_start + linear_idx % n_chunk_cols
+            if _chunk_exists(linear_idx):
+                skipped += 1
+                continue
             work_items.append((
                 cr, cc, zone_epsg, src_pixel,
                 src_origin_e, src_origin_n, src_h, src_w,
             ))
+
+    if skipped and console is not None:
+        console.print(
+            f"    Skipping {skipped}/{chunks_total} already-populated chunks, "
+            f"{len(work_items)} to process"
+        )
+
+    if not work_items:
+        if console is not None:
+            console.print(f"    All chunks already populated")
+        return (row_start, row_end, col_start, col_end, False)
 
     chunks_written = 0
 
@@ -1780,7 +1834,7 @@ def _reproject_zone(
             console=console,
         ) as progress:
             ptask = progress.add_task(
-                f"Reprojecting zone {zone_num:02d}", total=chunks_total,
+                f"Reprojecting zone {zone_num:02d}", total=len(work_items),
             )
             with ProcessPoolExecutor(
                 max_workers=workers,
