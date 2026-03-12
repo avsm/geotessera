@@ -4,11 +4,15 @@ This module provides tools for building and reading Zarr v3 stores that
 consolidate all tiles within a UTM zone into a single store per year.
 This enables efficient spatial subsetting and cloud-native access.
 
-Store layout (sharded, zstd-compressed):
-    utm{zone:02d}_{year}.zarr/
-        embeddings        # int8    (H, W, 128)  chunks=(4,4,128)   shards=(256,256,128)
-        scales            # float32 (H, W)       chunks=(4,4)       shards=(256,256)
-        rgb               # uint8   (H, W, 4)    chunks=(4,4,4)     shards=(256,256,4)   [optional]
+Store layout (one store per year, zone groups within):
+    {year}.zarr/
+        zarr.json             # root: tessera:dataset_version, year
+        utm{zone:02d}/        # one group per UTM zone
+            embeddings        # int8    (H, W, 128)  chunks=(4,4,128)   shards=(256,256,128)
+            scales            # float32 (H, W)       chunks=(4,4)       shards=(256,256)
+            rgb               # uint8   (H, W, 4)    chunks=(4,4,4)     shards=(256,256,4)   [optional]
+        global_rgb/           # global EPSG:4326 preview
+            {level}/rgb       # uint8   (H, W, 4)    chunks=(512,512,4)
 
 NaN in scales indicates no-data (water or no coverage).
 Per-pixel inner chunks enable O(2KB) single-pixel lookups via HTTP range
@@ -516,27 +520,60 @@ def build_shard_index(
 # =============================================================================
 
 
-def _store_name(zone: int, year: int) -> str:
-    return f"utm{zone:02d}_{year}.zarr"
+def _year_store_name(year: int) -> str:
+    """Return the Zarr store directory name for a given year."""
+    return f"{year}.zarr"
+
+
+def _zone_group_name(zone: int) -> str:
+    """Return the group name for a UTM zone within a year store."""
+    return f"utm{zone:02d}"
+
+
+def _ensure_year_store(year_store_path: Path, year: int, dataset_version: str = "v1") -> None:
+    """Create the year store root if it doesn't exist."""
+    import json as _json
+    os.makedirs(str(year_store_path), exist_ok=True)
+    root_meta = year_store_path / "zarr.json"
+    if not root_meta.exists():
+        meta = {
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "tessera:dataset_version": dataset_version,
+                "year": year,
+                "zarr_conventions": [PROJ_CONVENTION, SPATIAL_CONVENTION],
+            },
+        }
+        with open(str(root_meta), "w") as f:
+            _json.dump(meta, f, indent=2)
 
 
 def create_zone_store(
     zone_grid: ZoneGrid,
-    output_dir: Path,
+    year_store_path: Path,
     geotessera_version: str = "unknown",
     dataset_version: str = "v1",
 ) -> "zarr.Group":
-    """Create a new Zarr v3 store for a UTM zone."""
+    """Create a new Zarr v3 zone group within a year store."""
+    import json as _json
     import zarr
     from zarr.codecs import BloscCodec
 
-    store_path = output_dir / _store_name(zone_grid.zone, zone_grid.year)
+    zone_group = _zone_group_name(zone_grid.zone)
+    zone_dir = year_store_path / zone_group
 
-    if store_path.exists():
+    if zone_dir.exists():
         import shutil
-        shutil.rmtree(store_path)
+        shutil.rmtree(str(zone_dir))
 
-    store = zarr.open_group(store_path, mode="w", zarr_format=3)
+    os.makedirs(str(zone_dir), exist_ok=True)
+    zone_meta = zone_dir / "zarr.json"
+    with open(str(zone_meta), "w") as f:
+        _json.dump({"zarr_format": 3, "node_type": "group", "attributes": {}}, f)
+
+    root = zarr.open_group(str(year_store_path), mode="r+", zarr_format=3)
+    store = root[zone_group]
 
     store.create_array(
         "embeddings",
@@ -936,11 +973,16 @@ def build_zone_stores(
         return []
 
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create year store root ONCE before per-zone loop (TOCTOU prevention)
+    year_store_path = output_dir / _year_store_name(year)
+    _ensure_year_store(year_store_path, year, dataset_version=dataset_version)
+
     created_stores: List[Path] = []
 
     for zone_num, tile_infos in sorted(zones_dict.items()):
         zone_grid = compute_zone_grid(tile_infos, year)
-        store_name = _store_name(zone_grid.zone, zone_grid.year)
+        zone_group = _zone_group_name(zone_grid.zone)
 
         if console is not None:
             grid_w_km = zone_grid.width_px * zone_grid.pixel_size / 1000
@@ -950,11 +992,11 @@ def build_zone_stores(
                 f"[dim]EPSG:{zone_grid.canonical_epsg}[/dim] "
                 f"[dim]{zone_grid.width_px}x{zone_grid.height_px}px "
                 f"({grid_w_km:.0f}x{grid_h_km:.0f}km)[/dim] "
-                f"-> {store_name}"
+                f"-> {year_store_path.name}/{zone_group}"
             )
 
         create_zone_store(
-            zone_grid, output_dir,
+            zone_grid, year_store_path,
             geotessera_version=geotessera_version,
             dataset_version=dataset_version,
         )
@@ -972,14 +1014,15 @@ def build_zone_stores(
             )
 
         # Write shards in parallel using processes (bypasses GIL)
-        store_path = str(output_dir / _store_name(zone_grid.zone, zone_grid.year))
+        # Workers open the zone group within the year store
+        zone_store_path = str(year_store_path / zone_group)
         _run_parallel_processes(
             _write_one_shard_worker,
-            shard_specs, workers, store_path, console,
+            shard_specs, workers, zone_store_path, console,
             label="Writing shards",
         )
 
-        created_stores.append(output_dir / store_name)
+        created_stores.append(year_store_path / zone_group)
 
     return created_stores
 
@@ -1191,15 +1234,17 @@ def write_preview_pass(
 
 
 def add_rgb_to_existing_store(
-    store_path: Path,
+    year_store_path: Path,
+    zone_group: str,
     workers: Optional[int] = None,
     console: Optional["rich.console.Console"] = None,
     progress_callback=None,
 ) -> None:
-    """Add RGB preview array to an existing Zarr store.
+    """Add RGB preview array to an existing zone group within a year store.
 
     Args:
-        store_path: Path to the Zarr store.
+        year_store_path: Path to the year Zarr store.
+        zone_group: Zone group name (e.g. "utm29").
         workers: Number of threads for parallel I/O.
         console: Optional Rich Console for local progress display.
         progress_callback: Optional callable(phase, completed, total) for
@@ -1207,8 +1252,10 @@ def add_rgb_to_existing_store(
     """
     import zarr
 
-    _ensure_rgb_array(store_path)
-    store = zarr.open_group(str(store_path), mode="r+")
+    zone_fs_path = year_store_path / zone_group
+    _ensure_rgb_array(zone_fs_path)
+    root = zarr.open_group(str(year_store_path), mode="r+", zarr_format=3)
+    store = root[zone_group]
 
     if workers is None:
         workers = _default_workers()
@@ -1313,20 +1360,22 @@ def _utm_array_to_xarray(
 # =============================================================================
 
 
-def open_zone_store(path) -> "xarray.Dataset":
-    """Open a zone Zarr store as an xarray Dataset."""
+def open_zone_store(year_store_path, zone_group: str) -> "xarray.Dataset":
+    """Open a zone group within a year Zarr store as an xarray Dataset."""
     import xarray as xr
-    return xr.open_zarr(str(path))
+    return xr.open_zarr(str(year_store_path), group=zone_group)
 
 
 def read_region_from_zone(
-    path,
+    year_store_path,
+    zone_group: str,
     bbox: Tuple[float, float, float, float],
 ) -> Tuple[np.ndarray, np.ndarray, dict]:
-    """Read a spatial subset from a zone store.
+    """Read a spatial subset from a zone group within a year store.
 
     Args:
-        path: Path to the .zarr directory
+        year_store_path: Path to the year .zarr directory
+        zone_group: Zone group name (e.g. "utm29")
         bbox: (min_easting, min_northing, max_easting, max_northing) in UTM
 
     Returns:
@@ -1334,7 +1383,7 @@ def read_region_from_zone(
     """
     import zarr
 
-    store = zarr.open_group(str(path), mode="r")
+    store = zarr.open_group(str(year_store_path), mode="r", path=zone_group)
     attrs = dict(store.attrs)
 
     transform = attrs["spatial:transform"]
@@ -1361,41 +1410,51 @@ def read_region_from_zone(
     return np.asarray(embeddings), np.asarray(scales), attrs
 
 
-def _ensure_global_store(store_path: Path, num_levels: int) -> None:
-    """Create the global preview store with fixed dimensions if it doesn't exist.
+def _ensure_global_store(year_store_path: Path, num_levels: int) -> None:
+    """Create the global_rgb group within the year store if it doesn't exist.
 
-    If the store already exists with correct dimensions, this is a no-op.
-    Creates level 0 through level (num_levels-1), each with an 'rgb' array
-    and a 'band' coordinate array.
+    If the group already exists with correct dimensions, this is a no-op.
+    Creates global_rgb/{level}/rgb arrays for level 0 through num_levels-1.
     """
     import json as _json
     import zarr
     from zarr.codecs import BloscCodec
 
-    if store_path.exists():
-        root = zarr.open_group(str(store_path), mode="r")
-        if "0/rgb" in root:
-            shape = root["0/rgb"].shape
-            if shape == (GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W, GLOBAL_NUM_BANDS):
-                return
-            # Old-format store with different dimensions — replace it
-            import shutil
-            logger.warning(
-                "Existing store %s has shape %s (expected %s), "
-                "replacing with fixed global grid",
-                store_path, shape,
-                (GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W, GLOBAL_NUM_BANDS),
-            )
-            shutil.rmtree(str(store_path))
+    root = zarr.open_group(str(year_store_path), mode="r+", zarr_format=3)
 
-    root = zarr.open_group(str(store_path), mode="w", zarr_format=3)
+    if "global_rgb/0/rgb" in root:
+        shape = root["global_rgb/0/rgb"].shape
+        if shape == (GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W, GLOBAL_NUM_BANDS):
+            return
+        # Old-format group with different dimensions — replace it
+        import shutil
+        global_rgb_dir = year_store_path / "global_rgb"
+        logger.warning(
+            "Existing global_rgb group has shape %s (expected %s), "
+            "replacing with fixed global grid",
+            shape,
+            (GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W, GLOBAL_NUM_BANDS),
+        )
+        shutil.rmtree(str(global_rgb_dir))
+
+    # Create global_rgb group directory and zarr.json
+    global_rgb_dir = year_store_path / "global_rgb"
+    os.makedirs(str(global_rgb_dir), exist_ok=True)
+    global_rgb_meta = global_rgb_dir / "zarr.json"
+    if not global_rgb_meta.exists():
+        with open(str(global_rgb_meta), "w") as f:
+            _json.dump(
+                {"zarr_format": 3, "node_type": "group", "attributes": {}},
+                f,
+            )
+
     h, w = GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W
     band_data = np.arange(GLOBAL_NUM_BANDS, dtype=np.int32)
 
     for lvl in range(num_levels):
         if h < 1 or w < 1:
             break
-        level_dir = os.path.join(str(store_path), str(lvl))
+        level_dir = os.path.join(str(global_rgb_dir), str(lvl))
         os.makedirs(level_dir, exist_ok=True)
         group_meta = os.path.join(level_dir, "zarr.json")
         if not os.path.exists(group_meta):
@@ -1405,9 +1464,9 @@ def _ensure_global_store(store_path: Path, num_levels: int) -> None:
                     f,
                 )
         # Re-open to pick up manually created group metadata
-        root = zarr.open_group(str(store_path), mode="r+", zarr_format=3)
+        root = zarr.open_group(str(year_store_path), mode="r+", zarr_format=3)
         root.create_array(
-            f"{lvl}/rgb",
+            f"global_rgb/{lvl}/rgb",
             shape=(h, w, GLOBAL_NUM_BANDS),
             chunks=(GLOBAL_CHUNK, GLOBAL_CHUNK, GLOBAL_NUM_BANDS),
             dtype=np.uint8,
@@ -1416,7 +1475,7 @@ def _ensure_global_store(store_path: Path, num_levels: int) -> None:
             dimension_names=["lat", "lon", "band"],
         )
         root.create_array(
-            f"{lvl}/band",
+            f"global_rgb/{lvl}/band",
             data=band_data,
             chunks=(GLOBAL_NUM_BANDS,),
         )
@@ -1424,7 +1483,8 @@ def _ensure_global_store(store_path: Path, num_levels: int) -> None:
         w //= 2
 
     from topozarr.metadata import create_multiscale_metadata
-    actual_levels = len([k for k in root.keys() if k.isdigit()])
+    global_rgb_group = root["global_rgb"]
+    actual_levels = len([k for k in global_rgb_group.keys() if k.isdigit()])
     ms_attrs = create_multiscale_metadata(actual_levels, "EPSG:4326", "mean")
     # topozarr already sets zarr_conventions with multiscales + proj:, and sets proj:code
     # Add spatial: convention to the registration list
@@ -1447,11 +1507,12 @@ def _ensure_global_store(store_path: Path, num_levels: int) -> None:
         h_lvl //= 2
         w_lvl //= 2
         res *= 2.0
-    root.attrs.update(ms_attrs)
+    # Multiscales metadata goes on the global_rgb group, not the year store root
+    global_rgb_group.attrs.update(ms_attrs)
     import warnings
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="Consolidated metadata")
-        zarr.consolidate_metadata(str(store_path))
+        zarr.consolidate_metadata(str(year_store_path))
 
 
 # Per-worker state for reprojection process pool
@@ -1460,14 +1521,14 @@ _reproj_worker_src_arr = None
 _reproj_worker_to_utm = None
 
 
-def _init_reproj_worker(global_store_path: str, zone_store_path: str, zone_epsg: int):
+def _init_reproj_worker(global_store_path: str, zone_group: str, zone_epsg: int):
     """Process pool initializer: open zarr stores and create transformer."""
     global _reproj_worker_global_arr, _reproj_worker_src_arr, _reproj_worker_to_utm
     import zarr
     from pyproj import Transformer
     global_root = zarr.open_group(global_store_path, mode="r+", zarr_format=3)
-    _reproj_worker_global_arr = global_root["0/rgb"]
-    zone_store = zarr.open_group(zone_store_path, mode="r")
+    _reproj_worker_global_arr = global_root["global_rgb/0/rgb"]
+    zone_store = zarr.open_group(global_store_path, mode="r", path=zone_group)
     _reproj_worker_src_arr = zone_store["rgb"]
     _reproj_worker_to_utm = Transformer.from_crs(
         "EPSG:4326", f"EPSG:{zone_epsg}", always_xy=True,
@@ -1686,7 +1747,7 @@ def _zone_output_bounds(
 def _reproject_zone(
     store_path: Path,
     zone_num: int,
-    zone_store_path: Path,
+    zone_group: str,
     zone_epsg: int,
     zone_transform: list,
     zone_shape: tuple,
@@ -1781,7 +1842,7 @@ def _reproject_zone(
             with ProcessPoolExecutor(
                 max_workers=workers,
                 initializer=_init_reproj_worker,
-                initargs=(str(store_path), str(zone_store_path), zone_epsg),
+                initargs=(str(store_path), zone_group, zone_epsg),
             ) as pool:
                 futures = {
                     pool.submit(_reproject_chunk_worker, item): item
@@ -1799,7 +1860,7 @@ def _reproject_zone(
         with ProcessPoolExecutor(
             max_workers=workers,
             initializer=_init_reproj_worker,
-            initargs=(str(store_path), str(zone_store_path), zone_epsg),
+            initargs=(str(store_path), zone_group, zone_epsg),
         ) as pool:
             futures = {
                 pool.submit(_reproject_chunk_worker, item): item
@@ -1844,8 +1905,8 @@ def _coarsen_zone_pyramid(
     prev_col_start, prev_col_end = col_start, col_end
 
     for lvl in range(1, num_levels):
-        prev_arr_path = f"{lvl - 1}/rgb"
-        cur_arr_path = f"{lvl}/rgb"
+        prev_arr_path = f"global_rgb/{lvl - 1}/rgb"
+        cur_arr_path = f"global_rgb/{lvl}/rgb"
 
         if prev_arr_path not in root or cur_arr_path not in root:
             break
@@ -2224,14 +2285,15 @@ def build_global_preview(
     force: bool = False,
     skip_reproject: bool = False,
 ) -> Path:
-    """Create or update global EPSG:4326 preview store from per-zone UTM stores.
+    """Create or update global EPSG:4326 preview within the year store.
 
-    The output store is always ``{zarr_dir}/global_rgb_{year}.zarr``.
-    If the store already exists, only the specified zones are re-processed.
+    The global preview is stored as ``{year}.zarr/global_rgb/``.
+    If the group already exists, only the specified zones are re-processed.
 
-    Completed zones are checkpointed in the store attrs so that a
-    crash/OOM mid-build can be resumed without reprocessing finished
-    zones.  Pass ``force=True`` to ignore checkpoints and reprocess all.
+    Completed zones are checkpointed via ``.zone_NN_done`` marker files
+    so that a crash/OOM mid-build can be resumed without reprocessing
+    finished zones.  Pass ``force=True`` to ignore checkpoints and
+    reprocess all.
     """
     import gc
     import zarr
@@ -2239,41 +2301,50 @@ def build_global_preview(
     if console is not None:
         console.print(f"[bold]Building global preview (year={year})[/bold]")
 
-    # 1. Discover zone stores
-    pattern = re.compile(rf"^utm(\d{{2}})_{year}\.zarr$")
-    zone_stores: Dict[int, Path] = {}
+    # 1. Discover zone groups within the year store
+    year_store_path = zarr_dir / _year_store_name(year)
+    if not year_store_path.is_dir():
+        raise FileNotFoundError(
+            f"Year store not found: {year_store_path}"
+        )
 
-    for entry in sorted(zarr_dir.iterdir()):
-        if not entry.is_dir():
-            continue
-        m = pattern.match(entry.name)
+    root = zarr.open_group(str(year_store_path), mode="r")
+    zone_pattern = re.compile(r"^utm(\d{2})$")
+    zone_groups: Dict[int, str] = {}
+
+    for key in sorted(root.keys()):
+        m = zone_pattern.match(key)
         if m is None:
             continue
         zone_num = int(m.group(1))
         if zones is not None and zone_num not in zones:
             continue
-        zone_stores[zone_num] = entry
+        zone_groups[zone_num] = key
 
-    if not zone_stores:
-        msg = f"No zone stores found in {zarr_dir} for year {year}"
+    if not zone_groups:
+        msg = f"No zone groups found in {year_store_path} for year {year}"
         if zones is not None:
             msg += f" (zones filter: {zones})"
         raise FileNotFoundError(msg)
 
     if console is not None:
         console.print(
-            f"  Found {len(zone_stores)} zone store(s): "
-            f"{sorted(zone_stores.keys())}"
+            f"  Found {len(zone_groups)} zone group(s): "
+            f"{sorted(zone_groups.keys())}"
         )
 
     # 2. Generate missing RGB previews (parallelised across zones)
     #    Check has_rgb_preview attr (not just array existence) because the
     #    array may exist but be empty from a failed or interrupted build.
+    #    _run_rgb_generation_parallel and helpers operate on filesystem paths;
+    #    year_store_path / zone_group_name is a valid fs path with the same
+    #    internal structure (embeddings/, scales/, rgb/).
     missing_rgb = []
-    for zone_num, store_path in sorted(zone_stores.items()):
-        store = zarr.open_group(str(store_path), mode="r")
-        if not store.attrs.get("has_rgb_preview", False):
-            missing_rgb.append((zone_num, store_path))
+    for zone_num, zone_group in sorted(zone_groups.items()):
+        zone_store = root[zone_group]
+        if not zone_store.attrs.get("has_rgb_preview", False):
+            zone_fs_path = year_store_path / zone_group
+            missing_rgb.append((zone_num, zone_fs_path))
 
     if missing_rgb:
         _run_rgb_generation_parallel(
@@ -2281,10 +2352,12 @@ def build_global_preview(
         )
 
     # 3. Read zone metadata
+    #    Re-open in case RGB generation updated attrs
+    root = zarr.open_group(str(year_store_path), mode="r")
     zone_infos: Dict[int, dict] = {}
-    for zone_num, store_path in sorted(zone_stores.items()):
-        store = zarr.open_group(str(store_path), mode="r")
-        attrs = dict(store.attrs)
+    for zone_num, zone_group in sorted(zone_groups.items()):
+        zone_store = root[zone_group]
+        attrs = dict(zone_store.attrs)
         if not attrs.get("has_rgb_preview", False):
             if console is not None:
                 console.print(
@@ -2292,20 +2365,19 @@ def build_global_preview(
                 )
             continue
         zone_infos[zone_num] = {
-            "store_path": store_path,
+            "zone_group": zone_group,
             "epsg": int(attrs["proj:code"].split(":")[1]),
             "transform": list(attrs["spatial:transform"]),
-            "shape": store["rgb"].shape,
+            "shape": zone_store["rgb"].shape,
         }
 
     if not zone_infos:
-        raise FileNotFoundError("No zone stores with rgb arrays found")
+        raise FileNotFoundError("No zone groups with rgb arrays found")
 
-    # 4. Ensure global store exists
-    output_path = zarr_dir / f"global_rgb_{year}.zarr"
+    # 4. Ensure global_rgb group exists within year store
     if console is not None:
-        console.print(f"  Output: {output_path}")
-    _ensure_global_store(output_path, num_levels)
+        console.print(f"  Output: {year_store_path}/global_rgb/")
+    _ensure_global_store(year_store_path, num_levels)
     if console is not None:
         console.print(
             f"  Global grid: {GLOBAL_LEVEL0_W}x{GLOBAL_LEVEL0_H} "
@@ -2341,9 +2413,9 @@ def build_global_preview(
             did_work = True  # force pyramid rebuild
         else:
             row_start, row_end, col_start, col_end, did_work = _reproject_zone(
-                store_path=output_path,
+                store_path=year_store_path,
                 zone_num=zone_num,
-                zone_store_path=zinfo["store_path"],
+                zone_group=zinfo["zone_group"],
                 zone_epsg=zinfo["epsg"],
                 zone_transform=zinfo["transform"],
                 zone_shape=zinfo["shape"],
@@ -2358,7 +2430,7 @@ def build_global_preview(
         if console is not None:
             console.print("    Building pyramid...")
         _coarsen_zone_pyramid(
-            store_path=output_path,
+            store_path=year_store_path,
             row_start=row_start,
             row_end=row_end,
             col_start=col_start,
@@ -2373,11 +2445,11 @@ def build_global_preview(
     import warnings
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="Consolidated metadata")
-        zarr.consolidate_metadata(str(output_path))
+        zarr.consolidate_metadata(str(year_store_path))
     if console is not None:
         console.print(
-            f"\n  [bold green]Global store updated: {output_path}[/bold green]"
+            f"\n  [bold green]Global store updated: {year_store_path}[/bold green]"
         )
         console.print(f"  Zones processed: {sorted(zone_infos.keys())}")
 
-    return output_path
+    return year_store_path

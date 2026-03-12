@@ -40,6 +40,8 @@ class Tile:
         self._scales_path = None
         self._landmask_path = None
         self._zone_store_path = None
+        self._year_store_path = None
+        self._zone_group = None
 
         # Spatial metadata (loaded during construction)
         self.crs = None
@@ -115,7 +117,7 @@ class Tile:
         elif self._format == "zarr":
             return self._zarr_path.exists()
         elif self._format == "zone_zarr":
-            return self._zone_store_path is not None and Path(self._zone_store_path).exists()
+            return self._year_store_path is not None and Path(self._year_store_path).exists()
         else:
             return False
 
@@ -239,19 +241,21 @@ class Tile:
     @classmethod
     def from_zone_zarr(
         cls,
-        zone_store_path: Path,
+        year_store_path: Path,
+        zone_group: str,
         lon: float,
         lat: float,
         year: int,
     ) -> "Tile":
-        """Create a Tile by reading from a zone-wide Zarr store.
+        """Create a Tile by reading from a zone group within a year Zarr store.
 
-        Extracts the tile-equivalent region from a zone store by looking up
+        Extracts the tile-equivalent region from a zone group by looking up
         the tile's landmask to determine its CRS, transform, and dimensions,
         then reading the corresponding pixel region from the zone arrays.
 
         Args:
-            zone_store_path: Path to utm{zone}_{year}.zarr directory
+            year_store_path: Path to {year}.zarr directory
+            zone_group: Zone group name (e.g. "utm29")
             lon: Tile center longitude
             lat: Tile center latitude
             year: Year of embeddings
@@ -261,13 +265,14 @@ class Tile:
         """
         tile = cls(lon, lat, year)
         tile._format = "zone_zarr"
-        tile._zarr_path = Path(zone_store_path)
-        tile._zone_store_path = zone_store_path
+        tile._year_store_path = Path(year_store_path)
+        tile._zone_group = zone_group
+        tile._zone_store_path = year_store_path
 
         return tile
 
     def _load_from_zone_zarr(self) -> np.ndarray:
-        """Load dequantized embedding from a zone-wide Zarr store.
+        """Load dequantized embedding from a zone group within a year store.
 
         Uses the tile's spatial metadata (set via landmask) to compute
         the pixel region, then reads and dequantizes.
@@ -275,7 +280,7 @@ class Tile:
         import zarr
         from geotessera.core import dequantize_embedding
 
-        store = zarr.open_group(str(self._zone_store_path), mode="r")
+        store = zarr.open_group(str(self._year_store_path), mode="r", path=self._zone_group)
         attrs = dict(store.attrs)
 
         transform_list = attrs["spatial:transform"]
