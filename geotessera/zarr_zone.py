@@ -1436,6 +1436,7 @@ def _ensure_global_store(year_store_path: Path, num_levels: int) -> None:
             (GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W, GLOBAL_NUM_BANDS),
         )
         shutil.rmtree(str(global_rgb_dir))
+        root = zarr.open_group(str(year_store_path), mode="r+", zarr_format=3)
 
     # Create global_rgb group directory and zarr.json
     global_rgb_dir = year_store_path / "global_rgb"
@@ -1526,10 +1527,9 @@ def _init_reproj_worker(global_store_path: str, zone_group: str, zone_epsg: int)
     global _reproj_worker_global_arr, _reproj_worker_src_arr, _reproj_worker_to_utm
     import zarr
     from pyproj import Transformer
-    global_root = zarr.open_group(global_store_path, mode="r+", zarr_format=3)
-    _reproj_worker_global_arr = global_root["global_rgb/0/rgb"]
-    zone_store = zarr.open_group(global_store_path, mode="r", path=zone_group)
-    _reproj_worker_src_arr = zone_store["rgb"]
+    root = zarr.open_group(global_store_path, mode="r+", zarr_format=3)
+    _reproj_worker_global_arr = root["global_rgb/0/rgb"]
+    _reproj_worker_src_arr = root[zone_group + "/rgb"]
     _reproj_worker_to_utm = Transformer.from_crs(
         "EPSG:4326", f"EPSG:{zone_epsg}", always_xy=True,
     )

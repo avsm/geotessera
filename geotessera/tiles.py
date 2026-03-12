@@ -117,7 +117,9 @@ class Tile:
         elif self._format == "zarr":
             return self._zarr_path.exists()
         elif self._format == "zone_zarr":
-            return self._year_store_path is not None and Path(self._year_store_path).exists()
+            return (self._year_store_path is not None
+                    and self._year_store_path.exists()
+                    and (self._year_store_path / self._zone_group).exists())
         else:
             return False
 
@@ -267,7 +269,6 @@ class Tile:
         tile._format = "zone_zarr"
         tile._year_store_path = Path(year_store_path)
         tile._zone_group = zone_group
-        tile._zone_store_path = year_store_path
 
         return tile
 
