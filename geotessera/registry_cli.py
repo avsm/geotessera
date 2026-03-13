@@ -3123,10 +3123,10 @@ def zarr_consolidate_command(args):
             if not dry_run:
                 os.rename(str(global_dir), str(target))
 
-    # 6. Clean up zone completion markers
+    # 6. Clean up zone completion markers (may be at root or inside moved zone dirs)
     if not dry_run:
-        for marker in year_store.glob(".zone_*_done"):
-            console.print(f"  remove {marker.name}")
+        for marker in year_store.rglob(".zone_*_done"):
+            console.print(f"  remove {marker.relative_to(year_store)}")
             marker.unlink()
 
     # 7. Consolidate metadata
@@ -3135,6 +3135,7 @@ def zarr_consolidate_command(args):
         import warnings
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message="Consolidated metadata")
+            warnings.filterwarnings("ignore", message="Object at .zone_")
             _zarr.consolidate_metadata(str(year_store))
 
     console.print(
