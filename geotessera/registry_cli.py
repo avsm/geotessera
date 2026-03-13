@@ -425,12 +425,6 @@ def find_tiff_files_by_blocks(base_dir):
     return files_by_block
 
 
-def generate_master_registry(registry_dir):
-    """Generate a master registry.txt file containing hashes of all registry files."""
-    # This function is no longer used but kept for compatibility
-    # The actual generation of registry.txt should be done separately
-    pass
-
 
 def create_landmasks_parquet_database(base_dir, output_path, console):
     """Create a Parquet database for landmasks by reading from SHA256SUM file.
@@ -2538,8 +2532,9 @@ def zarr_build_command(args):
         import zarr
 
         zarr_dir = Path(output_dir)
-        if not zarr_dir.is_dir():
-            console.print(f"[red]Error: directory not found: {zarr_dir}[/red]")
+        year_store = zarr_dir / f"{year}.zarr"
+        if not year_store.is_dir():
+            console.print(f"[red]Error: store not found: {year_store}[/red]")
             return 1
 
         # Parse zone filter for --rgb-only mode too
@@ -2551,27 +2546,23 @@ def zarr_build_command(args):
                 console.print("[red]Error: --zones must be comma-separated integers[/red]")
                 return 1
 
-        year_pattern = _re.compile(r"^(\d{4})\.zarr$")
         zone_pattern = _re.compile(r"^utm(\d{2})$")
+        root = zarr.open_group(str(year_store), mode="r")
 
         zone_count = 0
-        for entry in sorted(zarr_dir.iterdir()):
-            if not entry.is_dir() or not year_pattern.match(entry.name):
+        for zone_name in sorted(root.keys()):
+            m = zone_pattern.match(zone_name)
+            if m is None:
                 continue
-            root = zarr.open_group(str(entry), mode="r")
-            for zone_name in sorted(root.keys()):
-                m = zone_pattern.match(zone_name)
-                if m is None:
-                    continue
-                zone_num = int(m.group(1))
-                if zone_filter is not None and zone_num not in zone_filter:
-                    continue
-                console.print(f"\n  [cyan]{entry.name}/{zone_name}[/cyan]")
-                add_rgb_to_existing_store(entry, zone_name, workers=args.workers, console=console)
-                zone_count += 1
+            zone_num = int(m.group(1))
+            if zone_filter is not None and zone_num not in zone_filter:
+                continue
+            console.print(f"\n  [cyan]{year_store.name}/{zone_name}[/cyan]")
+            add_rgb_to_existing_store(year_store, zone_name, workers=args.workers, console=console)
+            zone_count += 1
 
         if zone_count == 0:
-            console.print(f"[yellow]No zone groups found in {zarr_dir}[/yellow]")
+            console.print(f"[yellow]No zone groups found in {year_store}[/yellow]")
             return 1
         console.print(f"\n[bold green]RGB preview added to {zone_count} zone(s)[/bold green]")
         return 0
@@ -2964,187 +2955,6 @@ def stac_index_command(args):
     return 0
 
 
-def zarr_migrate_attrs_command(args):
-    """Migrate existing Zarr store attrs to GeoZarr convention format."""
-    from .zarr_zone import migrate_store_attrs
-
-    zarr_dir = Path(args.zarr_dir)
-    if not zarr_dir.is_dir():
-        console.print(f"[red]Error: {zarr_dir} is not a directory[/red]")
-        return 1
-
-    # Find all .zarr stores (zone stores only, not global)
-    stores = sorted(
-        p for p in zarr_dir.iterdir()
-        if p.is_dir() and p.name.endswith(".zarr") and not p.name.startswith("global_")
-    )
-
-    if not stores:
-        console.print(f"[yellow]No .zarr stores found in {zarr_dir}[/yellow]")
-        return 1
-
-    action = "Would migrate" if args.dry_run else "Migrating"
-    console.print(
-        f"[bold]{action} {len(stores)} store(s) in {zarr_dir}[/bold]"
-    )
-    if args.dry_run:
-        console.print("[dim](dry run — no changes will be made)[/dim]")
-
-    migrated = 0
-    skipped = 0
-    for store_path in stores:
-        result = migrate_store_attrs(store_path, dry_run=args.dry_run)
-        status = result.pop("status")
-        if status == "already_migrated":
-            console.print(f"  {store_path.name}: [dim]already migrated[/dim]")
-            skipped += 1
-        else:
-            removed = result.pop("_removed", [])
-            console.print(f"  {store_path.name}: [green]{status}[/green]")
-            for key, value in sorted(result.items()):
-                if key == "zarr_conventions":
-                    names = [c["name"] for c in value]
-                    console.print(f"    + zarr_conventions: {names}")
-                elif key == "proj:wkt2":
-                    console.print(f"    + proj:wkt2: [dim](WKT2 string)[/dim]")
-                else:
-                    console.print(f"    + {key}: {value}")
-            for key in removed:
-                console.print(f"    - {key}")
-            migrated += 1
-
-    console.print(
-        f"\n[bold]{'Would migrate' if args.dry_run else 'Migrated'}: "
-        f"{migrated}, skipped: {skipped}[/bold]"
-    )
-    return 0
-
-
-def zarr_consolidate_command(args):
-    """Consolidate per-zone Zarr stores into a single per-year store."""
-    import json as _json
-    import re
-    import zarr as _zarr
-
-    base_dir = Path(args.zarr_dir)
-    year = args.year
-    version = args.version
-    dry_run = args.dry_run
-
-    year_store = base_dir / f"{year}.zarr"
-
-    # 1. Discover zone stores
-    zone_pattern = re.compile(rf"^utm(\d{{2}})_{year}\.zarr$")
-    zone_dirs = {}
-    for entry in sorted(base_dir.iterdir()):
-        if not entry.is_dir():
-            continue
-        m = zone_pattern.match(entry.name)
-        if m:
-            zone_num = int(m.group(1))
-            zone_dirs[zone_num] = entry
-
-    # Discover global preview store
-    global_dir = base_dir / f"global_rgb_{year}.zarr"
-    has_global = global_dir.exists()
-
-    if not zone_dirs and not has_global:
-        console.print(f"[red]No stores found for year {year}[/red]")
-        return 1
-
-    console.print(f"[bold]Consolidating stores for year {year}[/bold]")
-    console.print(f"  Version:  {version}")
-    console.print(f"  Zones:    {sorted(zone_dirs.keys())}")
-    console.print(f"  Global:   {'yes' if has_global else 'no'}")
-    console.print(f"  Target:   {year_store}")
-    if dry_run:
-        console.print("  [yellow]DRY RUN — no changes will be made[/yellow]")
-
-    # 2. Check for conflicts
-    for zone_num, zone_dir in sorted(zone_dirs.items()):
-        target = year_store / f"utm{zone_num:02d}"
-        if zone_dir.exists() and target.exists():
-            console.print(
-                f"[red]Error: both {zone_dir.name} and "
-                f"{year_store.name}/utm{zone_num:02d} exist — "
-                f"ambiguous state, manual resolution required[/red]"
-            )
-            return 1
-    if has_global and (year_store / "global_rgb").exists():
-        console.print(
-            f"[red]Error: both {global_dir.name} and "
-            f"{year_store.name}/global_rgb exist — "
-            f"ambiguous state, manual resolution required[/red]"
-        )
-        return 1
-
-    # 3. Create year store root
-    if not year_store.exists():
-        console.print(f"  mkdir {year_store.name}/")
-        if not dry_run:
-            year_store.mkdir()
-
-    # Write root zarr.json (always rewritten)
-    root_meta = year_store / "zarr.json"
-    console.print(f"  write {year_store.name}/zarr.json")
-    if not dry_run:
-        from .zarr_zone import PROJ_CONVENTION, SPATIAL_CONVENTION, MULTISCALES_CONVENTION
-        meta = {
-            "zarr_format": 3,
-            "node_type": "group",
-            "attributes": {
-                "tessera:dataset_version": version,
-                "year": year,
-                "zarr_conventions": [
-                    PROJ_CONVENTION, SPATIAL_CONVENTION, MULTISCALES_CONVENTION,
-                ],
-            },
-        }
-        with open(str(root_meta), "w") as f:
-            _json.dump(meta, f, indent=2)
-
-    # 4. Move zone stores
-    for zone_num, zone_dir in sorted(zone_dirs.items()):
-        target = year_store / f"utm{zone_num:02d}"
-        if not zone_dir.exists() and target.exists():
-            console.print(f"  skip {zone_dir.name}/ (already migrated)")
-            continue
-        console.print(f"  rename {zone_dir.name}/ → {year_store.name}/{target.name}/")
-        if not dry_run:
-            os.rename(str(zone_dir), str(target))
-
-    # 5. Move global preview
-    if has_global:
-        target = year_store / "global_rgb"
-        if not global_dir.exists() and target.exists():
-            console.print(f"  skip {global_dir.name}/ (already migrated)")
-        else:
-            console.print(f"  rename {global_dir.name}/ → {year_store.name}/global_rgb/")
-            if not dry_run:
-                os.rename(str(global_dir), str(target))
-
-    # 6. Clean up zone completion markers (may be at root or inside moved zone dirs)
-    if not dry_run:
-        for marker in year_store.rglob(".zone_*_done"):
-            console.print(f"  remove {marker.relative_to(year_store)}")
-            marker.unlink()
-
-    # 7. Consolidate metadata
-    if not dry_run:
-        console.print("  consolidating metadata...")
-        import warnings
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message="Consolidated metadata")
-            warnings.filterwarnings("ignore", message="Object at .zone_")
-            _zarr.consolidate_metadata(str(year_store))
-
-    console.print(
-        f"\n[bold green]Done: {len(zone_dirs)} zone(s)"
-        f"{' + global preview' if has_global else ''}"
-        f" → {year_store.name}[/bold green]"
-    )
-    return 0
-
 
 def main():
     """Main entry point for the geotessera-registry CLI tool."""
@@ -3513,51 +3323,6 @@ Directory Structure:
         help="Output directory for STAC JSON files (default: same as zarr_dir)",
     )
     stac_index_parser.set_defaults(func=stac_index_command)
-
-    # zarr-migrate-attrs command
-    migrate_parser = subparsers.add_parser(
-        "zarr-migrate-attrs",
-        help="Migrate existing Zarr store attributes to GeoZarr convention format",
-    )
-    migrate_parser.add_argument(
-        "zarr_dir",
-        help="Directory containing .zarr stores to migrate",
-    )
-    migrate_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show what would change without modifying stores",
-    )
-    migrate_parser.set_defaults(func=zarr_migrate_attrs_command)
-
-    # zarr-consolidate command
-    consolidate_parser = subparsers.add_parser(
-        "zarr-consolidate",
-        help="Consolidate per-zone Zarr stores into a single per-year store",
-    )
-    consolidate_parser.add_argument(
-        "zarr_dir",
-        type=Path,
-        help="Directory containing utm*_YYYY.zarr stores to consolidate",
-    )
-    consolidate_parser.add_argument(
-        "--year",
-        type=int,
-        required=True,
-        help="Year to consolidate",
-    )
-    consolidate_parser.add_argument(
-        "--version",
-        type=str,
-        default="v1",
-        help="Dataset version string (default: v1)",
-    )
-    consolidate_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print operations without executing them",
-    )
-    consolidate_parser.set_defaults(func=zarr_consolidate_command)
 
     args = parser.parse_args()
 

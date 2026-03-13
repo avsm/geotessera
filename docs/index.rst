@@ -233,13 +233,16 @@ and uses sharded arrays for efficient cloud-native access.
 
 **Store Layout**::
 
-    utm{zone:02d}_{year}.zarr/
-        embeddings        # int8    (H, W, 128)  shards=(256,256,128)
-        scales            # float32 (H, W)       shards=(256,256)
-        rgb               # uint8   (H, W, 4)    shards=(256,256,4)   [optional]
-        easting           # float64 coordinate array
-        northing          # float64 coordinate array
-        band              # int32   coordinate array
+    {year}.zarr/
+        zarr.json             # root metadata
+        utm{zone:02d}/        # one group per UTM zone
+            embeddings        # int8    (H, W, 128)  shards=(256,256,128)
+            scales            # float32 (H, W)       shards=(256,256)
+            rgb               # uint8   (H, W, 4)    shards=(256,256,4)   [optional]
+            easting           # float64 coordinate array
+            northing          # float64 coordinate array
+            band              # int32   coordinate array
+        global_rgb/           # global EPSG:4326 preview [optional]
 
 **Key Design Decisions**:
 
@@ -259,7 +262,7 @@ and uses sharded arrays for efficient cloud-native access.
     geotessera-registry zarr-build /data/tessera --year 2024
 
     # Add RGB false-colour preview to existing stores
-    geotessera-registry zarr-build /data/tessera --rgb-only
+    geotessera-registry zarr-build /data/tessera --rgb-only --year 2024
 
     # Build global EPSG:4326 preview pyramid
     geotessera-registry global-preview /data/zarr --year 2024
@@ -273,12 +276,12 @@ and uses sharded arrays for efficient cloud-native access.
 
     # Read a spatial subset (UTM coordinates)
     embeddings, scales, attrs = read_region_from_zone(
-        'utm30_2024.zarr',
+        '2024.zarr', 'utm30',
         bbox=(500000, 5700000, 510000, 5710000),
     )
 
     # Open as xarray Dataset
-    ds = open_zone_store('utm30_2024.zarr')
+    ds = open_zone_store('2024.zarr', 'utm30')
 
 Understanding Tessera Embeddings
 --------------------------------

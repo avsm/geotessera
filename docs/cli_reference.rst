@@ -537,7 +537,7 @@ cloud-native access via HTTP range requests::
     # 5. Read a spatial subset from the zone store (Python)
     # from geotessera.zarr_zone import read_region_from_zone
     # embeddings, scales, attrs = read_region_from_zone(
-    #     'uk_zarr/utm30_2024.zarr',
+    #     'uk_zarr/2024.zarr', 'utm30',
     #     bbox=(500000, 5700000, 510000, 5710000),
     # )
 
@@ -587,15 +587,18 @@ Build zone-wide Zarr v3 stores from downloaded tile data.
 
 **Output Store Layout**:
 
-Each output store is a Zarr v3 directory::
+Output is a consolidated Zarr v3 store per year::
 
-    utm{zone:02d}_{year}.zarr/
-        embeddings        # int8    (H, W, 128)  sharded (256x256x128)
-        scales            # float32 (H, W)       sharded (256x256)
-        rgb               # uint8   (H, W, 4)    sharded (256x256x4)   [optional]
-        easting           # float64 (W,)         coordinate array
-        northing          # float64 (H,)         coordinate array
-        band              # int32   (128,)        coordinate array
+    {year}.zarr/
+        zarr.json             # root metadata
+        utm{zone:02d}/        # one group per UTM zone
+            embeddings        # int8    (H, W, 128)  sharded (256x256x128)
+            scales            # float32 (H, W)       sharded (256x256)
+            rgb               # uint8   (H, W, 4)    sharded (256x256x4)   [optional]
+            easting           # float64 (W,)         coordinate array
+            northing          # float64 (H,)         coordinate array
+            band              # int32   (128,)        coordinate array
+        global_rgb/           # global EPSG:4326 preview [optional]
 
 Sharding uses 256x256 pixel shards with 4x4 inner chunks, enabling
 efficient single-pixel lookups (~2KB per HTTP range request).
@@ -611,7 +614,7 @@ Build a global EPSG:4326 RGB preview pyramid from per-zone UTM stores.
 
 **Required Arguments**:
 
-* ``ZARR_DIR`` - Directory containing utm*_YYYY.zarr stores
+* ``ZARR_DIR`` - Directory containing {year}.zarr stores
 
 **Options**:
 
@@ -619,6 +622,8 @@ Build a global EPSG:4326 RGB preview pyramid from per-zone UTM stores.
 * ``--zones TEXT`` - Comma-separated UTM zones to include (default: all)
 * ``--levels INT`` - Number of multiscale levels (default: 10)
 * ``--workers INT`` - Number of parallel reprojection workers (default: 4)
+* ``--force`` - Ignore zone checkpoints and reprocess all zones
+* ``--skip-reproject`` - Skip reprojection, only rebuild pyramids
 
 **Examples**::
 
@@ -633,10 +638,9 @@ Build a global EPSG:4326 RGB preview pyramid from per-zone UTM stores.
 
 **Output**:
 
-Creates ``global_rgb_{year}.zarr`` in the input directory with multiscale
-pyramid levels.  The store uses EPSG:4326 coordinates and includes
-consolidated metadata with ``multiscales`` and ``spatial`` attributes,
-compatible with the topozarr standard.
+Creates a ``global_rgb`` group within the ``{year}.zarr`` store with
+multiscale pyramid levels.  The group uses EPSG:4326 coordinates and
+includes ``multiscales`` and ``spatial`` attributes.
 
 stac-index
 ~~~~~~~~~~
@@ -649,7 +653,7 @@ Generate a static STAC catalog from a directory of Zarr stores.
 
 **Required Arguments**:
 
-* ``ZARR_DIR`` - Directory containing utm*_*.zarr stores
+* ``ZARR_DIR`` - Directory containing {year}.zarr stores
 
 **Options**:
 

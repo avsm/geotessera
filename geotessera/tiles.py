@@ -280,6 +280,7 @@ class Tile:
         """
         import zarr
         from geotessera.core import dequantize_embedding
+        from geotessera.zarr_zone import northing_to_canonical
 
         store = zarr.open_group(str(self._year_store_path), mode="r", path=self._zone_group)
         attrs = dict(store.attrs)
@@ -297,7 +298,10 @@ class Tile:
             )
 
         tile_easting = self.transform.c
-        tile_northing = self.transform.f
+        # Store uses canonical northings (southern hemisphere false northing removed),
+        # so we must canonicalize the tile northing to match.
+        epsg = int(attrs["proj:code"].split(":")[1])
+        tile_northing = northing_to_canonical(self.transform.f, epsg)
 
         col_start = round((tile_easting - origin_easting) / pixel_size)
         row_start = round((origin_northing - tile_northing) / pixel_size)

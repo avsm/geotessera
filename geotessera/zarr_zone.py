@@ -82,81 +82,6 @@ MULTISCALES_CONVENTION = {
 }
 
 
-def migrate_store_attrs(store_path: "Path", dry_run: bool = False) -> dict:
-    """Migrate a zone store's attrs from legacy keys to GeoZarr convention keys.
-
-    Rewrites in-place. Idempotent — skips stores that already have convention keys.
-
-    Returns a dict summarising what was changed (or would be changed if dry_run).
-    """
-    import zarr
-
-    store = zarr.open_group(str(store_path), mode="r" if dry_run else "r+")
-    attrs = dict(store.attrs)
-    changes = {}
-
-    # Skip if already migrated
-    if "proj:code" in attrs and "spatial:transform" in attrs:
-        return {"status": "already_migrated"}
-
-    # --- proj: convention ---
-    epsg = attrs.get("crs_epsg")
-    crs_wkt = attrs.get("crs_wkt", "")
-    if epsg is not None:
-        changes["proj:code"] = f"EPSG:{epsg}"
-    if crs_wkt:
-        changes["proj:wkt2"] = crs_wkt
-    elif epsg is not None:
-        # Generate WKT2 from EPSG code
-        try:
-            from pyproj import CRS
-            changes["proj:wkt2"] = CRS.from_epsg(epsg).to_wkt()
-        except Exception:
-            pass
-
-    # --- spatial: convention ---
-    transform = attrs.get("transform")
-    if transform is not None:
-        changes["spatial:transform"] = list(transform)
-        changes["spatial:dimensions"] = ["northing", "easting"]
-        changes["spatial:registration"] = "pixel"
-
-        pixel_size = transform[0]
-        origin_easting = transform[2]
-        origin_northing = transform[5]
-
-        # Compute shape from the scales array
-        try:
-            scales_shape = store["scales"].shape
-            height_px, width_px = scales_shape[0], scales_shape[1]
-            changes["spatial:shape"] = [height_px, width_px]
-            # Compute bbox
-            easting_min = origin_easting
-            easting_max = origin_easting + width_px * pixel_size
-            northing_max = origin_northing
-            northing_min = origin_northing - height_px * pixel_size
-            changes["spatial:bbox"] = [
-                easting_min, northing_min, easting_max, northing_max,
-            ]
-        except Exception:
-            pass
-
-    # --- Convention registration ---
-    changes["zarr_conventions"] = [PROJ_CONVENTION, SPATIAL_CONVENTION]
-
-    # --- Remove legacy keys ---
-    legacy_keys = ["crs_epsg", "crs_wkt", "transform"]
-
-    if not dry_run:
-        store.attrs.update(changes)
-        for key in legacy_keys:
-            if key in attrs:
-                del store.attrs[key]
-
-    changes["_removed"] = [k for k in legacy_keys if k in attrs]
-    changes["status"] = "migrated"
-    return changes
-
 
 # =============================================================================
 # Data types
@@ -572,7 +497,7 @@ def create_zone_store(
     with open(str(zone_meta), "w") as f:
         _json.dump({"zarr_format": 3, "node_type": "group", "attributes": {}}, f)
 
-    root = zarr.open_group(str(year_store_path), mode="r+", zarr_format=3)
+    root = zarr.open_group(str(year_store_path), mode="r+", zarr_format=3, use_consolidated=False)
     store = root[zone_group]
 
     store.create_array(
@@ -650,20 +575,6 @@ def create_zone_store(
 
     return store
 
-
-def write_tile_to_store(
-    store: "zarr.Group",
-    embedding_int8: np.ndarray,
-    scales: np.ndarray,
-    row_start: int,
-    col_start: int,
-) -> None:
-    """Write a single tile's embedding and scales into the zone store."""
-    h, w = scales.shape[:2]
-    store["embeddings"][row_start : row_start + h, col_start : col_start + w, :] = (
-        embedding_int8
-    )
-    store["scales"][row_start : row_start + h, col_start : col_start + w] = scales
 
 
 # =============================================================================
@@ -781,7 +692,7 @@ def _init_shard_worker(store_path: str) -> None:
     """Process pool initializer: open the zarr store once per worker."""
     global _worker_store
     import zarr
-    _worker_store = zarr.open_group(store_path, mode="r+", zarr_format=3)
+    _worker_store = zarr.open_group(store_path, mode="r+", zarr_format=3, use_consolidated=False)
 
 
 def _write_one_shard_worker(spec: ShardSpec) -> None:
@@ -1254,7 +1165,7 @@ def add_rgb_to_existing_store(
 
     zone_fs_path = year_store_path / zone_group
     _ensure_rgb_array(zone_fs_path)
-    root = zarr.open_group(str(year_store_path), mode="r+", zarr_format=3)
+    root = zarr.open_group(str(year_store_path), mode="r+", zarr_format=3, use_consolidated=False)
     store = root[zone_group]
 
     if workers is None:
@@ -1420,7 +1331,7 @@ def _ensure_global_store(year_store_path: Path, num_levels: int) -> None:
     import zarr
     from zarr.codecs import BloscCodec
 
-    root = zarr.open_group(str(year_store_path), mode="r+", zarr_format=3)
+    root = zarr.open_group(str(year_store_path), mode="r+", zarr_format=3, use_consolidated=False)
 
     if "global_rgb/0/rgb" in root:
         shape = root["global_rgb/0/rgb"].shape
@@ -1436,7 +1347,7 @@ def _ensure_global_store(year_store_path: Path, num_levels: int) -> None:
             (GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W, GLOBAL_NUM_BANDS),
         )
         shutil.rmtree(str(global_rgb_dir))
-        root = zarr.open_group(str(year_store_path), mode="r+", zarr_format=3)
+        root = zarr.open_group(str(year_store_path), mode="r+", zarr_format=3, use_consolidated=False)
 
     # Create global_rgb group directory and zarr.json
     global_rgb_dir = year_store_path / "global_rgb"
@@ -1465,7 +1376,7 @@ def _ensure_global_store(year_store_path: Path, num_levels: int) -> None:
                     f,
                 )
         # Re-open to pick up manually created group metadata
-        root = zarr.open_group(str(year_store_path), mode="r+", zarr_format=3)
+        root = zarr.open_group(str(year_store_path), mode="r+", zarr_format=3, use_consolidated=False)
         root.create_array(
             f"global_rgb/{lvl}/rgb",
             shape=(h, w, GLOBAL_NUM_BANDS),
@@ -1527,7 +1438,7 @@ def _init_reproj_worker(global_store_path: str, zone_group: str, zone_epsg: int)
     global _reproj_worker_global_arr, _reproj_worker_src_arr, _reproj_worker_to_utm
     import zarr
     from pyproj import Transformer
-    root = zarr.open_group(global_store_path, mode="r+", zarr_format=3)
+    root = zarr.open_group(global_store_path, mode="r+", zarr_format=3, use_consolidated=False)
     _reproj_worker_global_arr = root["global_rgb/0/rgb"]
     _reproj_worker_src_arr = root[zone_group + "/rgb"]
     _reproj_worker_to_utm = Transformer.from_crs(
@@ -1899,7 +1810,7 @@ def _coarsen_zone_pyramid(
     from concurrent.futures import ThreadPoolExecutor, as_completed
     import zarr
 
-    root = zarr.open_group(str(store_path), mode="r+", zarr_format=3)
+    root = zarr.open_group(str(store_path), mode="r+", zarr_format=3, use_consolidated=False)
 
     prev_row_start, prev_row_end = row_start, row_end
     prev_col_start, prev_col_end = col_start, col_end
@@ -2018,7 +1929,7 @@ def _get_rgb_store(store_path_str: str):
     global _rgb_worker_stores
     if store_path_str not in _rgb_worker_stores:
         _rgb_worker_stores[store_path_str] = zarr.open_group(
-            store_path_str, mode="r+", zarr_format=3,
+            store_path_str, mode="r+", zarr_format=3, use_consolidated=False,
         )
     return _rgb_worker_stores[store_path_str]
 
@@ -2092,7 +2003,7 @@ def _ensure_rgb_array(store_path: Path) -> None:
     """Create the rgb array in a store if it doesn't exist."""
     import zarr
     from zarr.codecs import BloscCodec
-    store = zarr.open_group(str(store_path), mode="r+")
+    store = zarr.open_group(str(store_path), mode="r+", use_consolidated=False)
     try:
         _ = store["rgb"]
     except KeyError:
@@ -2244,7 +2155,7 @@ def _run_rgb_generation_parallel(
         # Update store attrs
         for zn, info in zone_chunk_info.items():
             import zarr
-            store = zarr.open_group(info["store_path"], mode="r+")
+            store = zarr.open_group(info["store_path"], mode="r+", use_consolidated=False)
             store.attrs.update({
                 "has_rgb_preview": True,
                 "rgb_bands": list(RGB_PREVIEW_BANDS),
