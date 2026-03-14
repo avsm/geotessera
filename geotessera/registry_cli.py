@@ -2796,7 +2796,6 @@ def _zarr_store_to_stac_item(
     properties = {
         "tessera:utm_zone": _get_tessera_attr(attrs, "utm_zone"),
         "proj:code": attrs["proj:code"],
-        "tessera:pixel_size_m": _get_tessera_attr(attrs, "pixel_size_m", attrs["spatial:transform"][0]),
         "grid_width": attrs["grid_width"],
         "grid_height": attrs["grid_height"],
         "tessera:n_bands": n_bands,

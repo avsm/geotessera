@@ -94,14 +94,18 @@ TESSERA_CONVENTION = {
 _OLD_TO_NEW_ATTRS = {
     "utm_zone": "tessera:utm_zone",
     "year": "tessera:year",
-    "pixel_size_m": "tessera:pixel_size_m",
     "geotessera_version": "tessera:build_version",
     "tessera_dataset_version": "tessera:dataset_version",
     "n_tiles": "tessera:n_tiles",
     "has_rgb_preview": "tessera:has_rgb_preview",
-    "rgb_bands": "tessera:rgb_bands",
-    "rgb_stretch": "tessera:rgb_stretch",
 }
+# Attrs that should be removed during migration (superseded by convention)
+_REMOVED_ATTRS = [
+    "pixel_size_m", "tessera:pixel_size_m",
+    "rgb_bands", "tessera:rgb_bands",
+    "rgb_stretch", "tessera:rgb_stretch",
+    "tessera:quantisation",
+]
 
 
 def _get_tessera_attr(attrs, short_name: str, default=None):
@@ -180,9 +184,10 @@ def migrate_store_attrs(year_store_path: Path, *, dry_run: bool = False,
                 updates[new_key] = attrs[old_key]
                 removals.append(old_key)
 
-        # Remove tessera:quantisation if present (formula is defined by convention, not metadata)
-        if "tessera:quantisation" in attrs:
-            removals.append("tessera:quantisation")
+        # Remove attrs superseded by convention (pixel_size_m, rgb_bands, etc.)
+        for old_key in _REMOVED_ATTRS:
+            if old_key in attrs:
+                removals.append(old_key)
 
         # Add tessera:n_bands if missing
         if "tessera:n_bands" not in attrs:
@@ -820,7 +825,6 @@ def create_zone_store(
         "tessera:dataset_version": dataset_version,
         "tessera:year": zone_grid.year,
         "tessera:utm_zone": zone_grid.zone,
-        "tessera:pixel_size_m": zone_grid.pixel_size,
         "tessera:n_bands": N_BANDS,
         "tessera:n_tiles": len(zone_grid.tiles),
         "tessera:model_version": model_version,
@@ -1453,8 +1457,6 @@ def add_rgb_to_existing_store(
 
     store.attrs.update({
         "tessera:has_rgb_preview": True,
-        "tessera:rgb_bands": list(RGB_PREVIEW_BANDS),
-        "tessera:rgb_stretch": stretch,
     })
 
     if console is not None:
@@ -2415,8 +2417,6 @@ def _run_rgb_generation_parallel(
             store = zarr.open_group(info["store_path"], mode="r+", use_consolidated=False)
             store.attrs.update({
                 "tessera:has_rgb_preview": True,
-                "tessera:rgb_bands": list(RGB_PREVIEW_BANDS),
-                "tessera:rgb_stretch": zone_stretch[zn],
             })
 
         if progress is not None:
