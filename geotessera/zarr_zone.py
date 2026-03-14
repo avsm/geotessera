@@ -213,6 +213,11 @@ def migrate_store_attrs(year_store_path: Path, *, dry_run: bool = False,
                     _delete_attr(zone, old_key)
             modified += 1
 
+    # --- Add dimension_names to arrays that are missing them ---
+    n_dims = _ensure_dimension_names(year_store_path, dry_run=dry_run, console=console)
+    if n_dims:
+        modified += 1
+
     # Re-consolidate metadata after migration
     if modified and not dry_run:
         import warnings
@@ -221,6 +226,96 @@ def migrate_store_attrs(year_store_path: Path, *, dry_run: bool = False,
             zarr.consolidate_metadata(str(year_store_path))
 
     return modified
+
+
+# Expected dimension_names for each array type.
+# Keys are array names (relative to their parent group).
+_ZONE_ARRAY_DIMS = {
+    "embeddings": ["northing", "easting", "band"],
+    "scales":     ["northing", "easting"],
+    "rgb":        ["northing", "easting", "rgba"],
+    "easting":    ["easting"],
+    "northing":   ["northing"],
+    "band":       ["band"],
+}
+_GLOBAL_RGB_ARRAY_DIMS = {
+    "rgb":  ["lat", "lon", "band"],
+    "band": ["band"],
+}
+
+
+def _ensure_dimension_names(year_store_path: Path, *, dry_run: bool = False,
+                            console: Optional["rich.console.Console"] = None) -> int:
+    """Patch zarr.json for arrays missing dimension_names.
+
+    Xarray requires dimension_names in Zarr v3 array metadata to open
+    datasets.  This walks all arrays in the store and adds the expected
+    dimension_names where they are missing or null.
+
+    Returns the number of arrays patched.
+    """
+    import json as _json
+
+    patched = 0
+    zone_pattern = re.compile(r"^utm\d{2}$")
+    global_level_pattern = re.compile(r"^\d+$")
+
+    for entry in sorted(year_store_path.iterdir()):
+        if not entry.is_dir():
+            continue
+
+        if zone_pattern.match(entry.name):
+            # Zone group arrays
+            for array_name, dims in _ZONE_ARRAY_DIMS.items():
+                patched += _patch_array_dims(
+                    entry / array_name / "zarr.json", dims,
+                    label=f"{entry.name}/{array_name}",
+                    dry_run=dry_run, console=console,
+                )
+
+        elif entry.name == "global_rgb":
+            # Global preview pyramid levels
+            for level_dir in sorted(entry.iterdir()):
+                if level_dir.is_dir() and global_level_pattern.match(level_dir.name):
+                    for array_name, dims in _GLOBAL_RGB_ARRAY_DIMS.items():
+                        patched += _patch_array_dims(
+                            level_dir / array_name / "zarr.json", dims,
+                            label=f"global_rgb/{level_dir.name}/{array_name}",
+                            dry_run=dry_run, console=console,
+                        )
+
+    return patched
+
+
+def _patch_array_dims(zarr_json: Path, dims: list, *, label: str,
+                      dry_run: bool, console) -> int:
+    """Add dimension_names to a single array's zarr.json if missing."""
+    import json as _json
+
+    if not zarr_json.exists():
+        return 0
+
+    with open(zarr_json, "r") as f:
+        meta = _json.load(f)
+
+    if meta.get("node_type") != "array":
+        return 0
+
+    existing = meta.get("dimension_names")
+    if existing is not None and existing != [None] * len(dims):
+        return 0  # already has valid dimension_names
+
+    if dry_run:
+        if console:
+            console.print(f"  [dim]Would add dimension_names {dims} to {label}[/dim]")
+        return 1
+
+    meta["dimension_names"] = dims
+    with open(zarr_json, "w") as f:
+        _json.dump(meta, f, indent=2)
+    if console:
+        console.print(f"  Added dimension_names {dims} to {label}")
+    return 1
 
 
 def _delete_attr(group: "zarr.Group", key: str) -> None:
@@ -1551,6 +1646,7 @@ def _ensure_global_store(year_store_path: Path, num_levels: int) -> None:
             f"global_rgb/{lvl}/band",
             data=band_data,
             chunks=(GLOBAL_NUM_BANDS,),
+            dimension_names=["band"],
         )
         h //= 2
         w //= 2
