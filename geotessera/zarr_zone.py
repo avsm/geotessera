@@ -88,14 +88,6 @@ TESSERA_CONVENTION = {
     "description": "Quantised geospatial embedding vectors with per-pixel dequantisation scales",
 }
 
-# Tessera quantisation metadata (written to every zone group)
-TESSERA_QUANTISATION = {
-    "method": "per_pixel_scale",
-    "formula": "embedding_float32[y,x,b] = embeddings[y,x,b] * scales[y,x]",
-    "embeddings_dtype": "int8",
-    "scales_dtype": "float32",
-    "nodata": "scales=NaN",
-}
 
 # Mapping from old unprefixed attribute names to new tessera:-prefixed names.
 # Used for backwards-compatible reads and one-off migration.
@@ -130,7 +122,7 @@ def migrate_store_attrs(year_store_path: Path, *, dry_run: bool = False,
     """Migrate a year store from old unprefixed attrs to tessera:-prefixed attrs.
 
     Walks the root group and every ``utm*`` zone group, renaming old attribute
-    keys and adding ``tessera:quantisation`` / ``tessera:n_bands`` where missing.
+    keys and adding ``tessera:n_bands`` where missing.
     Also injects the ``TESSERA_CONVENTION`` into ``zarr_conventions`` if absent.
 
     Returns the number of groups modified.
@@ -188,9 +180,9 @@ def migrate_store_attrs(year_store_path: Path, *, dry_run: bool = False,
                 updates[new_key] = attrs[old_key]
                 removals.append(old_key)
 
-        # Add tessera:quantisation if missing
-        if "tessera:quantisation" not in attrs:
-            updates["tessera:quantisation"] = TESSERA_QUANTISATION
+        # Remove tessera:quantisation if present (formula is defined by convention, not metadata)
+        if "tessera:quantisation" in attrs:
+            removals.append("tessera:quantisation")
 
         # Add tessera:n_bands if missing
         if "tessera:n_bands" not in attrs:
@@ -736,7 +728,6 @@ def create_zone_store(
         "tessera:pixel_size_m": zone_grid.pixel_size,
         "tessera:n_bands": N_BANDS,
         "tessera:n_tiles": len(zone_grid.tiles),
-        "tessera:quantisation": TESSERA_QUANTISATION,
         "tessera:model_version": model_version,
         "tessera:build_version": geotessera_version,
     })
