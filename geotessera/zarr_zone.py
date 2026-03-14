@@ -1294,7 +1294,7 @@ def read_region_from_zone(
     """
     import zarr
 
-    store = zarr.open_group(str(year_store_path), mode="r", path=zone_group)
+    store = zarr.open_group(str(year_store_path), mode="r", path=zone_group, use_consolidated=False)
     attrs = dict(store.attrs)
 
     transform = attrs["spatial:transform"]
@@ -2043,7 +2043,7 @@ def _run_rgb_generation_parallel(
     total_skipped = 0
     for zone_num, store_path in missing_rgb:
         import zarr
-        store = zarr.open_group(str(store_path), mode="r")
+        store = zarr.open_group(str(store_path), mode="r", use_consolidated=False)
         emb_shape = store["embeddings"].shape
         n_rows = math.ceil(emb_shape[0] / SHARD_SIZE)
         n_cols = math.ceil(emb_shape[1] / SHARD_SIZE)
@@ -2219,7 +2219,7 @@ def build_global_preview(
             f"Year store not found: {year_store_path}"
         )
 
-    root = zarr.open_group(str(year_store_path), mode="r")
+    root = zarr.open_group(str(year_store_path), mode="r", use_consolidated=False)
     zone_pattern = re.compile(r"^utm(\d{2})$")
     zone_groups: Dict[int, str] = {}
 
@@ -2264,7 +2264,7 @@ def build_global_preview(
 
     # 3. Read zone metadata
     #    Re-open in case RGB generation updated attrs
-    root = zarr.open_group(str(year_store_path), mode="r")
+    root = zarr.open_group(str(year_store_path), mode="r", use_consolidated=False)
     zone_infos: Dict[int, dict] = {}
     for zone_num, zone_group in sorted(zone_groups.items()):
         zone_store = root[zone_group]

@@ -2547,7 +2547,7 @@ def zarr_build_command(args):
                 return 1
 
         zone_pattern = _re.compile(r"^utm(\d{2})$")
-        root = zarr.open_group(str(year_store), mode="r")
+        root = zarr.open_group(str(year_store), mode="r", use_consolidated=False)
 
         zone_count = 0
         for zone_name in sorted(root.keys()):
@@ -2850,7 +2850,7 @@ def stac_index_command(args):
     # Discover zone groups and cache store roots to avoid re-opening
     year_store_info = []  # (path, root, root_attrs, year, zone_names)
     for year_store_path in year_stores:
-        root = zarr.open_group(str(year_store_path), mode="r")
+        root = zarr.open_group(str(year_store_path), mode="r", use_consolidated=False)
         root_attrs = dict(root.attrs)
         yr = root_attrs.get("year", int(year_store_path.name.removesuffix(".zarr")))
         zones = [n for n in sorted(root.keys()) if zone_pattern.match(n)]
