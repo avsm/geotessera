@@ -81,8 +81,8 @@ MULTISCALES_CONVENTION = {
     "description": "Multiscale layout of zarr datasets",
 }
 TESSERA_CONVENTION = {
-    "schema_url": "https://raw.githubusercontent.com/zarr-conventions/tessera/refs/tags/v1/schema.json",
-    "spec_url": "https://github.com/zarr-conventions/tessera/blob/v1/README.md",
+    "schema_url": "https://raw.githubusercontent.com/ucam-eo/zarr-convention-tessera/refs/tags/v1/schema.json",
+    "spec_url": "https://github.com/ucam-eo/zarr-convention-tessera/blob/v1/README.md",
     "uuid": "e7f90d5f-019e-4a38-802f-9fa695e26c71",
     "name": "tessera:",
     "description": "Quantised geospatial embedding vectors with per-pixel dequantisation scales",
