@@ -2623,6 +2623,7 @@ def zarr_build_command(args):
         dry_run=args.dry_run,
         geotessera_version=gt_version,
         dataset_version=args.dataset_version,
+        model_version=getattr(args, "model_version", "1.0"),
         console=console,
         workers=args.workers,
     )
@@ -2694,7 +2695,8 @@ def _store_bbox_wgs84(attrs: dict) -> list[float]:
     """
     from pyproj import Transformer
 
-    utm_zone = attrs["utm_zone"]
+    from .zarr_zone import _get_tessera_attr
+    utm_zone = _get_tessera_attr(attrs, "utm_zone")
     west = (utm_zone - 1) * 6 - 180
     east = utm_zone * 6 - 180
 
@@ -2734,8 +2736,12 @@ def _zarr_store_to_stac_item(
         return None
 
     # Required attributes
-    required = ["utm_zone", "proj:code", "spatial:transform"]
-    missing = [k for k in required if k not in attrs]
+    from .zarr_zone import _get_tessera_attr
+    # Accept both old unprefixed and new tessera:-prefixed attribute names
+    required_spatial = ["proj:code", "spatial:transform"]
+    missing = [k for k in required_spatial if k not in attrs]
+    if _get_tessera_attr(attrs, "utm_zone") is None:
+        missing.append("tessera:utm_zone")
     if missing:
         logger.warning("Skipping %s: missing attrs %s", label, missing)
         return None
@@ -2788,14 +2794,15 @@ def _zarr_store_to_stac_item(
         )
 
     properties = {
-        "utm_zone": attrs["utm_zone"],
+        "tessera:utm_zone": _get_tessera_attr(attrs, "utm_zone"),
         "proj:code": attrs["proj:code"],
-        "pixel_size_m": attrs.get("pixel_size_m", attrs["spatial:transform"][0]),
+        "tessera:pixel_size_m": _get_tessera_attr(attrs, "pixel_size_m", attrs["spatial:transform"][0]),
         "grid_width": attrs["grid_width"],
         "grid_height": attrs["grid_height"],
-        "n_bands": n_bands,
-        "has_rgb_preview": attrs.get("has_rgb_preview", False),
-        "geotessera_version": attrs.get("geotessera_version", "unknown"),
+        "tessera:n_bands": n_bands,
+        "tessera:has_rgb_preview": _get_tessera_attr(attrs, "has_rgb_preview", False),
+        "tessera:build_version": _get_tessera_attr(attrs, "build_version",
+                                                    attrs.get("geotessera_version", "unknown")),
         "tessera:dataset_version": dataset_version,
     }
 
@@ -2819,6 +2826,43 @@ def _zarr_store_to_stac_item(
     )
 
     return item
+
+
+def zarr_migrate_command(args):
+    """Migrate Zarr stores from old unprefixed attrs to tessera:-prefixed attrs."""
+    import re
+    from .zarr_zone import migrate_store_attrs
+    from rich.console import Console
+
+    console = Console()
+    zarr_dir = Path(args.zarr_dir).resolve()
+    dry_run = args.dry_run
+
+    year_pattern = re.compile(r"^\d{4}\.zarr$")
+    year_stores = sorted(
+        e for e in zarr_dir.iterdir()
+        if e.is_dir() and year_pattern.match(e.name)
+    )
+
+    if not year_stores:
+        console.print(f"[red]Error:[/red] No {{YYYY}}.zarr stores found in {zarr_dir}")
+        return 1
+
+    if dry_run:
+        console.print("[dim]Dry run — no changes will be written[/dim]")
+
+    total = 0
+    for year_store_path in year_stores:
+        console.print(f"\n{emoji('📦 ')}{year_store_path.name}")
+        n = migrate_store_attrs(year_store_path, dry_run=dry_run, console=console)
+        total += n
+        if n:
+            console.print(f"  {emoji('✅ ')}{n} group(s) {'would be ' if dry_run else ''}migrated")
+        else:
+            console.print(f"  [dim]Already up to date[/dim]")
+
+    console.print(f"\n{emoji('🏁 ')}Done: {total} group(s) {'would be ' if dry_run else ''}migrated across {len(year_stores)} store(s)")
+    return 0
 
 
 def stac_index_command(args):
@@ -2852,7 +2896,9 @@ def stac_index_command(args):
     for year_store_path in year_stores:
         root = zarr.open_group(str(year_store_path), mode="r", use_consolidated=False)
         root_attrs = dict(root.attrs)
-        yr = root_attrs.get("year", int(year_store_path.name.removesuffix(".zarr")))
+        yr = root_attrs.get("tessera:year",
+                            root_attrs.get("year",
+                                           int(year_store_path.name.removesuffix(".zarr"))))
         zones = [n for n in sorted(root.keys()) if zone_pattern.match(n)]
         if zones:
             year_store_info.append((year_store_path, root, root_attrs, yr, zones))
@@ -2949,7 +2995,7 @@ def stac_index_command(args):
         f"  {len(items_by_year)} collection(s), {total_items} item(s)"
     )
     for year in sorted(items_by_year):
-        zones = sorted(it.properties["utm_zone"] for it in items_by_year[year])
+        zones = sorted(it.properties["tessera:utm_zone"] for it in items_by_year[year])
         console.print(f"  {year}: UTM zones {zones}")
 
     return 0
@@ -3223,6 +3269,12 @@ Directory Structure:
         help="Tessera dataset version (default: v1)",
     )
     zarr_build_parser.add_argument(
+        "--model-version",
+        type=str,
+        default="1.0",
+        help="Embedding model version (default: 1.0)",
+    )
+    zarr_build_parser.add_argument(
         "--registry-dir",
         type=str,
         default=None,
@@ -3323,6 +3375,22 @@ Directory Structure:
         help="Output directory for STAC JSON files (default: same as zarr_dir)",
     )
     stac_index_parser.set_defaults(func=stac_index_command)
+
+    # Zarr-migrate command
+    zarr_migrate_parser = subparsers.add_parser(
+        "zarr-migrate",
+        help="Migrate Zarr stores from old unprefixed attrs to tessera:-prefixed attrs",
+    )
+    zarr_migrate_parser.add_argument(
+        "zarr_dir",
+        type=Path,
+        help="Directory containing {year}.zarr stores",
+    )
+    zarr_migrate_parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Show what would be changed without writing",
+    )
+    zarr_migrate_parser.set_defaults(func=zarr_migrate_command)
 
     args = parser.parse_args()
 

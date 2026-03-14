@@ -6,7 +6,7 @@ This enables efficient spatial subsetting and cloud-native access.
 
 Store layout (one store per year, zone groups within):
     {year}.zarr/
-        zarr.json             # root: tessera:dataset_version, year
+        zarr.json             # root: tessera:dataset_version, tessera:year
         utm{zone:02d}/        # one group per UTM zone
             embeddings        # int8    (H, W, 128)  chunks=(4,4,128)   shards=(256,256,128)
             scales            # float32 (H, W)       chunks=(4,4)       shards=(256,256)
@@ -80,7 +80,167 @@ MULTISCALES_CONVENTION = {
     "name": "multiscales",
     "description": "Multiscale layout of zarr datasets",
 }
+TESSERA_CONVENTION = {
+    "schema_url": "https://raw.githubusercontent.com/zarr-conventions/tessera/refs/tags/v1/schema.json",
+    "spec_url": "https://github.com/zarr-conventions/tessera/blob/v1/README.md",
+    "uuid": "e7f90d5f-019e-4a38-802f-9fa695e26c71",
+    "name": "tessera:",
+    "description": "Quantised geospatial embedding vectors with per-pixel dequantisation scales",
+}
 
+# Tessera quantisation metadata (written to every zone group)
+TESSERA_QUANTISATION = {
+    "method": "per_pixel_scale",
+    "formula": "embedding_float32[y,x,b] = embeddings[y,x,b] * scales[y,x]",
+    "embeddings_dtype": "int8",
+    "scales_dtype": "float32",
+    "nodata": "scales=NaN",
+}
+
+# Mapping from old unprefixed attribute names to new tessera:-prefixed names.
+# Used for backwards-compatible reads and one-off migration.
+_OLD_TO_NEW_ATTRS = {
+    "utm_zone": "tessera:utm_zone",
+    "year": "tessera:year",
+    "pixel_size_m": "tessera:pixel_size_m",
+    "geotessera_version": "tessera:build_version",
+    "tessera_dataset_version": "tessera:dataset_version",
+    "n_tiles": "tessera:n_tiles",
+    "has_rgb_preview": "tessera:has_rgb_preview",
+    "rgb_bands": "tessera:rgb_bands",
+    "rgb_stretch": "tessera:rgb_stretch",
+}
+
+
+def _get_tessera_attr(attrs, short_name: str, default=None):
+    """Read a tessera attribute with backwards-compat fallback.
+
+    Tries ``tessera:{short_name}`` first, then the old unprefixed key.
+    """
+    prefixed = f"tessera:{short_name}"
+    if prefixed in attrs:
+        return attrs[prefixed]
+    if short_name in attrs:
+        return attrs[short_name]
+    return default
+
+
+def migrate_store_attrs(year_store_path: Path, *, dry_run: bool = False,
+                        console: Optional["rich.console.Console"] = None) -> int:
+    """Migrate a year store from old unprefixed attrs to tessera:-prefixed attrs.
+
+    Walks the root group and every ``utm*`` zone group, renaming old attribute
+    keys and adding ``tessera:quantisation`` / ``tessera:n_bands`` where missing.
+    Also injects the ``TESSERA_CONVENTION`` into ``zarr_conventions`` if absent.
+
+    Returns the number of groups modified.
+    """
+    import zarr
+
+    modified = 0
+
+    root = zarr.open_group(str(year_store_path), mode="r+", use_consolidated=False)
+    root_attrs = dict(root.attrs)
+
+    # --- Migrate root group ---
+    root_updates: Dict[str, Any] = {}
+
+    # Rename "year" -> "tessera:year" on root
+    if "year" in root_attrs and "tessera:year" not in root_attrs:
+        root_updates["tessera:year"] = root_attrs["year"]
+
+    # Ensure tessera:dataset_version exists (root already used the prefixed form)
+    if "tessera:dataset_version" not in root_attrs:
+        v = root_attrs.get("tessera_dataset_version", "v1")
+        root_updates["tessera:dataset_version"] = v
+
+    # Add TESSERA_CONVENTION to zarr_conventions
+    convs = list(root_attrs.get("zarr_conventions", []))
+    if not any(c.get("uuid") == TESSERA_CONVENTION["uuid"] for c in convs):
+        convs.insert(0, TESSERA_CONVENTION)
+        root_updates["zarr_conventions"] = convs
+
+    if root_updates:
+        if dry_run:
+            if console:
+                console.print(f"  [dim]Would update root: {list(root_updates.keys())}[/dim]")
+        else:
+            root.attrs.update(root_updates)
+            # Remove old keys
+            for old in ("year",):
+                if old in root_attrs and f"tessera:{old}" != old:
+                    _delete_attr(root, old)
+        modified += 1
+
+    # --- Migrate zone groups ---
+    zone_pattern = re.compile(r"^utm\d{2}$")
+    for name in sorted(root.keys()):
+        if not zone_pattern.match(name):
+            continue
+        zone = root[name]
+        attrs = dict(zone.attrs)
+        updates: Dict[str, Any] = {}
+        removals: list[str] = []
+
+        # Rename old keys
+        for old_key, new_key in _OLD_TO_NEW_ATTRS.items():
+            if old_key in attrs and new_key not in attrs:
+                updates[new_key] = attrs[old_key]
+                removals.append(old_key)
+
+        # Add tessera:quantisation if missing
+        if "tessera:quantisation" not in attrs:
+            updates["tessera:quantisation"] = TESSERA_QUANTISATION
+
+        # Add tessera:n_bands if missing
+        if "tessera:n_bands" not in attrs:
+            try:
+                updates["tessera:n_bands"] = zone["embeddings"].shape[2]
+            except Exception:
+                updates["tessera:n_bands"] = N_BANDS
+
+        # Add tessera:model_version if missing (default 1.0 for legacy stores)
+        if "tessera:model_version" not in attrs:
+            updates["tessera:model_version"] = "1.0"
+
+        # Add TESSERA_CONVENTION to zarr_conventions
+        convs = list(attrs.get("zarr_conventions", []))
+        if not any(c.get("uuid") == TESSERA_CONVENTION["uuid"] for c in convs):
+            convs.insert(0, TESSERA_CONVENTION)
+            updates["zarr_conventions"] = convs
+
+        if updates:
+            if dry_run:
+                if console:
+                    console.print(
+                        f"  [dim]Would update {name}: {list(updates.keys())}[/dim]"
+                    )
+            else:
+                zone.attrs.update(updates)
+                for old_key in removals:
+                    _delete_attr(zone, old_key)
+            modified += 1
+
+    # Re-consolidate metadata after migration
+    if modified and not dry_run:
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Consolidated metadata")
+            zarr.consolidate_metadata(str(year_store_path))
+
+    return modified
+
+
+def _delete_attr(group: "zarr.Group", key: str) -> None:
+    """Remove a single key from a zarr group's attributes."""
+    try:
+        attrs = dict(group.attrs)
+        if key in attrs:
+            del attrs[key]
+            group.attrs.clear()
+            group.attrs.update(attrs)
+    except Exception:
+        pass  # best-effort removal
 
 
 # =============================================================================
@@ -465,9 +625,11 @@ def _ensure_year_store(year_store_path: Path, year: int, dataset_version: str = 
             "zarr_format": 3,
             "node_type": "group",
             "attributes": {
+                "zarr_conventions": [
+                    TESSERA_CONVENTION, PROJ_CONVENTION, SPATIAL_CONVENTION,
+                ],
                 "tessera:dataset_version": dataset_version,
-                "year": year,
-                "zarr_conventions": [PROJ_CONVENTION, SPATIAL_CONVENTION],
+                "tessera:year": year,
             },
         }
         with open(str(root_meta), "w") as f:
@@ -479,6 +641,7 @@ def create_zone_store(
     year_store_path: Path,
     geotessera_version: str = "unknown",
     dataset_version: str = "v1",
+    model_version: str = "1.0",
 ) -> "zarr.Group":
     """Create a new Zarr v3 zone group within a year store."""
     import json as _json
@@ -551,7 +714,9 @@ def create_zone_store(
 
     store.attrs.update({
         # Convention registration
-        "zarr_conventions": [PROJ_CONVENTION, SPATIAL_CONVENTION],
+        "zarr_conventions": [
+            TESSERA_CONVENTION, PROJ_CONVENTION, SPATIAL_CONVENTION,
+        ],
         # proj: convention
         "proj:code": f"EPSG:{zone_grid.canonical_epsg}",
         "proj:wkt2": crs_wkt,
@@ -564,13 +729,16 @@ def create_zone_store(
         "spatial:shape": [zone_grid.height_px, zone_grid.width_px],
         "spatial:bbox": [easting_min, northing_min, easting_max, northing_max],
         "spatial:registration": "pixel",
-        # Application-specific metadata (not part of conventions)
-        "utm_zone": zone_grid.zone,
-        "year": zone_grid.year,
-        "pixel_size_m": zone_grid.pixel_size,
-        "geotessera_version": geotessera_version,
-        "tessera_dataset_version": dataset_version,
-        "n_tiles": len(zone_grid.tiles),
+        # tessera: convention
+        "tessera:dataset_version": dataset_version,
+        "tessera:year": zone_grid.year,
+        "tessera:utm_zone": zone_grid.zone,
+        "tessera:pixel_size_m": zone_grid.pixel_size,
+        "tessera:n_bands": N_BANDS,
+        "tessera:n_tiles": len(zone_grid.tiles),
+        "tessera:quantisation": TESSERA_QUANTISATION,
+        "tessera:model_version": model_version,
+        "tessera:build_version": geotessera_version,
     })
 
     return store
@@ -845,6 +1013,7 @@ def build_zone_stores(
     dry_run: bool = False,
     geotessera_version: str = "unknown",
     dataset_version: str = "v1",
+    model_version: str = "1.0",
     console: Optional["rich.console.Console"] = None,
     workers: Optional[int] = None,
 ) -> List[Path]:
@@ -910,6 +1079,7 @@ def build_zone_stores(
             zone_grid, year_store_path,
             geotessera_version=geotessera_version,
             dataset_version=dataset_version,
+            model_version=model_version,
         )
 
         # Build shard index: precompute which tiles overlap each shard
@@ -1196,9 +1366,9 @@ def add_rgb_to_existing_store(
     )
 
     store.attrs.update({
-        "has_rgb_preview": True,
-        "rgb_bands": list(RGB_PREVIEW_BANDS),
-        "rgb_stretch": stretch,
+        "tessera:has_rgb_preview": True,
+        "tessera:rgb_bands": list(RGB_PREVIEW_BANDS),
+        "tessera:rgb_stretch": stretch,
     })
 
     if console is not None:
@@ -2157,9 +2327,9 @@ def _run_rgb_generation_parallel(
             import zarr
             store = zarr.open_group(info["store_path"], mode="r+", use_consolidated=False)
             store.attrs.update({
-                "has_rgb_preview": True,
-                "rgb_bands": list(RGB_PREVIEW_BANDS),
-                "rgb_stretch": zone_stretch[zn],
+                "tessera:has_rgb_preview": True,
+                "tessera:rgb_bands": list(RGB_PREVIEW_BANDS),
+                "tessera:rgb_stretch": zone_stretch[zn],
             })
 
         if progress is not None:
@@ -2245,15 +2415,15 @@ def build_global_preview(
         )
 
     # 2. Generate missing RGB previews (parallelised across zones)
-    #    Check has_rgb_preview attr (not just array existence) because the
-    #    array may exist but be empty from a failed or interrupted build.
+    #    Check tessera:has_rgb_preview attr (not just array existence) because
+    #    the array may exist but be empty from a failed or interrupted build.
     #    _run_rgb_generation_parallel and helpers operate on filesystem paths;
     #    year_store_path / zone_group_name is a valid fs path with the same
     #    internal structure (embeddings/, scales/, rgb/).
     missing_rgb = []
     for zone_num, zone_group in sorted(zone_groups.items()):
         zone_store = root[zone_group]
-        if not zone_store.attrs.get("has_rgb_preview", False):
+        if not _get_tessera_attr(zone_store.attrs, "has_rgb_preview", False):
             zone_fs_path = year_store_path / zone_group
             missing_rgb.append((zone_num, zone_fs_path))
 
@@ -2269,7 +2439,7 @@ def build_global_preview(
     for zone_num, zone_group in sorted(zone_groups.items()):
         zone_store = root[zone_group]
         attrs = dict(zone_store.attrs)
-        if not attrs.get("has_rgb_preview", False):
+        if not _get_tessera_attr(attrs, "has_rgb_preview", False):
             if console is not None:
                 console.print(
                     f"  [yellow]Zone {zone_num}: rgb still missing, skipping[/yellow]"
