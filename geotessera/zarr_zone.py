@@ -160,12 +160,28 @@ def migrate_store_attrs(year_store_path: Path, *, dry_run: bool = False,
 
     Returns the number of groups modified.
     """
+    import warnings
     import zarr
 
     modified = 0
 
     root = zarr.open_group(str(year_store_path), mode="r+", use_consolidated=False)
     root_attrs = dict(root.attrs)
+
+    # --- Remove stale build marker files (.zone_*_done etc.) ---
+    marker_pattern = re.compile(r"^\.zone_\d+_done$")
+    markers = [f for f in year_store_path.iterdir()
+               if f.is_file() and marker_pattern.match(f.name)]
+    if markers:
+        for m in markers:
+            if dry_run:
+                if console:
+                    console.print(f"  [dim]Would remove build marker {m.name}[/dim]")
+            else:
+                m.unlink()
+        if not dry_run and console:
+            console.print(f"  Removed {len(markers)} build marker file(s)")
+        modified += 1
 
     # --- Migrate root group ---
     root_updates: Dict[str, Any] = {}
@@ -201,7 +217,10 @@ def migrate_store_attrs(year_store_path: Path, *, dry_run: bool = False,
 
     # --- Migrate zone groups ---
     zone_pattern = re.compile(r"^utm\d{2}$")
-    for name in sorted(root.keys()):
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Object at .* is not recognized")
+        zone_names = sorted(root.keys())
+    for name in zone_names:
         if not zone_pattern.match(name):
             continue
         zone = root[name]
@@ -258,7 +277,6 @@ def migrate_store_attrs(year_store_path: Path, *, dry_run: bool = False,
 
     # Re-consolidate metadata after migration
     if modified and not dry_run:
-        import warnings
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message="Consolidated metadata")
             zarr.consolidate_metadata(str(year_store_path))
