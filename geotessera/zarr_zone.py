@@ -196,13 +196,10 @@ def migrate_store_attrs(year_store_path: Path, *, dry_run: bool = False,
         v = root_attrs.get("tessera_dataset_version", "v1")
         root_updates["tessera:dataset_version"] = v
 
-    # Fix zarr_conventions: add TESSERA_CONVENTION, fix stale descriptions/URLs
-    convs = list(root_attrs.get("zarr_conventions", []))
-    if not any(c.get("uuid") == TESSERA_CONVENTION["uuid"] for c in convs):
-        convs.insert(0, TESSERA_CONVENTION)
-    convs, convs_changed = _fix_zarr_conventions(convs)
-    if convs_changed or convs != root_attrs.get("zarr_conventions", []):
-        root_updates["zarr_conventions"] = convs
+    # Root group only declares tessera: (proj: and spatial: live on zone groups)
+    expected_root_convs = [TESSERA_CONVENTION]
+    if root_attrs.get("zarr_conventions") != expected_root_convs:
+        root_updates["zarr_conventions"] = expected_root_convs
 
     if root_updates:
         if dry_run:
@@ -769,9 +766,7 @@ def _ensure_year_store(year_store_path: Path, year: int, dataset_version: str = 
             "zarr_format": 3,
             "node_type": "group",
             "attributes": {
-                "zarr_conventions": [
-                    TESSERA_CONVENTION, PROJ_CONVENTION, SPATIAL_CONVENTION,
-                ],
+                "zarr_conventions": [TESSERA_CONVENTION],
                 "tessera:dataset_version": dataset_version,
                 "tessera:year": year,
             },
