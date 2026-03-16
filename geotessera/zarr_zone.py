@@ -105,6 +105,7 @@ _REMOVED_ATTRS = [
     "rgb_bands", "tessera:rgb_bands",
     "rgb_stretch", "tessera:rgb_stretch",
     "tessera:quantisation",
+    "proj:wkt2",
 ]
 
 
@@ -842,13 +843,6 @@ def create_zone_store(
         )
         store[name][:] = data
 
-    # CRS WKT
-    try:
-        from pyproj import CRS
-        crs_wkt = CRS.from_epsg(zone_grid.canonical_epsg).to_wkt()
-    except ImportError:
-        crs_wkt = ""
-
     # Compute spatial:bbox from the grid extent
     easting_min = zone_grid.origin_easting
     easting_max = zone_grid.origin_easting + zone_grid.width_px * zone_grid.pixel_size
@@ -860,9 +854,8 @@ def create_zone_store(
         "zarr_conventions": [
             TESSERA_CONVENTION, PROJ_CONVENTION, SPATIAL_CONVENTION,
         ],
-        # proj: convention
+        # proj: convention (proj:code is sufficient; clients derive WKT2 via pyproj)
         "proj:code": f"EPSG:{zone_grid.canonical_epsg}",
-        "proj:wkt2": crs_wkt,
         # spatial: convention
         "spatial:dimensions": ["northing", "easting"],
         "spatial:transform": [
