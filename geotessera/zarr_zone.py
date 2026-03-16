@@ -60,8 +60,8 @@ INNER_CHUNK = 4    # inner chunk spatial dimension (pixels)
 
 # GeoZarr convention registration entries
 PROJ_CONVENTION = {
-    "schema_url": "https://raw.githubusercontent.com/zarr-conventions/geo-proj/refs/tags/v1/schema.json",
-    "spec_url": "https://github.com/zarr-conventions/geo-proj/blob/v1/README.md",
+    "schema_url": "https://raw.githubusercontent.com/zarr-experimental/geo-proj/refs/tags/v1/schema.json",
+    "spec_url": "https://github.com/zarr-experimental/geo-proj/blob/v1/README.md",
     "uuid": "f17cb550-5864-4468-aeb7-f3180cfb622f",
     "name": "proj:",
     "description": "Coordinate reference system information for geospatial data",
@@ -71,7 +71,7 @@ SPATIAL_CONVENTION = {
     "spec_url": "https://github.com/zarr-conventions/spatial/blob/v1/README.md",
     "uuid": "689b58e2-cf7b-45e0-9fff-9cfc0883d6b4",
     "name": "spatial:",
-    "description": "Spatial coordinate transformations and mappings",
+    "description": "Spatial coordinate information",
 }
 MULTISCALES_CONVENTION = {
     "schema_url": "https://raw.githubusercontent.com/zarr-conventions/multiscales/refs/tags/v1/schema.json",
@@ -121,6 +121,35 @@ def _get_tessera_attr(attrs, short_name: str, default=None):
     return default
 
 
+# Canonical convention registration objects, keyed by UUID.
+# Used by migration to fix stale descriptions.
+_CANONICAL_CONVENTIONS = {
+    c["uuid"]: c for c in [
+        TESSERA_CONVENTION, PROJ_CONVENTION, SPATIAL_CONVENTION,
+        MULTISCALES_CONVENTION,
+    ]
+}
+
+
+def _fix_zarr_conventions(convs: list) -> tuple[list, bool]:
+    """Fix convention registration objects to match canonical descriptions.
+
+    Returns (updated_convs, changed).
+    """
+    changed = False
+    fixed = []
+    for c in convs:
+        uuid = c.get("uuid")
+        if uuid and uuid in _CANONICAL_CONVENTIONS:
+            canonical = _CANONICAL_CONVENTIONS[uuid]
+            if c != canonical:
+                fixed.append(dict(canonical))
+                changed = True
+                continue
+        fixed.append(c)
+    return fixed, changed
+
+
 def migrate_store_attrs(year_store_path: Path, *, dry_run: bool = False,
                         console: Optional["rich.console.Console"] = None) -> int:
     """Migrate a year store from old unprefixed attrs to tessera:-prefixed attrs.
@@ -150,10 +179,12 @@ def migrate_store_attrs(year_store_path: Path, *, dry_run: bool = False,
         v = root_attrs.get("tessera_dataset_version", "v1")
         root_updates["tessera:dataset_version"] = v
 
-    # Add TESSERA_CONVENTION to zarr_conventions
+    # Fix zarr_conventions: add TESSERA_CONVENTION, fix stale descriptions/URLs
     convs = list(root_attrs.get("zarr_conventions", []))
     if not any(c.get("uuid") == TESSERA_CONVENTION["uuid"] for c in convs):
         convs.insert(0, TESSERA_CONVENTION)
+    convs, convs_changed = _fix_zarr_conventions(convs)
+    if convs_changed or convs != root_attrs.get("zarr_conventions", []):
         root_updates["zarr_conventions"] = convs
 
     if root_updates:
@@ -200,13 +231,15 @@ def migrate_store_attrs(year_store_path: Path, *, dry_run: bool = False,
         if "tessera:model_version" not in attrs:
             updates["tessera:model_version"] = "1.0"
 
-        # Add TESSERA_CONVENTION to zarr_conventions
+        # Fix zarr_conventions: add TESSERA_CONVENTION, fix stale descriptions/URLs
         convs = list(attrs.get("zarr_conventions", []))
         if not any(c.get("uuid") == TESSERA_CONVENTION["uuid"] for c in convs):
             convs.insert(0, TESSERA_CONVENTION)
+        convs, convs_changed = _fix_zarr_conventions(convs)
+        if convs_changed or convs != attrs.get("zarr_conventions", []):
             updates["zarr_conventions"] = convs
 
-        if updates:
+        if updates or removals:
             if dry_run:
                 if console:
                     console.print(
