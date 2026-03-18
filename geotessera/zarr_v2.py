@@ -394,24 +394,16 @@ def init_v2_store(
     if console:
         console.print(f"  {len(landmask_by_zone)} zone(s) with land coverage")
 
-    # Create root group
-    os.makedirs(str(output_path), exist_ok=True)
-    root_meta = output_path / "zarr.json"
-    with open(str(root_meta), "w") as f:
-        _json.dump({
-            "zarr_format": 3,
-            "node_type": "group",
-            "attributes": {
-                "zarr_conventions": [TESSERA_CONVENTION],
-                "tessera:dataset_version": "v2",
-                "tessera:years": years,
-                "tessera:model_version": model_version,
-                "tessera:build_version": geotessera_version,
-            },
-        }, f, indent=2)
-
-    root = zarr.open_group(str(output_path), mode="r+", zarr_format=3,
-                           use_consolidated=False)
+    # Create root group via zarr API (not manual JSON) so consolidation
+    # preserves attributes correctly.
+    root = zarr.open_group(str(output_path), mode="w", zarr_format=3)
+    root.attrs.update({
+        "zarr_conventions": [TESSERA_CONVENTION],
+        "tessera:dataset_version": "v2",
+        "tessera:years": years,
+        "tessera:model_version": model_version,
+        "tessera:build_version": geotessera_version,
+    })
 
     # Create each zone group from landmask coverage
     for zone_num in sorted(landmask_by_zone.keys()):
@@ -461,16 +453,10 @@ def _create_v2_zone_group(
     from zarr.codecs import BloscCodec
 
     zone_group = _zone_group_name(grid.zone)
-    zone_dir = store_path / zone_group
-
-    os.makedirs(str(zone_dir), exist_ok=True)
-    zone_meta = zone_dir / "zarr.json"
-    with open(str(zone_meta), "w") as f:
-        _json.dump({"zarr_format": 3, "node_type": "group", "attributes": {}}, f)
 
     root_reopen = zarr.open_group(str(store_path), mode="r+", zarr_format=3,
                                   use_consolidated=False)
-    store = root_reopen[zone_group]
+    store = root_reopen.create_group(zone_group)
 
     T = len(grid.years)
     H = grid.height_px
