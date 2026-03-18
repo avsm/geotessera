@@ -37,8 +37,6 @@ import numpy as np
 
 from .zarr_zone import (
     N_BANDS,
-    PROJ_CONVENTION,
-    SPATIAL_CONVENTION,
     TESSERA_CONVENTION,
     ShardSpec,
     ShardTileOverlap,
@@ -508,28 +506,31 @@ def _create_v2_zone_group(
         )
         store[name][:] = data
 
-    # Spatial metadata
+    # Use geozarr-toolkit for proj: and spatial: convention metadata
+    from geozarr_toolkit import create_geozarr_attrs
+
     x_min = grid.origin_x
     x_max = grid.origin_x + W * grid.pixel_size
     y_max = grid.origin_y
     y_min = grid.origin_y - H * grid.pixel_size
 
-    store.attrs.update({
-        "zarr_conventions": [
-            TESSERA_CONVENTION, PROJ_CONVENTION, SPATIAL_CONVENTION,
-        ],
-        # proj:
-        "proj:code": f"EPSG:{grid.canonical_epsg}",
-        # spatial:
-        "spatial:dimensions": ["y", "x"],
-        "spatial:transform": [
+    geozarr_attrs = create_geozarr_attrs(
+        dimensions=["y", "x"],
+        crs=f"EPSG:{grid.canonical_epsg}",
+        transform=[
             grid.pixel_size, 0.0, grid.origin_x,
             0.0, -grid.pixel_size, grid.origin_y,
         ],
-        "spatial:shape": [H, W],
-        "spatial:bbox": [x_min, y_min, x_max, y_max],
-        "spatial:registration": "pixel",
-        # tessera:
+        bbox=[x_min, y_min, x_max, y_max],
+        shape=[H, W],
+        registration="pixel",
+    )
+
+    # Add tessera convention registration alongside the geozarr ones
+    geozarr_attrs.setdefault("zarr_conventions", []).insert(0, TESSERA_CONVENTION)
+
+    # Add tessera-specific attributes
+    geozarr_attrs.update({
         "tessera:dataset_version": "v2",
         "tessera:years": grid.years,
         "tessera:utm_zone": grid.zone,
@@ -537,6 +538,8 @@ def _create_v2_zone_group(
         "tessera:model_version": model_version,
         "tessera:build_version": build_version,
     })
+
+    store.attrs.update(geozarr_attrs)
 
     return store
 
