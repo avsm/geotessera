@@ -285,7 +285,7 @@ def _gather_landmask_tiles_by_zone(
 
     Returns dict mapping zone number to list of (lon, lat) centres.
     """
-    tiles = registry.get_landmask_tiles()  # [(lon, lat), ...]
+    tiles = registry.available_landmasks  # [(lon, lat), ...]
     by_zone: Dict[int, List[Tuple[float, float]]] = {}
     for lon, lat in tiles:
         zone_num = int(math.floor((lon + 180) / 6)) + 1
