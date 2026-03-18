@@ -15,6 +15,11 @@ Layout:
 
 Dimension order: (time, band, y, x) — ML-standard NCHW.
 Inner chunks: (1, 128, 32, 32), Shards: (1, 128, 4096, 4096).
+
+Scale sentinels:
+    NaN   = water (permanent, from landmask)
+    +inf  = land, no data yet (set at init, replaced by real scale on fill)
+    finite = valid data
 """
 
 from __future__ import annotations
@@ -273,24 +278,101 @@ def _default_zone_grid(zone: int, years: List[int]) -> UnifiedZoneGrid:
     )
 
 
+def _gather_landmask_tiles_by_zone(
+    registry: "Registry",
+) -> Dict[int, List[Tuple[float, float]]]:
+    """Group landmask tile coordinates by UTM zone.
+
+    Returns dict mapping zone number to list of (lon, lat) centres.
+    """
+    tiles = registry.get_landmask_tiles()  # [(lon, lat), ...]
+    by_zone: Dict[int, List[Tuple[float, float]]] = {}
+    for lon, lat in tiles:
+        zone_num = int(math.floor((lon + 180) / 6)) + 1
+        zone_num = max(1, min(60, zone_num))
+        by_zone.setdefault(zone_num, []).append((lon, lat))
+    return by_zone
+
+
+def _compute_zone_grid_from_landmask(
+    zone: int,
+    tile_coords: List[Tuple[float, float]],
+    years: List[int],
+) -> UnifiedZoneGrid:
+    """Compute a unified zone grid from landmask tile coordinates.
+
+    Projects tile bounding boxes to UTM and computes the union extent,
+    snapped to V2_SHARD_SIZE boundaries.
+    """
+    from pyproj import Transformer
+
+    epsg = zone_canonical_epsg(zone)
+    pixel_size = 10.0
+    proj = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True)
+
+    min_x = float("inf")
+    max_x = float("-inf")
+    min_y = float("inf")
+    max_y = float("-inf")
+
+    for lon, lat in tile_coords:
+        # Each tile is 0.1 degrees
+        west, east = lon - 0.05, lon + 0.05
+        south, north = lat - 0.05, lat + 0.05
+
+        corners_x, corners_y = proj.transform(
+            [west, east, west, east],
+            [north, north, south, south],
+        )
+        min_x = min(min_x, min(corners_x))
+        max_x = max(max_x, max(corners_x))
+        min_y = min(min_y, min(corners_y))
+        max_y = max(max_y, max(corners_y))
+
+    origin_x = math.floor(min_x / pixel_size) * pixel_size
+    origin_y = math.ceil(max_y / pixel_size) * pixel_size
+    extent_right = math.ceil(max_x / pixel_size) * pixel_size
+    extent_bottom = math.floor(min_y / pixel_size) * pixel_size
+
+    width_px = round((extent_right - origin_x) / pixel_size)
+    height_px = round((origin_y - extent_bottom) / pixel_size)
+
+    width_px = math.ceil(width_px / V2_SHARD_SIZE) * V2_SHARD_SIZE
+    height_px = math.ceil(height_px / V2_SHARD_SIZE) * V2_SHARD_SIZE
+
+    return UnifiedZoneGrid(
+        zone=zone,
+        years=years,
+        canonical_epsg=epsg,
+        origin_x=origin_x,
+        origin_y=origin_y,
+        width_px=width_px,
+        height_px=height_px,
+        pixel_size=pixel_size,
+    )
+
+
 def init_v2_store(
     registry: "Registry",
     output_path: Path,
     years: List[int],
-    zones: Optional[List[int]] = None,
     geotessera_version: str = "unknown",
     model_version: str = "1.0",
     console: Optional["rich.console.Console"] = None,
 ) -> Path:
-    """Create an empty v2 tessera store with time dimension.
+    """Create a v2 tessera store with time dimension from the landmask registry.
 
-    Creates all 60 UTM zones (or the specified subset).  All arrays are
-    fully sparse (fill_value) — no data is written.  Zones with tile
-    coverage get a tight bounding box; zones without tiles get the full
-    theoretical UTM extent.
+    Creates all UTM zones that have landmask coverage.  For each zone, the
+    grid extent is computed from landmask tiles (not embeddings), so only
+    the landmask registry is needed.
+
+    The scales array is initialised with sentinels:
+    - NaN  = water (permanent, from landmask)
+    - +inf = land, no data yet (replaced by real scale values during fill)
+
+    No embedding data is written.  The embeddings array stays at fill_value (0).
     """
     import zarr
-    from zarr.codecs import BloscCodec
 
     output_path = Path(output_path)
     if output_path.exists():
@@ -298,26 +380,19 @@ def init_v2_store(
 
     years = sorted(years)
     T = len(years)
-    zone_list = zones if zones is not None else list(range(1, 61))
 
     if console:
         console.print(f"Initialising v2 store at [bold]{output_path}[/bold]")
         console.print(f"  Years: {years[0]}-{years[-1]} ({T} time steps)")
-        console.print(f"  Zones: {len(zone_list)} ({zone_list[0]}-{zone_list[-1]})")
 
-    # Gather tile infos across ALL years to compute tight grids where possible
-    zones_with_tiles: Dict[int, List[TileInfo]] = {}
-    for year in years:
-        year_tiles = gather_tile_infos(registry, year, zones=zones, console=console)
-        for zone_num, tile_list in year_tiles.items():
-            zones_with_tiles.setdefault(zone_num, []).extend(tile_list)
+    # Get landmask coverage grouped by UTM zone
+    landmask_by_zone = _gather_landmask_tiles_by_zone(registry)
+
+    if not landmask_by_zone:
+        raise ValueError("No landmask tiles found in registry")
 
     if console:
-        n_with = len(zones_with_tiles)
-        console.print(
-            f"  {n_with} zone(s) have tiles, "
-            f"{len(zone_list) - n_with} will use default extents"
-        )
+        console.print(f"  {len(landmask_by_zone)} zone(s) with land coverage")
 
     # Create root group
     os.makedirs(str(output_path), exist_ok=True)
@@ -338,12 +413,10 @@ def init_v2_store(
     root = zarr.open_group(str(output_path), mode="r+", zarr_format=3,
                            use_consolidated=False)
 
-    # Create each zone group
-    for zone_num in sorted(zone_list):
-        if zone_num in zones_with_tiles:
-            grid = compute_unified_zone_grid(zones_with_tiles[zone_num], years)
-        else:
-            grid = _default_zone_grid(zone_num, years)
+    # Create each zone group from landmask coverage
+    for zone_num in sorted(landmask_by_zone.keys()):
+        tile_coords = landmask_by_zone[zone_num]
+        grid = _compute_zone_grid_from_landmask(zone_num, tile_coords, years)
 
         if console:
             w_km = grid.width_px * grid.pixel_size / 1000
@@ -407,12 +480,16 @@ def _create_v2_zone_group(
         compressors=BloscCodec(cname="zstd", clevel=3),
         dimension_names=["time", "band", "y", "x"],
     )
+    # fill_value=+inf means unwritten land pixels read as "no data yet".
+    # Water pixels are written as NaN during zarr-fill (from landmask).
+    # Clients: isinf(scales) → land/no-data, isnan(scales) → water,
+    #          isfinite(scales) → valid embedding data.
     store.create_array(
         "scales",
         shape=(T, H, W),
         chunks=(1, V2_INNER_CHUNK, V2_INNER_CHUNK),
         shards=(1, V2_SHARD_SIZE, V2_SHARD_SIZE),
-        dtype=np.float32, fill_value=np.float32("nan"),
+        dtype=np.float32, fill_value=np.float32("inf"),
         compressors=BloscCodec(cname="zstd", clevel=3),
         dimension_names=["time", "y", "x"],
     )
@@ -551,7 +628,9 @@ def _write_one_shard_v2(spec: ShardSpec, store: "zarr.Group") -> bool:
 
     # Allocate BHW buffer (bands-first for NCHW write)
     emb_buf = np.zeros((N_BANDS, S, S), dtype=np.int8)
-    scales_buf = np.full((S, S), np.float32("nan"))
+    # Start with +inf (land/nodata); landmask sets water to NaN,
+    # valid tiles overwrite with finite scales.
+    scales_buf = np.full((S, S), np.float32("inf"))
 
     has_data = False
     for ov in spec.tiles:
