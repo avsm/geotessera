@@ -437,6 +437,12 @@ def init_v2_store(
     # Create empty tile registry
     _init_tile_registry(output_path)
 
+    # Consolidate metadata so HTTP readers can discover the hierarchy
+    import warnings
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Consolidated metadata")
+        zarr.consolidate_metadata(str(output_path))
+
     if console:
         console.print(f"  [green]Store initialised (metadata only, no data written)[/green]")
 
@@ -826,6 +832,13 @@ def fill_v2_store(
 
             # Update tile registry
             _record_written_tiles(store_path, remaining, fill_year, zone_num)
+
+    # Re-consolidate metadata after filling
+    if total_shards_written > 0:
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Consolidated metadata")
+            zarr.consolidate_metadata(str(store_path))
 
     return total_shards_written
 
