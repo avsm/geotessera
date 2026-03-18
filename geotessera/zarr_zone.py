@@ -448,6 +448,7 @@ class ShardSpec:
     row_px: int  # pixel row in zone grid (sr * SHARD_SIZE)
     col_px: int  # pixel col in zone grid (sc * SHARD_SIZE)
     tiles: List[ShardTileOverlap]
+    time_index: int = 0  # which time step (v2 only; 0 for v1)
 
 
 # =============================================================================

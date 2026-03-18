@@ -20,7 +20,7 @@ import pandas as pd
 import geopandas as gpd
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Callable, Any, List, Optional
+from typing import Callable, Any, List, Optional, Tuple
 
 from rich.console import Console
 from rich.panel import Panel
@@ -2827,6 +2827,108 @@ def _zarr_store_to_stac_item(
     return item
 
 
+def _parse_year_range(s: str) -> list[int]:
+    """Parse a year range like '2017-2025' or '2017,2019,2024'."""
+    if "-" in s and "," not in s:
+        start, end = s.split("-", 1)
+        return list(range(int(start), int(end) + 1))
+    return [int(y.strip()) for y in s.split(",")]
+
+
+def _parse_zone_list(s: str) -> list[int]:
+    """Parse a zone list like '29,30,31' or '29-34'."""
+    if "-" in s and "," not in s:
+        start, end = s.split("-", 1)
+        return list(range(int(start), int(end) + 1))
+    return [int(z.strip()) for z in s.split(",")]
+
+
+def _find_registry(base_dir: str, registry_dir: Optional[str] = None) -> Tuple[str, str]:
+    """Find the registry directory from base_dir. Returns (base_dir, registry_dir)."""
+    if registry_dir is None:
+        candidate = Path(base_dir)
+        for _ in range(3):
+            if (candidate / "registry.parquet").exists():
+                return base_dir, str(candidate)
+            candidate = candidate.parent
+    return base_dir, registry_dir or base_dir
+
+
+def zarr_init_command(args):
+    """Create an empty v2 tessera store with time dimension."""
+    from rich.console import Console
+    from .registry import Registry
+    from .zarr_v2 import init_v2_store
+
+    console = Console()
+
+    base_dir = args.base_dir
+    base_dir, registry_dir = _find_registry(base_dir, args.registry_dir)
+
+    registry = Registry(
+        version="v1",
+        embeddings_dir=base_dir,
+        registry_dir=registry_dir,
+    )
+
+    years = _parse_year_range(args.years)
+    zones = _parse_zone_list(args.zones) if args.zones else None
+    output = Path(args.output)
+
+    try:
+        import importlib.metadata
+        version = importlib.metadata.version("geotessera")
+    except Exception:
+        version = "unknown"
+
+    try:
+        init_v2_store(
+            registry, output, years,
+            zones=zones,
+            geotessera_version=version,
+            model_version=args.model_version,
+            console=console,
+        )
+    except FileExistsError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        return 1
+
+    return 0
+
+
+def zarr_fill_command(args):
+    """Incrementally fill a v2 tessera store with tile data."""
+    from rich.console import Console
+    from .registry import Registry
+    from .zarr_v2 import fill_v2_store
+
+    console = Console()
+
+    base_dir = args.base_dir
+    base_dir, registry_dir = _find_registry(base_dir, args.registry_dir)
+
+    registry = Registry(
+        version="v1",
+        embeddings_dir=base_dir,
+        registry_dir=registry_dir,
+    )
+
+    store_path = Path(args.store_path)
+    year = args.year
+    zones = _parse_zone_list(args.zones) if args.zones else None
+
+    n = fill_v2_store(
+        registry, store_path,
+        year=year, zones=zones,
+        with_rgb=args.with_rgb,
+        console=console,
+        workers=args.workers,
+    )
+
+    console.print(f"\n{emoji('✅ ')}{n} shards written")
+    return 0
+
+
 def zarr_migrate_command(args):
     """Migrate Zarr stores from old unprefixed attrs to tessera:-prefixed attrs."""
     import re
@@ -3374,6 +3476,72 @@ Directory Structure:
         help="Output directory for STAC JSON files (default: same as zarr_dir)",
     )
     stac_index_parser.set_defaults(func=stac_index_command)
+
+    # Zarr-init command (v2)
+    zarr_init_parser = subparsers.add_parser(
+        "zarr-init",
+        help="Create an empty v2 tessera store with time dimension",
+    )
+    zarr_init_parser.add_argument(
+        "base_dir",
+        help="Base directory containing downloaded tile data",
+    )
+    zarr_init_parser.add_argument(
+        "--years", required=True,
+        help="Year range (e.g. 2017-2025 or 2017,2019,2024)",
+    )
+    zarr_init_parser.add_argument(
+        "--zones", default=None,
+        help="Zone numbers (e.g. 29-34 or 29,30,31). Default: all from registry",
+    )
+    zarr_init_parser.add_argument(
+        "--output", required=True, type=str,
+        help="Output store path (e.g. tessera.zarr)",
+    )
+    zarr_init_parser.add_argument(
+        "--model-version", default="1.0",
+        help="Embedding model version (default: 1.0)",
+    )
+    zarr_init_parser.add_argument(
+        "--registry-dir", type=str, default=None,
+        help="Directory containing registry.parquet (default: auto-detected)",
+    )
+    zarr_init_parser.set_defaults(func=zarr_init_command)
+
+    # Zarr-fill command (v2)
+    zarr_fill_parser = subparsers.add_parser(
+        "zarr-fill",
+        help="Incrementally fill a v2 tessera store with tile data",
+    )
+    zarr_fill_parser.add_argument(
+        "base_dir",
+        help="Base directory containing downloaded tile data",
+    )
+    zarr_fill_parser.add_argument(
+        "store_path", type=str,
+        help="Path to existing v2 tessera store",
+    )
+    zarr_fill_parser.add_argument(
+        "--year", type=int, default=None,
+        help="Year to fill (default: all years)",
+    )
+    zarr_fill_parser.add_argument(
+        "--zones", default=None,
+        help="Zone numbers to fill (e.g. 29-34). Default: all initialised zones",
+    )
+    zarr_fill_parser.add_argument(
+        "--with-rgb", action="store_true",
+        help="Also generate RGB previews for filled zones",
+    )
+    zarr_fill_parser.add_argument(
+        "--workers", type=int, default=None,
+        help="Number of parallel workers (default: 4)",
+    )
+    zarr_fill_parser.add_argument(
+        "--registry-dir", type=str, default=None,
+        help="Directory containing registry.parquet (default: auto-detected)",
+    )
+    zarr_fill_parser.set_defaults(func=zarr_fill_command)
 
     # Zarr-migrate command
     zarr_migrate_parser = subparsers.add_parser(
