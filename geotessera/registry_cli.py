@@ -2927,6 +2927,51 @@ def zarr_fill_command(args):
     return 0
 
 
+def zarr_rgb_command(args):
+    """Generate RGB previews for a v2 tessera store."""
+    import re
+    import zarr
+    from rich.console import Console
+    from .zarr_v2 import add_v2_rgb_preview
+
+    console = Console()
+    store_path = Path(args.store_path)
+
+    root = zarr.open_group(str(store_path), mode="r", use_consolidated=False)
+    root_attrs = dict(root.attrs)
+    all_years = root_attrs.get("tessera:years", [])
+    if not all_years:
+        console.print("[red]Error: not a v2 store (no tessera:years)[/red]")
+        return 1
+
+    years = _parse_year_range(args.years) if args.years else all_years
+    zones = _parse_zone_list(args.zones) if args.zones else None
+
+    zone_pattern = re.compile(r"^utm(\d{2})$")
+    all_zone_nums = sorted(
+        int(m.group(1)) for name in root.keys()
+        if (m := zone_pattern.match(name))
+    )
+    target_zones = [z for z in all_zone_nums if zones is None or z in zones]
+
+    console.print(f"Generating RGB previews for [bold]{store_path}[/bold]")
+    console.print(f"  Years: {years}")
+    console.print(f"  Zones: {target_zones}")
+
+    for year in years:
+        if year not in all_years:
+            console.print(f"  [yellow]Year {year} not in store, skipping[/yellow]")
+            continue
+        time_index = all_years.index(year)
+        for zone_num in target_zones:
+            add_v2_rgb_preview(
+                store_path, zone_num, time_index,
+                workers=args.workers, console=console,
+            )
+
+    return 0
+
+
 def zarr_migrate_command(args):
     """Migrate Zarr stores from old unprefixed attrs to tessera:-prefixed attrs."""
     import re
@@ -3536,6 +3581,29 @@ Directory Structure:
         help="Directory containing registry.parquet (default: auto-detected)",
     )
     zarr_fill_parser.set_defaults(func=zarr_fill_command)
+
+    # Zarr-rgb command (v2)
+    zarr_rgb_parser = subparsers.add_parser(
+        "zarr-rgb",
+        help="Generate RGB previews for a v2 tessera store",
+    )
+    zarr_rgb_parser.add_argument(
+        "store_path", type=str,
+        help="Path to v2 tessera store",
+    )
+    zarr_rgb_parser.add_argument(
+        "--years", default=None,
+        help="Year range (e.g. 2024 or 2017-2025). Default: all years",
+    )
+    zarr_rgb_parser.add_argument(
+        "--zones", default=None,
+        help="Zone numbers (e.g. 29-34). Default: all zones",
+    )
+    zarr_rgb_parser.add_argument(
+        "--workers", type=int, default=None,
+        help="Number of parallel workers",
+    )
+    zarr_rgb_parser.set_defaults(func=zarr_rgb_command)
 
     # Zarr-migrate command
     zarr_migrate_parser = subparsers.add_parser(

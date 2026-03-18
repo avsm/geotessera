@@ -700,9 +700,9 @@ def fill_v2_store(
     Reads the tile registry to skip already-written tiles.
     Returns the number of shards written.
     """
+    import warnings
     import zarr
     from concurrent.futures import ProcessPoolExecutor, as_completed
-    from shapely.geometry import Point
 
     store_path = Path(store_path)
     if workers is None:
@@ -722,6 +722,7 @@ def fill_v2_store(
         console.print(f"  Years to fill: {fill_years}")
 
     total_shards_written = 0
+    zones_filled: List[Tuple[int, int]] = []  # (zone_num, time_index) for RGB
 
     for fill_year in fill_years:
         if fill_year not in all_years:
@@ -829,9 +830,21 @@ def fill_v2_store(
             # Update tile registry
             _record_written_tiles(store_path, remaining, fill_year, zone_num)
 
+            if written_count > 0:
+                zones_filled.append((zone_num, time_index))
+
+    # Generate RGB previews for filled zones
+    if with_rgb and zones_filled:
+        if console:
+            console.print(f"\n  Generating RGB previews...")
+        for zone_num, time_index in zones_filled:
+            add_v2_rgb_preview(
+                store_path, zone_num, time_index,
+                workers=workers, console=console,
+            )
+
     # Re-consolidate metadata after filling
     if total_shards_written > 0:
-        import warnings
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message="Consolidated metadata")
             zarr.consolidate_metadata(str(store_path))
@@ -872,3 +885,255 @@ def _record_written_tiles(
         crs="EPSG:4326",
     )
     _save_tile_registry(store_path, combined)
+
+
+# ---------------------------------------------------------------------------
+# RGB preview generation (v2 — NCHW layout)
+# ---------------------------------------------------------------------------
+
+RGB_PREVIEW_BANDS = (0, 1, 2)
+
+
+def _ensure_v2_rgb_array(store: "zarr.Group") -> None:
+    """Create the rgb array in a v2 zone group if it doesn't exist.
+
+    Shape: (T, 4, H, W) matching the NCHW layout.
+    """
+    from zarr.codecs import BloscCodec
+
+    try:
+        _ = store["rgb"]
+        return
+    except KeyError:
+        pass
+
+    emb_shape = store["embeddings"].shape  # (T, B, H, W)
+    T, _, H, W = emb_shape
+    store.create_array(
+        "rgb",
+        shape=(T, 4, H, W),
+        chunks=(1, 4, V2_INNER_CHUNK, V2_INNER_CHUNK),
+        shards=(1, 4, V2_SHARD_SIZE, V2_SHARD_SIZE),
+        dtype=np.uint8, fill_value=np.uint8(0),
+        compressors=BloscCodec(cname="zstd", clevel=3),
+        dimension_names=["time", "rgba", "y", "x"],
+    )
+
+
+def _compute_rgb_chunk_v2(
+    emb_bhw: np.ndarray,
+    scales_hw: np.ndarray,
+    band_indices: tuple,
+    stretch_min: List[float],
+    stretch_max: List[float],
+) -> np.ndarray:
+    """Compute RGBA preview from NCHW-layout embedding + scales.
+
+    Args:
+        emb_bhw: int8 (B, H, W)
+        scales_hw: float32 (H, W)
+
+    Returns:
+        uint8 (4, H, W) — RGBA in channels-first layout.
+    """
+    h, w = scales_hw.shape
+    rgba = np.zeros((4, h, w), dtype=np.uint8)
+    valid = np.isfinite(scales_hw)
+    scales_safe = np.where(valid, scales_hw, 0.0)
+
+    for i, band_idx in enumerate(band_indices):
+        raw = emb_bhw[band_idx].astype(np.float32)
+        dequant = raw * scales_safe
+        lo, hi = stretch_min[i], stretch_max[i]
+        normalised = np.clip((dequant - lo) / max(hi - lo, 1e-10), 0.0, 1.0)
+        rgba[i] = (normalised * 255).astype(np.uint8)
+
+    rgba[:3, ~valid] = 0
+    rgba[3] = np.where(valid, 255, 0).astype(np.uint8)
+    return rgba
+
+
+def _sample_v2_chunk_stats(
+    emb_arr, scales_arr,
+    time_index: int,
+    ci: int, cj: int,
+    shard_size: int,
+    spatial_shape: Tuple[int, int],
+    band_indices: tuple = RGB_PREVIEW_BANDS,
+    max_per_chunk: int = 10_000,
+) -> Optional[np.ndarray]:
+    """Sample dequantised values from one shard for stretch estimation.
+
+    Reads from NCHW layout: emb_arr[t, bands, r0:r1, c0:c1].
+    """
+    H, W = spatial_shape
+    r0, r1 = ci * shard_size, min(ci * shard_size + shard_size, H)
+    c0, c1 = cj * shard_size, min(cj * shard_size + shard_size, W)
+
+    scales_chunk = np.asarray(scales_arr[time_index, r0:r1, c0:c1])
+    valid = np.isfinite(scales_chunk)
+    if not np.any(valid):
+        return None
+
+    # Read only the RGB bands
+    band_list = list(band_indices)
+    emb_chunk = np.asarray(
+        emb_arr[time_index, band_list[0]:band_list[-1] + 1, r0:r1, c0:c1]
+    )  # (n_rgb_bands, h, w)
+
+    # Dequantise: (n_bands, h, w) * (h, w) → broadcast over bands
+    vals_all = emb_chunk.astype(np.float32) * scales_chunk[np.newaxis, :, :]
+    # Reshape to (n_pixels, n_bands) and filter to valid
+    n_bands = vals_all.shape[0]
+    vals_flat = vals_all.reshape(n_bands, -1).T  # (n_pixels, n_bands)
+    valid_flat = valid.ravel()
+    vals = vals_flat[valid_flat]
+
+    if vals.shape[0] > max_per_chunk:
+        rng = np.random.default_rng(ci * 10007 + cj)
+        idx = rng.choice(vals.shape[0], max_per_chunk, replace=False)
+        vals = vals[idx]
+
+    return vals
+
+
+def compute_v2_stretch(
+    store: "zarr.Group",
+    time_index: int,
+    p_low: float = 2,
+    p_high: float = 98,
+    workers: int = 8,
+    console: Optional["rich.console.Console"] = None,
+    sample_fraction: float = 0.1,
+) -> dict:
+    """Compute percentile stretch for RGB bands at one time step."""
+    from .zarr_zone import _run_parallel
+
+    emb_arr = store["embeddings"]
+    scales_arr = store["scales"]
+    _, _, H, W = emb_arr.shape
+
+    n_rows = math.ceil(H / V2_SHARD_SIZE)
+    n_cols = math.ceil(W / V2_SHARD_SIZE)
+    all_indices = [(ci, cj) for ci in range(n_rows) for cj in range(n_cols)]
+
+    n_sample = max(1, int(len(all_indices) * sample_fraction))
+    rng = np.random.default_rng(42)
+    sample_indices = [
+        all_indices[i] for i in rng.choice(len(all_indices), n_sample, replace=False)
+    ]
+
+    results = _run_parallel(
+        lambda idx: _sample_v2_chunk_stats(
+            emb_arr, scales_arr, time_index,
+            idx[0], idx[1], V2_SHARD_SIZE, (H, W),
+        ),
+        sample_indices, workers, console,
+        label=f"Sampling stretch ({n_sample}/{len(all_indices)} shards)",
+    )
+
+    samples = [r for _, r in results if r is not None]
+    if not samples:
+        return {"min": [0.0, 0.0, 0.0], "max": [1.0, 1.0, 1.0]}
+
+    all_rgb = np.concatenate(samples, axis=0)
+    stretch_min = [float(np.percentile(all_rgb[:, i], p_low)) for i in range(3)]
+    stretch_max = [float(np.percentile(all_rgb[:, i], p_high)) for i in range(3)]
+
+    for i in range(3):
+        if stretch_max[i] <= stretch_min[i]:
+            stretch_max[i] = stretch_min[i] + 1.0
+
+    return {"min": stretch_min, "max": stretch_max}
+
+
+def _write_v2_rgb_pass(
+    store: "zarr.Group",
+    time_index: int,
+    stretch: dict,
+    workers: int = 8,
+    console: Optional["rich.console.Console"] = None,
+) -> int:
+    """Write the RGB preview for one time step, shard by shard."""
+    from .zarr_zone import _run_parallel
+
+    emb_arr = store["embeddings"]
+    scales_arr = store["scales"]
+    rgb_arr = store["rgb"]
+    _, _, H, W = emb_arr.shape
+
+    n_rows = math.ceil(H / V2_SHARD_SIZE)
+    n_cols = math.ceil(W / V2_SHARD_SIZE)
+
+    def _process_shard(idx):
+        ci, cj = idx
+        r0 = ci * V2_SHARD_SIZE
+        r1 = min(r0 + V2_SHARD_SIZE, H)
+        c0 = cj * V2_SHARD_SIZE
+        c1 = min(c0 + V2_SHARD_SIZE, W)
+
+        scales_chunk = np.asarray(scales_arr[time_index, r0:r1, c0:c1])
+        if not np.any(np.isfinite(scales_chunk)):
+            return False
+
+        emb_chunk = np.asarray(emb_arr[time_index, :, r0:r1, c0:c1])  # (B, h, w)
+        rgba = _compute_rgb_chunk_v2(
+            emb_chunk, scales_chunk,
+            RGB_PREVIEW_BANDS, stretch["min"], stretch["max"],
+        )
+        rgb_arr[time_index, :, r0:r1, c0:c1] = rgba
+        return True
+
+    shard_indices = [(ci, cj) for ci in range(n_rows) for cj in range(n_cols)]
+
+    results = _run_parallel(
+        _process_shard, shard_indices, workers, console,
+        label=f"Writing RGB preview ({workers} threads)",
+    )
+
+    return sum(1 for _, wrote in results if wrote)
+
+
+def add_v2_rgb_preview(
+    store_path: Path,
+    zone_num: int,
+    time_index: int,
+    workers: Optional[int] = None,
+    console: Optional["rich.console.Console"] = None,
+) -> None:
+    """Add or update the RGB preview for one zone at one time step."""
+    import zarr
+    from .zarr_zone import _default_workers
+
+    if workers is None:
+        workers = _default_workers()
+
+    zone_group = _zone_group_name(zone_num)
+    store = zarr.open_group(
+        str(store_path), mode="r+", path=zone_group,
+        zarr_format=3, use_consolidated=False,
+    )
+
+    _ensure_v2_rgb_array(store)
+
+    if console:
+        console.print(f"  Zone {zone_num} t={time_index}: sampling stretch...")
+
+    stretch = compute_v2_stretch(
+        store, time_index, workers=workers, console=console,
+    )
+
+    if console:
+        console.print(
+            f"    Stretch: min={[f'{v:.3f}' for v in stretch['min']]}, "
+            f"max={[f'{v:.3f}' for v in stretch['max']]}"
+        )
+
+    written = _write_v2_rgb_pass(
+        store, time_index, stretch, workers=workers, console=console,
+    )
+
+    store.attrs.update({"tessera:has_rgb_preview": True})
+
+    if console:
+        console.print(f"    [green]RGB: {written} shards written[/green]")
