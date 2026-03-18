@@ -526,6 +526,13 @@ def _create_v2_zone_group(
         registration="pixel",
     )
 
+    # Fix convention descriptions to match upstream schemas exactly
+    # (geozarr-toolkit has a bug: "Spatial coordinate and transformation
+    # information" instead of "Spatial coordinate information")
+    for conv in geozarr_attrs.get("zarr_conventions", []):
+        if conv.get("uuid") == "689b58e2-cf7b-45e0-9fff-9cfc0883d6b4":
+            conv["description"] = "Spatial coordinate information"
+
     # Add tessera convention registration alongside the geozarr ones
     geozarr_attrs.setdefault("zarr_conventions", []).insert(0, TESSERA_CONVENTION)
 
