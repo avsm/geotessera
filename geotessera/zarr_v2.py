@@ -800,31 +800,71 @@ def fill_v2_store(
             # Write shards via process pool
             zone_store_path = str(store_path)
             written_count = 0
+            n_shards = len(shard_specs)
 
-            with ProcessPoolExecutor(
-                max_workers=workers,
-                initializer=_init_v2_shard_worker,
-                initargs=(zone_store_path, zone_group),
-            ) as pool:
-                futures = {
-                    pool.submit(_write_one_shard_v2_worker, spec): spec
-                    for spec in shard_specs
-                }
-                for future in as_completed(futures):
-                    try:
-                        if future.result():
-                            written_count += 1
-                    except Exception as e:
-                        spec = futures[future]
-                        logger.warning(
-                            f"Shard ({spec.sr},{spec.sc}) failed: {e}"
-                        )
+            if console:
+                from rich.progress import (
+                    Progress, BarColumn, TextColumn,
+                    MofNCompleteColumn, TimeElapsedColumn,
+                    TimeRemainingColumn, SpinnerColumn,
+                )
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    MofNCompleteColumn(),
+                    TimeElapsedColumn(),
+                    TimeRemainingColumn(),
+                    console=console,
+                ) as progress:
+                    task = progress.add_task(
+                        f"    Zone {zone_num} y{fill_year}",
+                        total=n_shards,
+                    )
+                    with ProcessPoolExecutor(
+                        max_workers=workers,
+                        initializer=_init_v2_shard_worker,
+                        initargs=(zone_store_path, zone_group),
+                    ) as pool:
+                        futures = {
+                            pool.submit(_write_one_shard_v2_worker, spec): spec
+                            for spec in shard_specs
+                        }
+                        for future in as_completed(futures):
+                            try:
+                                if future.result():
+                                    written_count += 1
+                            except Exception as e:
+                                spec = futures[future]
+                                logger.warning(
+                                    f"Shard ({spec.sr},{spec.sc}) failed: {e}"
+                                )
+                            progress.advance(task)
+            else:
+                with ProcessPoolExecutor(
+                    max_workers=workers,
+                    initializer=_init_v2_shard_worker,
+                    initargs=(zone_store_path, zone_group),
+                ) as pool:
+                    futures = {
+                        pool.submit(_write_one_shard_v2_worker, spec): spec
+                        for spec in shard_specs
+                    }
+                    for future in as_completed(futures):
+                        try:
+                            if future.result():
+                                written_count += 1
+                        except Exception as e:
+                            spec = futures[future]
+                            logger.warning(
+                                f"Shard ({spec.sr},{spec.sc}) failed: {e}"
+                            )
 
             total_shards_written += written_count
 
             if console:
                 console.print(
-                    f"    [green]{written_count} shards written[/green]"
+                    f"    [green]{written_count}/{n_shards} shards written[/green]"
                 )
 
             # Update tile registry
