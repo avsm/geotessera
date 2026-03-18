@@ -223,6 +223,56 @@ def build_v2_shard_index(
 # Store initialisation (zarr-init)
 # ---------------------------------------------------------------------------
 
+def _default_zone_grid(zone: int, years: List[int]) -> UnifiedZoneGrid:
+    """Compute a default grid for a UTM zone with no tiles.
+
+    Uses the full theoretical UTM zone extent: 6 degrees wide,
+    equator to 84N (the standard UTM northern limit).  This is
+    generous but sparse — no storage is consumed until data is written.
+    """
+    from pyproj import Transformer
+
+    epsg = zone_canonical_epsg(zone)
+    west_lon = (zone - 1) * 6 - 180
+    east_lon = zone * 6 - 180
+    pixel_size = 10.0
+
+    # Project zone corners to UTM
+    proj = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True)
+    # Use 0N-84N for northern hemisphere canonical grid
+    ul_x, ul_y = proj.transform(west_lon, 84.0)
+    ur_x, ur_y = proj.transform(east_lon, 84.0)
+    ll_x, ll_y = proj.transform(west_lon, 0.0)
+    lr_x, lr_y = proj.transform(east_lon, 0.0)
+
+    min_x = min(ul_x, ll_x)
+    max_x = max(ur_x, lr_x)
+    min_y = min(ll_y, lr_y)
+    max_y = max(ul_y, ur_y)
+
+    origin_x = math.floor(min_x / pixel_size) * pixel_size
+    origin_y = math.ceil(max_y / pixel_size) * pixel_size
+    extent_right = math.ceil(max_x / pixel_size) * pixel_size
+    extent_bottom = math.floor(min_y / pixel_size) * pixel_size
+
+    width_px = round((extent_right - origin_x) / pixel_size)
+    height_px = round((origin_y - extent_bottom) / pixel_size)
+
+    width_px = math.ceil(width_px / V2_SHARD_SIZE) * V2_SHARD_SIZE
+    height_px = math.ceil(height_px / V2_SHARD_SIZE) * V2_SHARD_SIZE
+
+    return UnifiedZoneGrid(
+        zone=zone,
+        years=years,
+        canonical_epsg=epsg,
+        origin_x=origin_x,
+        origin_y=origin_y,
+        width_px=width_px,
+        height_px=height_px,
+        pixel_size=pixel_size,
+    )
+
+
 def init_v2_store(
     registry: "Registry",
     output_path: Path,
@@ -234,7 +284,10 @@ def init_v2_store(
 ) -> Path:
     """Create an empty v2 tessera store with time dimension.
 
-    All arrays are fully sparse (fill_value) — no data is written.
+    Creates all 60 UTM zones (or the specified subset).  All arrays are
+    fully sparse (fill_value) — no data is written.  Zones with tile
+    coverage get a tight bounding box; zones without tiles get the full
+    theoretical UTM extent.
     """
     import zarr
     from zarr.codecs import BloscCodec
@@ -245,23 +298,26 @@ def init_v2_store(
 
     years = sorted(years)
     T = len(years)
+    zone_list = zones if zones is not None else list(range(1, 61))
 
     if console:
         console.print(f"Initialising v2 store at [bold]{output_path}[/bold]")
         console.print(f"  Years: {years[0]}-{years[-1]} ({T} time steps)")
+        console.print(f"  Zones: {len(zone_list)} ({zone_list[0]}-{zone_list[-1]})")
 
-    # Gather tile infos across ALL years to compute unified zone grids
-    all_zones: Dict[int, List[TileInfo]] = {}
+    # Gather tile infos across ALL years to compute tight grids where possible
+    zones_with_tiles: Dict[int, List[TileInfo]] = {}
     for year in years:
         year_tiles = gather_tile_infos(registry, year, zones=zones, console=console)
         for zone_num, tile_list in year_tiles.items():
-            all_zones.setdefault(zone_num, []).extend(tile_list)
-
-    if not all_zones:
-        raise ValueError("No tiles found for any year/zone")
+            zones_with_tiles.setdefault(zone_num, []).extend(tile_list)
 
     if console:
-        console.print(f"  {len(all_zones)} zone(s) with tiles: {sorted(all_zones.keys())}")
+        n_with = len(zones_with_tiles)
+        console.print(
+            f"  {n_with} zone(s) have tiles, "
+            f"{len(zone_list) - n_with} will use default extents"
+        )
 
     # Create root group
     os.makedirs(str(output_path), exist_ok=True)
@@ -283,9 +339,11 @@ def init_v2_store(
                            use_consolidated=False)
 
     # Create each zone group
-    for zone_num in sorted(all_zones.keys()):
-        tile_infos = all_zones[zone_num]
-        grid = compute_unified_zone_grid(tile_infos, years)
+    for zone_num in sorted(zone_list):
+        if zone_num in zones_with_tiles:
+            grid = compute_unified_zone_grid(zones_with_tiles[zone_num], years)
+        else:
+            grid = _default_zone_grid(zone_num, years)
 
         if console:
             w_km = grid.width_px * grid.pixel_size / 1000

@@ -2872,7 +2872,6 @@ def zarr_init_command(args):
     )
 
     years = _parse_year_range(args.years)
-    zones = _parse_zone_list(args.zones) if args.zones else None
     output = Path(args.output)
 
     try:
@@ -2884,7 +2883,6 @@ def zarr_init_command(args):
     try:
         init_v2_store(
             registry, output, years,
-            zones=zones,
             geotessera_version=version,
             model_version=args.model_version,
             console=console,
@@ -3489,10 +3487,6 @@ Directory Structure:
     zarr_init_parser.add_argument(
         "--years", required=True,
         help="Year range (e.g. 2017-2025 or 2017,2019,2024)",
-    )
-    zarr_init_parser.add_argument(
-        "--zones", default=None,
-        help="Zone numbers (e.g. 29-34 or 29,30,31). Default: all from registry",
     )
     zarr_init_parser.add_argument(
         "--output", required=True, type=str,
