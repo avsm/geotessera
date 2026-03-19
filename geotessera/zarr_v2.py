@@ -1021,9 +1021,10 @@ def _sample_v2_chunk_stats(
         emb_arr[time_index, band_list[0]:band_list[-1] + 1, r0:r1, c0:c1]
     )  # (n_rgb_bands, h, w)
 
-    # Dequantise: (n_bands, h, w) * (h, w) → broadcast over bands
-    vals_all = emb_chunk.astype(np.float32) * scales_chunk[np.newaxis, :, :]
-    # Reshape to (n_pixels, n_bands) and filter to valid
+    # Dequantise only valid pixels (avoid inf/nan multiply warnings)
+    scales_safe = np.where(valid, scales_chunk, 0.0)
+    vals_all = emb_chunk.astype(np.float32) * scales_safe[np.newaxis, :, :]
+    # Reshape to (n_pixels, n_bands) and keep only valid
     n_bands = vals_all.shape[0]
     vals_flat = vals_all.reshape(n_bands, -1).T  # (n_pixels, n_bands)
     valid_flat = valid.ravel()

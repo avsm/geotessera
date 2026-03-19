@@ -2896,9 +2896,12 @@ def zarr_init_command(args):
 
 def zarr_fill_command(args):
     """Incrementally fill a v2 tessera store with tile data."""
+    import warnings
     from rich.console import Console
     from .registry import Registry
     from .zarr_v2 import fill_v2_store
+
+    warnings.filterwarnings("ignore", message="Object at .* is not recognized")
 
     console = Console()
 
@@ -2930,9 +2933,12 @@ def zarr_fill_command(args):
 def zarr_rgb_command(args):
     """Generate RGB previews for a v2 tessera store."""
     import re
+    import warnings
     import zarr
     from rich.console import Console
     from .zarr_v2 import add_v2_rgb_preview
+
+    warnings.filterwarnings("ignore", message="Object at .* is not recognized")
 
     console = Console()
     store_path = Path(args.store_path)
