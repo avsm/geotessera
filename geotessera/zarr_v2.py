@@ -1178,3 +1178,508 @@ def add_v2_rgb_preview(
 
     if console:
         console.print(f"    [green]RGB: {written} shards written[/green]")
+
+
+# ---------------------------------------------------------------------------
+# Global RGB preview pyramid (v2)
+# ---------------------------------------------------------------------------
+# Reprojects per-zone UTM RGB (NCHW) into a single EPSG:4326 pyramid.
+# The global pyramid stays HWC (H, W, 4) since it's purely for web tiles.
+# Parallelisation follows v1: ProcessPoolExecutor for reprojection,
+# ThreadPoolExecutor for pyramid coarsening.
+
+from .zarr_zone import (
+    GLOBAL_BOUNDS, GLOBAL_BASE_RES, GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W,
+    GLOBAL_CHUNK, GLOBAL_NUM_BANDS, GLOBAL_DEFAULT_LEVELS,
+    SPATIAL_CONVENTION, MULTISCALES_CONVENTION, PROJ_CONVENTION,
+    _zone_output_bounds, _coarsen_zone_pyramid,
+)
+
+
+def _ensure_v2_global_store(store_path: Path, num_levels: int) -> None:
+    """Create the global_rgb/ pyramid group within a v2 store."""
+    import zarr
+    from zarr.codecs import BloscCodec
+
+    root = zarr.open_group(str(store_path), mode="r+", zarr_format=3,
+                           use_consolidated=False)
+
+    # Check if already exists with correct shape
+    if "global_rgb/0/rgb" in root:
+        shape = root["global_rgb/0/rgb"].shape
+        if shape == (GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W, GLOBAL_NUM_BANDS):
+            return
+        import shutil
+        shutil.rmtree(str(store_path / "global_rgb"))
+        root = zarr.open_group(str(store_path), mode="r+", zarr_format=3,
+                               use_consolidated=False)
+
+    # Create pyramid levels via zarr API
+    global_grp = root.create_group("global_rgb")
+    h, w = GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W
+    band_data = np.arange(GLOBAL_NUM_BANDS, dtype=np.int32)
+
+    for lvl in range(num_levels):
+        if h < 1 or w < 1:
+            break
+        lvl_grp = global_grp.create_group(str(lvl))
+        lvl_grp.create_array(
+            "rgb",
+            shape=(h, w, GLOBAL_NUM_BANDS),
+            chunks=(GLOBAL_CHUNK, GLOBAL_CHUNK, GLOBAL_NUM_BANDS),
+            dtype=np.uint8, fill_value=np.uint8(0),
+            compressors=BloscCodec(cname="zstd", clevel=3),
+            dimension_names=["lat", "lon", "band"],
+        )
+        lvl_grp.create_array(
+            "band", data=band_data,
+            chunks=(GLOBAL_NUM_BANDS,),
+            dimension_names=["band"],
+        )
+        h //= 2
+        w //= 2
+
+    # Multiscale metadata
+    from topozarr.metadata import create_multiscale_metadata
+    actual_levels = len([k for k in global_grp.keys() if k.isdigit()])
+    ms_attrs = create_multiscale_metadata(actual_levels, "EPSG:4326", "mean")
+
+    # Fix convention descriptions (same geozarr-toolkit bug workaround)
+    if "zarr_conventions" in ms_attrs:
+        for conv in ms_attrs["zarr_conventions"]:
+            if conv.get("uuid") == "689b58e2-cf7b-45e0-9fff-9cfc0883d6b4":
+                conv["description"] = "Spatial coordinate information"
+        ms_attrs["zarr_conventions"].append(SPATIAL_CONVENTION)
+    else:
+        ms_attrs["zarr_conventions"] = [
+            MULTISCALES_CONVENTION, PROJ_CONVENTION, SPATIAL_CONVENTION,
+        ]
+
+    west, south, east, north_ = GLOBAL_BOUNDS
+    ms_attrs["spatial:dimensions"] = ["lat", "lon"]
+    ms_attrs["spatial:bbox"] = [west, south, east, north_]
+
+    h_lvl, w_lvl = GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W
+    res = GLOBAL_BASE_RES
+    for item in ms_attrs.get("multiscales", {}).get("layout", []):
+        item["spatial:shape"] = [h_lvl, w_lvl]
+        item["spatial:transform"] = [res, 0.0, west, 0.0, -res, north_]
+        h_lvl //= 2
+        w_lvl //= 2
+        res *= 2.0
+
+    global_grp.attrs.update(ms_attrs)
+
+
+# Per-worker state for v2 reprojection
+_v2_reproj_global_arr = None
+_v2_reproj_src_arr = None
+_v2_reproj_to_utm = None
+_v2_reproj_time_index = None
+
+
+def _init_v2_reproj_worker(
+    store_path: str, zone_group: str, zone_epsg: int, time_index: int,
+) -> None:
+    """Process pool initializer: open stores and create transformer."""
+    global _v2_reproj_global_arr, _v2_reproj_src_arr
+    global _v2_reproj_to_utm, _v2_reproj_time_index
+    import zarr
+    from pyproj import Transformer
+
+    root = zarr.open_group(store_path, mode="r+", zarr_format=3,
+                           use_consolidated=False)
+    _v2_reproj_global_arr = root["global_rgb/0/rgb"]
+    _v2_reproj_src_arr = root[zone_group + "/rgb"]  # (T, 4, H, W)
+    _v2_reproj_to_utm = Transformer.from_crs(
+        "EPSG:4326", f"EPSG:{zone_epsg}", always_xy=True,
+    )
+    _v2_reproj_time_index = time_index
+
+
+def _v2_reproject_chunk_worker(args) -> bool:
+    """Process pool worker for v2 reprojection."""
+    chunk_row, chunk_col, src_epsg, src_pixel, src_origin_e, src_origin_n, src_h, src_w = args
+    return _v2_reproject_chunk(
+        _v2_reproj_global_arr, chunk_row, chunk_col,
+        _v2_reproj_src_arr, _v2_reproj_time_index,
+        src_epsg, src_pixel, src_origin_e, src_origin_n, src_h, src_w,
+        _v2_reproj_to_utm,
+    )
+
+
+def _v2_reproject_chunk(
+    global_arr,
+    chunk_row: int, chunk_col: int,
+    src_arr, time_index: int,
+    src_epsg: int, src_pixel: float,
+    src_origin_e: float, src_origin_n: float,
+    src_h: int, src_w: int,
+    to_utm,
+) -> bool:
+    """Reproject one 512x512 global chunk from a v2 NCHW source."""
+    import warnings
+    from affine import Affine
+    from rasterio.enums import Resampling
+    import rasterio.warp
+    from rasterio.errors import NotGeoreferencedWarning
+
+    warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
+
+    west, south, east, north_ = GLOBAL_BOUNDS
+    row0 = chunk_row * GLOBAL_CHUNK
+    col0 = chunk_col * GLOBAL_CHUNK
+    tile_h = min(GLOBAL_CHUNK, GLOBAL_LEVEL0_H - row0)
+    tile_w = min(GLOBAL_CHUNK, GLOBAL_LEVEL0_W - col0)
+    if tile_h <= 0 or tile_w <= 0:
+        return False
+
+    tile_west = west + col0 * GLOBAL_BASE_RES
+    tile_north = north_ - row0 * GLOBAL_BASE_RES
+    tile_east = tile_west + tile_w * GLOBAL_BASE_RES
+    tile_south = tile_north - tile_h * GLOBAL_BASE_RES
+
+    dst_transform = Affine(
+        GLOBAL_BASE_RES, 0, tile_west,
+        0, -GLOBAL_BASE_RES, tile_north,
+    )
+
+    # Sample corners to check zone coverage
+    sample_lons = [tile_west, tile_east, tile_west, tile_east,
+                   (tile_west + tile_east) / 2]
+    sample_lats = [tile_north, tile_north, tile_south, tile_south,
+                   (tile_north + tile_south) / 2]
+    try:
+        utm_xs, utm_ys = to_utm.transform(sample_lons, sample_lats)
+    except Exception:
+        return False
+
+    if any(not math.isfinite(v) for v in list(utm_xs) + list(utm_ys)):
+        return False
+
+    # Compute source window in UTM pixel coords
+    pad = 16
+    r_min = max(0, int((src_origin_n - max(utm_ys)) / src_pixel) - pad)
+    r_max = min(src_h, int(math.ceil(
+        (src_origin_n - min(utm_ys)) / src_pixel
+    )) + pad)
+    c_min = max(0, int((min(utm_xs) - src_origin_e) / src_pixel) - pad)
+    c_max = min(src_w, int(math.ceil(
+        (max(utm_xs) - src_origin_e) / src_pixel
+    )) + pad)
+
+    if r_max <= r_min or c_max <= c_min:
+        return False
+
+    # Read from NCHW source: src_arr[t, :4, r_min:r_max, c_min:c_max]
+    # Result is (4, h, w) — already band-first for rasterio
+    window = np.asarray(src_arr[time_index, :, r_min:r_max, c_min:c_max])
+    if not window.any():
+        return False
+
+    src_data = window.astype(np.float32)  # (4, h, w) already band-first
+    del window
+
+    win_transform = Affine(
+        src_pixel, 0, src_origin_e + c_min * src_pixel,
+        0, -src_pixel, src_origin_n - r_min * src_pixel,
+    )
+
+    # Mask invalid pixels (alpha < 128) as NaN
+    alpha_band = src_data[3]
+    invalid = alpha_band < 128
+    for b in range(3):
+        src_data[b][invalid] = np.nan
+    rgb_src = src_data[:3]
+    del src_data
+
+    rgb_dst = np.full((3, tile_h, tile_w), np.nan, dtype=np.float32)
+
+    try:
+        rasterio.warp.reproject(
+            source=rgb_src,
+            destination=rgb_dst,
+            src_transform=win_transform,
+            src_crs=f"EPSG:{src_epsg}",
+            dst_transform=dst_transform,
+            dst_crs="EPSG:4326",
+            resampling=Resampling.average,
+            src_nodata=np.nan,
+            dst_nodata=np.nan,
+        )
+    except Exception:
+        return False
+
+    del rgb_src
+
+    # Derive alpha from valid reprojected RGB
+    has_data = np.any(np.isfinite(rgb_dst) & (rgb_dst != 0), axis=0)
+    rgb_dst = np.nan_to_num(rgb_dst, nan=0.0)
+    rgb_dst = np.clip(rgb_dst, 0, 255).astype(np.uint8)
+    rgb_out = np.transpose(rgb_dst, (1, 2, 0))  # (h, w, 3)
+    del rgb_dst
+
+    out = np.zeros((tile_h, tile_w, GLOBAL_NUM_BANDS), dtype=np.uint8)
+    out[:, :, :3] = rgb_out
+    out[:, :, 3] = np.where(has_data, 255, 0).astype(np.uint8)
+    del rgb_out
+
+    if not out.any():
+        return False
+
+    # Composite: only overwrite pixels where new zone has data
+    mask = out.any(axis=2)
+    if mask.all():
+        global_arr[row0:row0 + tile_h, col0:col0 + tile_w, :] = out
+    else:
+        existing = np.asarray(
+            global_arr[row0:row0 + tile_h, col0:col0 + tile_w, :]
+        )
+        existing[mask] = out[mask]
+        global_arr[row0:row0 + tile_h, col0:col0 + tile_w, :] = existing
+    return True
+
+
+def _reproject_v2_zone(
+    store_path: Path,
+    zone_num: int,
+    zone_group: str,
+    zone_epsg: int,
+    zone_transform: list,
+    zone_shape: tuple,
+    time_index: int,
+    workers: int,
+    console: Optional["rich.console.Console"] = None,
+    force: bool = False,
+) -> Tuple[int, int, int, int, bool]:
+    """Reproject one zone's RGB into global level 0 (v2 NCHW source)."""
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    src_pixel = zone_transform[0]
+    src_origin_e = zone_transform[2]
+    src_origin_n = zone_transform[5]
+    src_h, src_w = zone_shape[:2]
+
+    row_start, row_end, col_start, col_end = _zone_output_bounds(
+        zone_epsg=zone_epsg,
+        zone_transform=zone_transform,
+        zone_shape=(src_h, src_w),
+    )
+
+    if col_end <= col_start or row_end <= row_start:
+        if console:
+            console.print(f"    [yellow]Zone {zone_num}: no output region[/yellow]")
+        return (0, 0, 0, 0, False)
+
+    n_chunk_rows = (row_end - row_start) // GLOBAL_CHUNK
+    n_chunk_cols = (col_end - col_start) // GLOBAL_CHUNK
+    chunk_row_start = row_start // GLOBAL_CHUNK
+    chunk_col_start = col_start // GLOBAL_CHUNK
+
+    # Resume check
+    marker = store_path / f".zone_{zone_num}_done"
+    if marker.exists():
+        if force:
+            marker.unlink()
+        else:
+            if console:
+                console.print(
+                    f"    Zone {zone_num:02d}: already complete, skipping"
+                )
+            return (row_start, row_end, col_start, col_end, False)
+
+    chunks_total = n_chunk_rows * n_chunk_cols
+    if console:
+        console.print(
+            f"    Zone {zone_num:02d}: {n_chunk_rows}x{n_chunk_cols} "
+            f"= {chunks_total} chunks"
+        )
+
+    work_items = [
+        (chunk_row_start + cr, chunk_col_start + cc,
+         zone_epsg, src_pixel, src_origin_e, src_origin_n, src_h, src_w)
+        for cr in range(n_chunk_rows)
+        for cc in range(n_chunk_cols)
+    ]
+
+    chunks_written = 0
+
+    if console:
+        from rich.progress import (
+            Progress, SpinnerColumn, BarColumn, TextColumn,
+            MofNCompleteColumn, TimeElapsedColumn, TimeRemainingColumn,
+        )
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(), MofNCompleteColumn(),
+            TimeElapsedColumn(), TimeRemainingColumn(),
+            console=console,
+        ) as progress:
+            ptask = progress.add_task(
+                f"Reprojecting zone {zone_num:02d}", total=len(work_items),
+            )
+            with ProcessPoolExecutor(
+                max_workers=workers,
+                initializer=_init_v2_reproj_worker,
+                initargs=(str(store_path), zone_group, zone_epsg, time_index),
+            ) as pool:
+                futures = {
+                    pool.submit(_v2_reproject_chunk_worker, item): item
+                    for item in work_items
+                }
+                for future in as_completed(futures):
+                    try:
+                        if future.result():
+                            chunks_written += 1
+                    except Exception as e:
+                        logger.warning(f"Reproject chunk failed: {e}")
+                    progress.advance(ptask)
+        console.print(f"    {chunks_written} chunks with data")
+    else:
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_init_v2_reproj_worker,
+            initargs=(str(store_path), zone_group, zone_epsg, time_index),
+        ) as pool:
+            futures = {
+                pool.submit(_v2_reproject_chunk_worker, item): item
+                for item in work_items
+            }
+            for future in as_completed(futures):
+                try:
+                    if future.result():
+                        chunks_written += 1
+                except Exception:
+                    pass
+
+    marker.write_text(
+        f"zone={zone_num} chunks={chunks_total} written={chunks_written}\n"
+    )
+
+    return (row_start, row_end, col_start, col_end, True)
+
+
+def build_v2_global_preview(
+    store_path: Path,
+    time_index: int,
+    zones: Optional[List[int]] = None,
+    num_levels: int = GLOBAL_DEFAULT_LEVELS,
+    workers: int = 4,
+    console: Optional["rich.console.Console"] = None,
+    force: bool = False,
+) -> None:
+    """Build the global EPSG:4326 RGB pyramid from v2 zone-level RGB.
+
+    For each zone that has RGB data at the given time_index, reprojects
+    from UTM to geographic coordinates and composites into the pyramid.
+    Uses ProcessPoolExecutor for reprojection (CPU-bound) and
+    ThreadPoolExecutor for pyramid coarsening (I/O-bound).
+    """
+    import re
+    import warnings
+    import zarr
+    import gc
+
+    warnings.filterwarnings("ignore", message="Object at .* is not recognized")
+
+    store_path = Path(store_path)
+    root = zarr.open_group(str(store_path), mode="r", use_consolidated=False)
+    root_attrs = dict(root.attrs)
+    all_years = root_attrs.get("tessera:years", [])
+
+    if time_index >= len(all_years):
+        raise ValueError(f"time_index {time_index} out of range (store has {len(all_years)} years)")
+
+    year = all_years[time_index]
+
+    if console:
+        console.print(
+            f"Building global preview for year {year} (t={time_index})"
+        )
+
+    # Discover zones with RGB data
+    zone_pattern = re.compile(r"^utm(\d{2})$")
+    zone_infos: Dict[int, dict] = {}
+
+    for name in sorted(root.keys()):
+        m = zone_pattern.match(name)
+        if not m:
+            continue
+        zone_num = int(m.group(1))
+        if zones is not None and zone_num not in zones:
+            continue
+
+        zone_store = root[name]
+        attrs = dict(zone_store.attrs)
+
+        if not attrs.get("tessera:has_rgb_preview", False):
+            continue
+
+        # Check the rgb array exists and has data for this time index
+        try:
+            rgb_arr = zone_store["rgb"]
+            # Shape is (T, 4, H, W)
+            _, _, zone_h, zone_w = rgb_arr.shape
+        except (KeyError, ValueError):
+            continue
+
+        zone_infos[zone_num] = {
+            "zone_group": name,
+            "epsg": int(attrs["proj:code"].split(":")[1]),
+            "transform": list(attrs["spatial:transform"]),
+            "shape": (zone_h, zone_w),
+        }
+
+    if not zone_infos:
+        if console:
+            console.print("[yellow]No zones with RGB data found[/yellow]")
+        return
+
+    if console:
+        console.print(f"  {len(zone_infos)} zone(s) with RGB data")
+
+    # Ensure global pyramid structure exists
+    _ensure_v2_global_store(store_path, num_levels)
+
+    # Reproject each zone and build pyramid
+    for zone_num, info in sorted(zone_infos.items()):
+        if console:
+            console.print(f"\n  Zone {zone_num:02d}:")
+
+        row_start, row_end, col_start, col_end, did_work = _reproject_v2_zone(
+            store_path=store_path,
+            zone_num=zone_num,
+            zone_group=info["zone_group"],
+            zone_epsg=info["epsg"],
+            zone_transform=info["transform"],
+            zone_shape=info["shape"],
+            time_index=time_index,
+            workers=workers,
+            console=console,
+            force=force,
+        )
+
+        if did_work:
+            if console:
+                console.print(f"    Building pyramid...")
+            _coarsen_zone_pyramid(
+                store_path=store_path,
+                row_start=row_start,
+                row_end=row_end,
+                col_start=col_start,
+                col_end=col_end,
+                num_levels=num_levels,
+                workers=workers,
+                console=console,
+            )
+
+        gc.collect()
+
+    # Consolidate
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Consolidated metadata")
+        zarr.consolidate_metadata(str(store_path))
+
+    if console:
+        console.print(f"\n  [green]Global preview complete[/green]")

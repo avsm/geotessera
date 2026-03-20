@@ -2978,6 +2978,46 @@ def zarr_rgb_command(args):
     return 0
 
 
+def zarr_global_preview_command(args):
+    """Build global EPSG:4326 RGB pyramid from v2 zone-level RGB."""
+    import warnings
+    import zarr
+    from rich.console import Console
+    from .zarr_v2 import build_v2_global_preview
+
+    warnings.filterwarnings("ignore", message="Object at .* is not recognized")
+
+    console = Console()
+    store_path = Path(args.store_path)
+
+    root = zarr.open_group(str(store_path), mode="r", use_consolidated=False)
+    root_attrs = dict(root.attrs)
+    all_years = root_attrs.get("tessera:years", [])
+    if not all_years:
+        console.print("[red]Error: not a v2 store (no tessera:years)[/red]")
+        return 1
+
+    year = args.year
+    if year not in all_years:
+        console.print(f"[red]Error: year {year} not in store (available: {all_years})[/red]")
+        return 1
+
+    time_index = all_years.index(year)
+    zones = _parse_zone_list(args.zones) if args.zones else None
+
+    build_v2_global_preview(
+        store_path=store_path,
+        time_index=time_index,
+        zones=zones,
+        num_levels=args.levels,
+        workers=args.workers,
+        console=console,
+        force=args.force,
+    )
+
+    return 0
+
+
 def zarr_migrate_command(args):
     """Migrate Zarr stores from old unprefixed attrs to tessera:-prefixed attrs."""
     import re
@@ -3610,6 +3650,37 @@ Directory Structure:
         help="Number of parallel workers",
     )
     zarr_rgb_parser.set_defaults(func=zarr_rgb_command)
+
+    # Zarr-global-preview command (v2)
+    zarr_gp_parser = subparsers.add_parser(
+        "zarr-global-preview",
+        help="Build global EPSG:4326 RGB pyramid from v2 zone-level RGB",
+    )
+    zarr_gp_parser.add_argument(
+        "store_path", type=str,
+        help="Path to v2 tessera store",
+    )
+    zarr_gp_parser.add_argument(
+        "--year", type=int, required=True,
+        help="Year to build the global preview for",
+    )
+    zarr_gp_parser.add_argument(
+        "--zones", default=None,
+        help="Zone numbers to include (e.g. 29-34). Default: all with RGB",
+    )
+    zarr_gp_parser.add_argument(
+        "--levels", type=int, default=10,
+        help="Number of pyramid levels (default: 10)",
+    )
+    zarr_gp_parser.add_argument(
+        "--workers", type=int, default=4,
+        help="Number of parallel workers (default: 4)",
+    )
+    zarr_gp_parser.add_argument(
+        "--force", action="store_true",
+        help="Reprocess zones even if completion markers exist",
+    )
+    zarr_gp_parser.set_defaults(func=zarr_global_preview_command)
 
     # Zarr-migrate command
     zarr_migrate_parser = subparsers.add_parser(
