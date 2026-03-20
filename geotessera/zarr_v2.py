@@ -1238,6 +1238,11 @@ def _ensure_v2_global_store(store_path: Path, num_levels: int) -> None:
         h //= 2
         w //= 2
 
+    # Re-open the global_rgb group to ensure attrs write to the correct handle
+    root = zarr.open_group(str(store_path), mode="r+", zarr_format=3,
+                           use_consolidated=False)
+    global_grp = root["global_rgb"]
+
     # Build multiscale + spatial + proj metadata directly
     # (avoids depending on unstable topozarr API)
     from geozarr_toolkit import (
