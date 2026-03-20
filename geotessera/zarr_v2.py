@@ -1191,7 +1191,6 @@ def add_v2_rgb_preview(
 from .zarr_zone import (
     GLOBAL_BOUNDS, GLOBAL_BASE_RES, GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W,
     GLOBAL_CHUNK, GLOBAL_NUM_BANDS, GLOBAL_DEFAULT_LEVELS,
-    SPATIAL_CONVENTION, MULTISCALES_CONVENTION, PROJ_CONVENTION,
     _zone_output_bounds, _coarsen_zone_pyramid,
 )
 
@@ -1239,36 +1238,57 @@ def _ensure_v2_global_store(store_path: Path, num_levels: int) -> None:
         h //= 2
         w //= 2
 
-    # Multiscale metadata
-    from topozarr.metadata import create_multiscale_metadata
-    actual_levels = len([k for k in global_grp.keys() if k.isdigit()])
-    ms_attrs = create_multiscale_metadata(actual_levels, "EPSG:4326", "mean")
-
-    # Fix convention descriptions (same geozarr-toolkit bug workaround)
-    if "zarr_conventions" in ms_attrs:
-        for conv in ms_attrs["zarr_conventions"]:
-            if conv.get("uuid") == "689b58e2-cf7b-45e0-9fff-9cfc0883d6b4":
-                conv["description"] = "Spatial coordinate information"
-        ms_attrs["zarr_conventions"].append(SPATIAL_CONVENTION)
-    else:
-        ms_attrs["zarr_conventions"] = [
-            MULTISCALES_CONVENTION, PROJ_CONVENTION, SPATIAL_CONVENTION,
-        ]
+    # Build multiscale + spatial + proj metadata directly
+    # (avoids depending on unstable topozarr API)
+    from geozarr_toolkit import (
+        create_geozarr_attrs, create_multiscales_layout,
+        create_zarr_conventions,
+    )
+    from geozarr_toolkit.conventions.multiscales import MultiscalesConventionMetadata
 
     west, south, east, north_ = GLOBAL_BOUNDS
-    ms_attrs["spatial:dimensions"] = ["lat", "lon"]
-    ms_attrs["spatial:bbox"] = [west, south, east, north_]
+    actual_levels = len([k for k in global_grp.keys() if k.isdigit()])
 
+    # Build multiscale layout
     h_lvl, w_lvl = GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W
     res = GLOBAL_BASE_RES
-    for item in ms_attrs.get("multiscales", {}).get("layout", []):
-        item["spatial:shape"] = [h_lvl, w_lvl]
-        item["spatial:transform"] = [res, 0.0, west, 0.0, -res, north_]
+    levels = []
+    for lvl in range(actual_levels):
+        entry: Dict[str, Any] = {"asset": str(lvl)}
+        if lvl > 0:
+            entry["derived_from"] = str(lvl - 1)
+            entry["transform"] = {"scale": [2.0, 2.0], "translation": [0.0, 0.0]}
+            entry["resampling_method"] = "mean"
+        else:
+            entry["transform"] = {"scale": [1.0, 1.0], "translation": [0.0, 0.0]}
+        entry["spatial:shape"] = [h_lvl, w_lvl]
+        entry["spatial:transform"] = [res, 0.0, west, 0.0, -res, north_]
+        levels.append(entry)
         h_lvl //= 2
         w_lvl //= 2
         res *= 2.0
 
-    global_grp.attrs.update(ms_attrs)
+    ms_layout = create_multiscales_layout(levels, resampling_method="mean")
+
+    # Geospatial attrs (proj + spatial)
+    geozarr_attrs = create_geozarr_attrs(
+        dimensions=["lat", "lon"],
+        crs="EPSG:4326",
+        bbox=[west, south, east, north_],
+    )
+
+    # Fix spatial description bug in geozarr-toolkit
+    for conv in geozarr_attrs.get("zarr_conventions", []):
+        if conv.get("uuid") == "689b58e2-cf7b-45e0-9fff-9cfc0883d6b4":
+            conv["description"] = "Spatial coordinate information"
+
+    # Add multiscales convention registration
+    ms_conv = MultiscalesConventionMetadata()
+    geozarr_attrs["zarr_conventions"].insert(0, ms_conv.model_dump(exclude_none=True))
+
+    # Merge all attrs
+    geozarr_attrs.update(ms_layout)
+    global_grp.attrs.update(geozarr_attrs)
 
 
 # Per-worker state for v2 reprojection

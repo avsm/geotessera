@@ -425,7 +425,7 @@ requires-dist = [
     { name = "scikit-image", specifier = ">=0.25.2" },
     { name = "scikit-learn", specifier = ">=1.7.1" },
     { name = "sphinx", specifier = ">=8.2.3" },
-    { name = "topozarr", specifier = ">=0.0.4" },
+    { name = "topozarr", specifier = ">=0.0.5" },
     { name = "typer" },
     { name = "xarray" },
     { name = "zarr" },
@@ -1860,16 +1860,16 @@ wheels = [
 
 [[package]]
 name = "topozarr"
-version = "0.0.4"
+version = "0.0.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "dask" },
     { name = "xarray" },
     { name = "xproj" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/f0/1d/2857a9bafba94cefd9e618e32b5930555b931a1b5a41f1aa2c5b054abe7e/topozarr-0.0.4.tar.gz", hash = "sha256:05015b4a00ec38af61dade9437d8a8bcb4550e08de00cbee02b3dcbeb05c121b", size = 3886, upload-time = "2026-01-22T21:13:55.289Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/49/50/173a693d60c85bf51dcfeee5dab92539091506127568f96729cd60955f06/topozarr-0.0.5.tar.gz", hash = "sha256:4adf766c0f5de9a836d4e09f424928507f500b7b84089b4d35b17cba75014908", size = 5516, upload-time = "2026-03-10T21:46:26.167Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/6e/89/7932939d5bbe0bb3baa7ab7aef99039d3935f067b35a1fd6744ef963acd5/topozarr-0.0.4-py3-none-any.whl", hash = "sha256:d7c70f993e4728dd857e57d2b17f8929a357cdd7d55355d115b359774e561f57", size = 5608, upload-time = "2026-01-22T21:13:54.269Z" },
+    { url = "https://files.pythonhosted.org/packages/d8/11/f9fdd61fb9e8c61d1012e28a46f8878778376fcb2e2c93451c404d9ea362/topozarr-0.0.5-py3-none-any.whl", hash = "sha256:c13b5ac57b7dc6ae56b7d7ee07af0b8466ae46b012b6cd809b6baf6c50d89194", size = 7203, upload-time = "2026-03-10T21:46:24.823Z" },
 ]
 
 [[package]]

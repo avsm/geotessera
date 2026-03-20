@@ -38,7 +38,7 @@ dependencies = [
     "zarr",
     "dask",
     "pystac",
-    "topozarr>=0.0.4",
+    "topozarr>=0.0.5",
     "geozarr-toolkit",
 ]
 
