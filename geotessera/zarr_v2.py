@@ -1117,10 +1117,12 @@ def _write_v2_rgb_pass(
         if not np.any(np.isfinite(scales_chunk)):
             return False
 
-        emb_chunk = np.asarray(emb_arr[time_index, :, r0:r1, c0:c1])  # (B, h, w)
+        # Read only the 3 RGB bands, not all 128 (~40x less I/O)
+        b0, b1 = RGB_PREVIEW_BANDS[0], RGB_PREVIEW_BANDS[-1] + 1
+        emb_chunk = np.asarray(emb_arr[time_index, b0:b1, r0:r1, c0:c1])  # (3, h, w)
         rgba = _compute_rgb_chunk_v2(
             emb_chunk, scales_chunk,
-            RGB_PREVIEW_BANDS, stretch["min"], stretch["max"],
+            tuple(range(b1 - b0)), stretch["min"], stretch["max"],
         )
         rgb_arr[time_index, :, r0:r1, c0:c1] = rgba
         return True
