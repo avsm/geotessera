@@ -27,7 +27,6 @@ The main interface for accessing Tessera embeddings. Contains the primary :class
 * :meth:`~geotessera.GeoTessera.fetch_embeddings` - Fetch multiple tiles in a bounding box with projection info
 * :meth:`~geotessera.GeoTessera.export_embedding_geotiff` - Export single embedding as GeoTIFF with native UTM
 * :meth:`~geotessera.GeoTessera.export_embedding_geotiffs` - Export multiple embeddings as GeoTIFF files
-* :meth:`~geotessera.GeoTessera.export_embedding_zarrs` - Export multiple embeddings as cloud-native Zarr archives
 
 .. automodule:: geotessera.core
    :members:
@@ -147,33 +146,6 @@ Export embeddings for GIS use with preserved projections::
         year=2024,
         bands=[10, 20, 30]
     )
-
-Export to Zarr
-~~~~~~~~~~~~~~
-
-Export embeddings as cloud-native Zarr archives::
-
-    # Step 1: Get list of tiles to export
-    bbox = (-0.2, 51.4, 0.1, 51.6)
-    tiles_to_fetch = gt.registry.load_blocks_for_region(bounds=bbox, year=2024)
-
-    # Step 2: Export as Zarr archives with all bands
-    files = gt.export_embedding_zarrs(
-        tiles_to_fetch,
-        output_dir="./output",
-    )
-
-    # Export specific bands
-    zarr_files = gt.export_embedding_zarrs(
-        tiles_to_fetch,
-        output_dir="./zarr_output",
-        bands=[0, 1, 2]  # Cloud-optimized chunked access
-    )
-
-    # Open with xarray for analysis
-    import xarray as xr
-    ds = xr.open_dataset(files[0], decode_coords='all')
-    print(f"CRS: {ds.rio.crs}, Shape: {ds.embedding.shape}")
 
 Create Visualizations
 ~~~~~~~~~~~~~~~~~~~~~

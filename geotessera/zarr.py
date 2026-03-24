@@ -193,19 +193,6 @@ def _zone_group_name(zone: int) -> str:
     return f"utm{zone:02d}"
 
 
-def tile_pixel_offset(
-    tile_info: TileInfo, zone_grid,
-) -> Tuple[int, int]:
-    """Compute the (row, col) pixel offset of a tile within a zone grid."""
-    tile_easting = tile_info.transform.c
-    tile_northing = northing_to_canonical(tile_info.transform.f, tile_info.epsg)
-
-    col_start = round((tile_easting - zone_grid.origin_easting) / zone_grid.pixel_size)
-    row_start = round(
-        (zone_grid.origin_northing - tile_northing) / zone_grid.pixel_size
-    )
-    return row_start, col_start
-
 
 # ---------------------------------------------------------------------------
 # Landmask handling

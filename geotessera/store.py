@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
 import numpy as np
 import rasterio.transform

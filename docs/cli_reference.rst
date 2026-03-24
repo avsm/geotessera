@@ -60,7 +60,7 @@ Download embeddings for a region in numpy or GeoTIFF format.
 
 **Format Options**:
 
-* ``-f, --format TEXT`` - Output format: 'tiff', 'npy', or 'zarr' (default: tiff)
+* ``-f, --format TEXT`` - Output format: 'tiff' or 'npy' (default: tiff)
 * ``--bands TEXT`` - Comma-separated band indices (default: all 128)
 * ``--compress TEXT`` - Compression for TIFF format (default: lzw)
 
@@ -112,14 +112,6 @@ Download embeddings for a region in numpy or GeoTIFF format.
         --output ./cambridge_tiles
     # Next step: geotessera visualize ./cambridge_tiles pca_mosaic.tif
 
-    # Download as Zarr (cloud-native format for efficient access)
-    geotessera download \
-        --bbox "-0.2,51.4,0.1,51.6" \
-        --format zarr \
-        --year 2024 \
-        --output ./london_zarr
-    # Next step: Use xarray to analyze the zarr archives
-
 **Output Formats**:
 
 **TIFF Format** (``--format tiff``):
@@ -129,16 +121,6 @@ Download embeddings for a region in numpy or GeoTIFF format.
     - Suitable for GIS software (QGIS, ArcGIS, etc.)
     - Supports compression (lzw, deflate, none)
     - Files named by tile coordinates (e.g., ``tessera_2024_lat52.05_lon0.15.tif``)
-
-**Zarr Format** (``--format zarr``):
-    - Creates cloud-native Zarr archives with native UTM projections
-    - Efficient chunked access optimized for both local and cloud storage
-    - Built-in compression for reduced storage footprint
-    - xarray integration for analysis workflows
-    - Preserves CRS, scales, and georeferencing metadata
-    - Suitable for cloud-based analysis and large-scale workflows
-    - Supports band selection (``--bands``)
-    - Files organized in registry structure (e.g., ``global_0.1_degree_representation/2024/grid_0.15_52.05/grid_0.15_52.05_2024.zarr``)
 
 **NPY Format** (``--format npy``):
     - Creates raw numpy arrays (.npy files)
@@ -483,31 +465,6 @@ Prepare data for GIS software::
 
     # Files are now ready for QGIS, ArcGIS, etc.
     # Use pca_overview.tif for quick visual reference
-
-Cloud-Native Workflow with Zarr
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Use Zarr format for efficient cloud-based analysis::
-
-    # 1. Download embeddings as Zarr archives
-    geotessera download \
-        --bbox "-0.2,51.4,0.1,51.6" \
-        --format zarr \
-        --year 2024 \
-        --output ./london_zarr
-
-    # 2. Analyze with xarray (cloud-optimized chunked access)
-    # In Python:
-    # import xarray as xr
-    # ds = xr.open_dataset('london_zarr/global_0.1_degree_representation/2024/grid_0.15_52.05/grid_0.15_52.05_2024.zarr',
-    #                      decode_coords='all')
-    # print(f"CRS: {ds.rio.crs}")
-    # print(f"Transform: {ds.rio.transform()}")
-    # print(f"Data shape: {ds.embedding.shape}")
-
-    # 3. Process specific bands or spatial subsets efficiently
-    # Zarr's chunked storage allows reading only needed data
-    # ideal for large-scale cloud-based workflows
 
 Troubleshooting
 ---------------

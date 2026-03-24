@@ -64,11 +64,12 @@ You can customize the visualization::
 Step 2: Download Embeddings
 ----------------------------
 
-GeoTessera supports three output formats:
+GeoTessera supports two output formats:
 
 - **tiff**: Georeferenced GeoTIFF files (default, best for GIS) - fully dequantized and ready to use
-- **zarr**: Cloud-native Zarr archives (best for cloud workflows) - efficient chunked access with xarray integration
 - **npy**: Quantized numpy arrays with scales and landmask TIFFs (for advanced analysis and storage efficiency)
+
+For cloud-native zarr access, see :class:`~geotessera.store.GeoTesseraZarr`.
 
 Download as GeoTIFF (Recommended for GIS)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -124,49 +125,6 @@ Download using a region file::
         --year 2024 \
         --output ./cambridge_tiles
     # Next step: geotessera visualize ./cambridge_tiles pca_mosaic.tif
-
-Download as Zarr (For Cloud-Native Workflows)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Download embeddings as Zarr archives for efficient cloud-based analysis::
-
-    geotessera download \
-        --bbox "-0.2,51.4,0.1,51.6" \
-        --format zarr \
-        --year 2024 \
-        --output ./london_zarr
-
-This creates Zarr archives in the registry directory structure:
-
-- ``global_0.1_degree_representation/{year}/grid_{lon}_{lat}/grid_{lon}_{lat}_{year}.zarr`` - Zarr archive with CRS and metadata
-
-**Key advantages of Zarr format**:
-
-- Cloud-optimized chunked storage for efficient access
-- Built-in compression reduces storage footprint
-- xarray integration for easy analysis
-- Preserves CRS, scales, and georeferencing information
-- Ideal for large-scale cloud-based workflows
-
-**Using Zarr archives with xarray**::
-
-    import xarray as xr
-
-    # Open zarr archive with coordinate reference system
-    ds = xr.open_dataset(
-        'london_zarr/global_0.1_degree_representation/2024/grid_0.15_52.05/grid_0.15_52.05_2024.zarr',
-        decode_coords='all'
-    )
-
-    print(f"CRS: {ds.rio.crs}")
-    print(f"Transform: {ds.rio.transform()}")
-    print(f"Data shape: {ds.embedding.shape}")
-
-    # Access specific bands efficiently (only loads needed chunks)
-    band_subset = ds.embedding.isel(band=slice(0, 3))
-
-    # Compute statistics
-    mean_values = ds.embedding.mean(dim=['x', 'y'])
 
 Download as NumPy Arrays (For Analysis)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -255,24 +213,6 @@ Export embeddings to GeoTIFF::
         compress="lzw"
     )
     print(f"Created {len(files)} GeoTIFF files")
-
-Export embeddings to Zarr::
-
-    # Step 1: Get list of tiles in the region
-    tiles_to_fetch = gt.registry.load_blocks_for_region(bounds=bbox, year=2024)
-
-    # Step 2: Export as Zarr archives
-    files = gt.export_embedding_zarrs(
-        tiles_to_fetch,
-        output_dir="./output",
-        bands=[10, 30, 50]  # Optional band selection
-    )
-    print(f"Created {len(files)} Zarr archives")
-
-    # Step 3: Open with xarray for analysis
-    import xarray as xr
-    ds = xr.open_dataset(files[0], decode_coords='all')
-    print(f"CRS: {ds.rio.crs}, Shape: {ds.embedding.shape}")
 
 Working with Downloaded NumPy Arrays
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

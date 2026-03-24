@@ -50,11 +50,19 @@ downstream processing, keeping GeoTessera focused on reliable data access.
 """
 
 from .core import GeoTessera, dequantize_embedding
-from .store import GeoTesseraZarr
 from . import visualization
 from . import web
 from . import registry
-from . import store
+
+
+def __getattr__(name):
+    if name == "GeoTesseraZarr":
+        from .store import GeoTesseraZarr
+        return GeoTesseraZarr
+    if name == "store":
+        from . import store
+        return store
+    raise AttributeError(f"module 'geotessera' has no attribute {name!r}")
 
 try:
     import importlib.metadata
