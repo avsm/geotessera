@@ -658,26 +658,11 @@ def compute_unified_zone_grid(
         min_y = min(min_y, tile_bottom)
         max_y = max(max_y, tile_y)
 
-    # Snap to the tile pixel grid.  All tiles in a zone share the same
-    # Sentinel-2 10m grid, so their origins have the same sub-pixel phase
-    # (origin % pixel_size).  We align the zarr grid to this phase so that
-    # tile pixels map exactly to zarr pixels with no sub-pixel offset.
-    ref = all_tile_infos[0]
-    grid_phase_x = ref.transform.c % pixel_size
-    grid_phase_y = northing_to_canonical(ref.transform.f, ref.epsg) % pixel_size
-
-    origin_x = math.floor(min_x / pixel_size) * pixel_size + grid_phase_x
-    if origin_x > min_x:
-        origin_x -= pixel_size
-    origin_y = math.ceil(max_y / pixel_size) * pixel_size + grid_phase_y
-    if origin_y < max_y:
-        origin_y += pixel_size
-    extent_right = math.ceil(max_x / pixel_size) * pixel_size + grid_phase_x
-    if extent_right < max_x:
-        extent_right += pixel_size
-    extent_bottom = math.floor(min_y / pixel_size) * pixel_size + grid_phase_y
-    if extent_bottom > min_y:
-        extent_bottom -= pixel_size
+    # Snap to pixel grid
+    origin_x = math.floor(min_x / pixel_size) * pixel_size
+    origin_y = math.ceil(max_y / pixel_size) * pixel_size
+    extent_right = math.ceil(max_x / pixel_size) * pixel_size
+    extent_bottom = math.floor(min_y / pixel_size) * pixel_size
 
     width_px = round((extent_right - origin_x) / pixel_size)
     height_px = round((origin_y - extent_bottom) / pixel_size)
@@ -776,10 +761,7 @@ def build_shard_index(
 # Store initialisation (zarr-init)
 # ---------------------------------------------------------------------------
 
-def _default_zone_grid(
-    zone: int, years: List[int],
-    grid_phase: Optional[Tuple[float, float]] = None,
-) -> UnifiedZoneGrid:
+def _default_zone_grid(zone: int, years: List[int]) -> UnifiedZoneGrid:
     """Compute a default grid for a UTM zone with no tiles.
 
     Uses the full theoretical UTM zone extent: 6 degrees wide,
@@ -806,9 +788,10 @@ def _default_zone_grid(
     min_y = min(ll_y, lr_y)
     max_y = max(ul_y, ur_y)
 
-    origin_x, origin_y, extent_right, extent_bottom = _snap_to_tile_grid(
-        min_x, max_x, min_y, max_y, pixel_size, grid_phase,
-    )
+    origin_x = math.floor(min_x / pixel_size) * pixel_size
+    origin_y = math.ceil(max_y / pixel_size) * pixel_size
+    extent_right = math.ceil(max_x / pixel_size) * pixel_size
+    extent_bottom = math.floor(min_y / pixel_size) * pixel_size
 
     width_px = round((extent_right - origin_x) / pixel_size)
     height_px = round((origin_y - extent_bottom) / pixel_size)
@@ -844,86 +827,15 @@ def _gather_landmask_tiles_by_zone(
     return by_zone
 
 
-def _snap_to_tile_grid(
-    min_x: float, max_x: float, min_y: float, max_y: float,
-    pixel_size: float,
-    grid_phase: Optional[Tuple[float, float]] = None,
-) -> Tuple[float, float, float, float]:
-    """Snap a bounding box to the tile pixel grid.
-
-    If ``grid_phase`` is ``(phase_x, phase_y)`` (the tile grid's sub-pixel
-    offset, i.e. ``tile_origin % pixel_size``), the grid is aligned to the
-    tile pixel centres.  Otherwise falls back to rounding to the nearest
-    ``pixel_size`` boundary.
-
-    Returns ``(origin_x, origin_y, extent_right, extent_bottom)``.
-    """
-    if grid_phase is not None:
-        px, py = grid_phase
-        origin_x = math.floor(min_x / pixel_size) * pixel_size + px
-        if origin_x > min_x:
-            origin_x -= pixel_size
-        origin_y = math.ceil(max_y / pixel_size) * pixel_size + py
-        if origin_y < max_y:
-            origin_y += pixel_size
-        extent_right = math.ceil(max_x / pixel_size) * pixel_size + px
-        if extent_right < max_x:
-            extent_right += pixel_size
-        extent_bottom = math.floor(min_y / pixel_size) * pixel_size + py
-        if extent_bottom > min_y:
-            extent_bottom -= pixel_size
-    else:
-        origin_x = math.floor(min_x / pixel_size) * pixel_size
-        origin_y = math.ceil(max_y / pixel_size) * pixel_size
-        extent_right = math.ceil(max_x / pixel_size) * pixel_size
-        extent_bottom = math.floor(min_y / pixel_size) * pixel_size
-    return origin_x, origin_y, extent_right, extent_bottom
-
-
-def _discover_grid_phase(
-    registry: "Registry",
-    zone: int,
-) -> Optional[Tuple[float, float]]:
-    """Discover the Sentinel-2 pixel grid phase for a UTM zone.
-
-    Reads one tile's landmask GeoTIFF to get the affine transform origin,
-    then returns ``(origin_x % pixel_size, origin_y % pixel_size)``.
-    All tiles in a zone share the same Sentinel-2 grid so one is sufficient.
-    """
-    import rasterio
-    from .registry import tile_to_landmask_filename, LANDMASKS_DIR_NAME
-
-    landmasks = registry.available_landmasks
-    for lon, lat in landmasks:
-        tile_zone = max(1, min(60, int(math.floor((lon + 180) / 6)) + 1))
-        if tile_zone != zone:
-            continue
-        lm_filename = tile_to_landmask_filename(lon, lat)
-        lm_path = os.path.join(registry.embeddings_dir, LANDMASKS_DIR_NAME, lm_filename)
-        if not os.path.exists(lm_path):
-            continue
-        try:
-            with rasterio.open(lm_path) as src:
-                pixel_size = src.transform.a
-                phase_x = src.transform.c % pixel_size
-                phase_y = src.transform.f % pixel_size
-                return (phase_x, phase_y)
-        except Exception:
-            continue
-    return None
-
-
 def _compute_zone_grid_from_landmask(
     zone: int,
     tile_coords: List[Tuple[float, float]],
     years: List[int],
-    grid_phase: Optional[Tuple[float, float]] = None,
 ) -> UnifiedZoneGrid:
     """Compute a unified zone grid from landmask tile coordinates.
 
     Projects tile bounding boxes to UTM and computes the union extent,
-    snapped to SHARD_SIZE boundaries.  If ``grid_phase`` is provided,
-    the grid is aligned to the tile pixel grid.
+    snapped to SHARD_SIZE boundaries.
     """
     from pyproj import Transformer
 
@@ -950,9 +862,10 @@ def _compute_zone_grid_from_landmask(
         min_y = min(min_y, min(corners_y))
         max_y = max(max_y, max(corners_y))
 
-    origin_x, origin_y, extent_right, extent_bottom = _snap_to_tile_grid(
-        min_x, max_x, min_y, max_y, pixel_size, grid_phase,
-    )
+    origin_x = math.floor(min_x / pixel_size) * pixel_size
+    origin_y = math.ceil(max_y / pixel_size) * pixel_size
+    extent_right = math.ceil(max_x / pixel_size) * pixel_size
+    extent_bottom = math.floor(min_y / pixel_size) * pixel_size
 
     width_px = round((extent_right - origin_x) / pixel_size)
     height_px = round((origin_y - extent_bottom) / pixel_size)
@@ -1028,14 +941,7 @@ def init_store(
     # Create each zone group from landmask coverage
     for zone_num in sorted(landmask_by_zone.keys()):
         tile_coords = landmask_by_zone[zone_num]
-
-        # Discover the Sentinel-2 pixel grid phase from a landmask GeoTIFF
-        # so the zarr grid aligns exactly with the tile pixel centres.
-        grid_phase = _discover_grid_phase(registry, zone_num)
-        if grid_phase and console:
-            console.print(f"  Zone {zone_num} grid phase: ({grid_phase[0]:.4f}, {grid_phase[1]:.4f})")
-
-        grid = _compute_zone_grid_from_landmask(zone_num, tile_coords, years, grid_phase)
+        grid = _compute_zone_grid_from_landmask(zone_num, tile_coords, years)
 
         if console:
             w_km = grid.width_px * grid.pixel_size / 1000
