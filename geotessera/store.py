@@ -95,7 +95,7 @@ def open_zone(
         case _: raise TypeError("Provide exactly one of zone=, lon=, or bbox=")
 
     log.debug("open_zone: utm%02d from %s", z, store_url)
-    return xr.open_zarr(
+    ds = xr.open_zarr(
         store_url,
         group=f"utm{z:02d}",
         zarr_format=3,
@@ -103,6 +103,17 @@ def open_zone(
         chunks=SHARD_CHUNKS,
         **kwargs,
     )
+
+    # Attach piecewise tile transform if available — enables exact per-pixel
+    # coordinates via CoordinateTransformIndex
+    from .tile_transform import TesseraTileTransform
+    transform = TesseraTileTransform.from_zone_attrs(ds.attrs)
+    if transform is not None:
+        idx = xr.indexes.CoordinateTransformIndex(transform)
+        ds = ds.assign_coords(xr.Coordinates.from_xindex(idx))
+        log.debug("Attached TesseraTileTransform with %d tiles", len(transform.tiles))
+
+    return ds
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +186,17 @@ class TesseraAccessor:
         """Sample a single dequantised embedding.  Returns ``(B,)`` float32."""
         e, n = self._to_utm.transform(lon, lat)
         log.debug("sample_at(%.6f, %.6f) → UTM(%.1f, %.1f)", lon, lat, e, n)
-        pixel = self._ds.sel(time=year, x=e, y=n, method="nearest")
+
+        # Use tile transform coords (xc/yc) if available, else regular (x/y)
+        if "xc" in self._ds.coords:
+            import xarray as xr
+            pixel = self._ds.sel(
+                time=year,
+                xc=xr.DataArray(e), yc=xr.DataArray(n),
+                method="nearest",
+            )
+        else:
+            pixel = self._ds.sel(time=year, x=e, y=n, method="nearest")
         scale = float(pixel["scales"].values)
         if not np.isfinite(scale):
             return np.full(self.n_bands, np.nan, dtype=np.float32)

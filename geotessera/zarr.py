@@ -1141,6 +1141,50 @@ def _get_written_tiles(store_path: Path, year: int, zone: int) -> set:
     return set(zip(subset["tile_lon"], subset["tile_lat"]))
 
 
+def _record_tile_transforms(
+    store_path: Path,
+    zone_group: str,
+    tile_infos: List[TileInfo],
+    grid: UnifiedZoneGrid,
+) -> None:
+    """Record tile placements in zone attrs for exact coordinate reconstruction.
+
+    Appends to ``tessera:tile_transforms`` — a list of dicts with each tile's
+    zarr offset and original affine transform.  Readers use this to compute
+    exact per-pixel UTM coordinates via :class:`TesseraTileTransform`.
+    """
+    import zarr as zarr_lib
+
+    # Compute the zarr offset for each tile
+    new_placements = []
+    for ti in tile_infos:
+        row, col = _tile_pixel_offset(ti, grid)
+        new_placements.append({
+            "row0": row, "col0": col,
+            "height": ti.height, "width": ti.width,
+            "ox": ti.transform.c,
+            "oy": northing_to_canonical(ti.transform.f, ti.epsg),
+            "px": ti.transform.a,
+        })
+
+    # Merge with any existing placements (from previous fill runs)
+    store = zarr_lib.open_group(
+        str(store_path), mode="r+", path=zone_group,
+        use_consolidated=False,
+    )
+    attrs = dict(store.attrs)
+    existing = list(attrs.get("tessera:tile_transforms", []))
+    # Deduplicate by (row0, col0) — last writer wins
+    by_key = {(p["row0"], p["col0"]): p for p in existing}
+    for p in new_placements:
+        by_key[(p["row0"], p["col0"])] = p
+    merged = sorted(by_key.values(), key=lambda p: (p["row0"], p["col0"]))
+
+    attrs["tessera:tile_transforms"] = merged
+    store.attrs.clear()
+    store.attrs.update(attrs)
+
+
 # ---------------------------------------------------------------------------
 # Shard writing (NCHW layout)
 # ---------------------------------------------------------------------------
@@ -1404,6 +1448,9 @@ def fill_store(
 
             # Update tile registry
             _record_written_tiles(store_path, remaining, fill_year, zone_num)
+
+            # Record tile transforms for exact coordinate reconstruction
+            _record_tile_transforms(store_path, zone_group, remaining, grid)
 
             if written_count > 0:
                 zones_filled.append((zone_num, time_index))
