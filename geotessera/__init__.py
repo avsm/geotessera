@@ -50,10 +50,12 @@ downstream processing, keeping GeoTessera focused on reliable data access.
 """
 
 from .core import GeoTessera, dequantize_embedding
+from .store import GeoTesseraZarr
 from . import visualization
 from . import web
 from . import registry
 from . import zarr_zone
+from . import store
 
 try:
     import importlib.metadata
@@ -63,4 +65,4 @@ except importlib.metadata.PackageNotFoundError:
     # Fallback for development installs
     __version__ = "unknown"
 
-__all__ = ["GeoTessera", "dequantize_embedding", "visualization", "web", "registry", "zarr_zone"]
+__all__ = ["GeoTessera", "GeoTesseraZarr", "dequantize_embedding", "visualization", "web", "registry", "zarr_zone", "store"]
