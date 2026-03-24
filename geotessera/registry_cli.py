@@ -2883,6 +2883,139 @@ def zarr_global_preview_command(args):
     return 0
 
 
+def verify_tile_command(args):
+    """Verify that NPY tile and zarr store produce identical embeddings for a full tile."""
+    import numpy as np
+    from rich.console import Console
+    from rich.table import Table
+
+    console = Console()
+
+    lon, lat = args.lon, args.lat
+    store_url = args.store
+    years = _parse_year_range(args.years)
+
+    console.print(f"Verifying full tile at ({lon}, {lat})")
+    console.print(f"  NPY source: geotessera tile download")
+    console.print(f"  Zarr source: {store_url}")
+    console.print(f"  Years: {years}")
+    console.print()
+
+    from .core import GeoTessera
+    from .store import GeoTesseraZarr
+
+    gt = GeoTessera()
+    gz = GeoTesseraZarr(store_url)
+
+    table = Table(title=f"Tile verification at ({lon}, {lat})")
+    table.add_column("Year", style="bold")
+    table.add_column("Tile size")
+    table.add_column("Valid px")
+    table.add_column("Max |diff|")
+    table.add_column("Mean |diff|")
+    table.add_column("Match", style="bold")
+
+    all_match = True
+
+    for year in years:
+        if year not in gz.years:
+            table.add_row(str(year), "-", "-", "-", "-", "[yellow]not in store[/yellow]")
+            continue
+
+        # Download the NPY tile covering this point
+        try:
+            tiles_needed = gt.registry.load_blocks_for_region(
+                (lon - 0.001, lat - 0.001, lon + 0.001, lat + 0.001), year,
+            )
+            if not tiles_needed:
+                table.add_row(str(year), "-", "-", "-", "-", "[yellow]no tile[/yellow]")
+                continue
+            coords = {(tlon, tlat) for (_, tlon, tlat) in tiles_needed}
+            tile_map = gt._ensure_tiles_available(
+                required_coords=coords, year=year, auto_download=True, bbox=None,
+            )
+            tile = next(t for t in tile_map.values() if t.is_available())
+            npy_emb = tile.load_embedding()  # (H, W, 128) float32
+        except Exception as e:
+            table.add_row(str(year), "-", "-", "-", "-", f"[red]NPY error: {e}[/red]")
+            all_match = False
+            continue
+
+        h, w, n_bands = npy_emb.shape
+        tile_transform = tile.transform
+        tile_crs = tile.crs
+
+        # Read the exact zarr pixels that zarr-fill placed this tile's data
+        # into.  The fill code uses round((tile_origin - grid_origin) / px)
+        # to compute the zarr index for tile pixel (0,0).  We replicate that
+        # to get the exact indices, then read via isel and dequantise via
+        # the accessor.
+        #
+        # Note: sel(method='nearest') with the NPY pixel centres does NOT
+        # work here because the NPY and zarr grids are offset by up to ~5m
+        # (the NPY tile origin has a sub-10m offset from the Sentinel-2
+        # processing while the zarr snaps to a regular 10m grid).
+        try:
+            px = tile_transform.a
+            ds = gz.open_zone(lon=lon)
+            t_attr = ds.attrs["spatial:transform"]
+            grid_origin_x, grid_origin_y = t_attr[2], t_attr[5]
+
+            zarr_col0 = round((tile_transform.c - grid_origin_x) / px)
+            zarr_row0 = round((grid_origin_y - tile_transform.f) / px)
+
+            sub = ds.isel(
+                time=gz.years.index(year),
+                y=slice(zarr_row0, zarr_row0 + h),
+                x=slice(zarr_col0, zarr_col0 + w),
+            )
+            scales = sub["scales"].values
+            emb_int8 = sub["embeddings"].values
+            zarr_emb = ds.tessera.dequantise(emb_int8, scales)
+        except Exception as e:
+            table.add_row(str(year), f"{h}x{w}", "-", "-", "-", f"[red]Zarr error: {e}[/red]")
+            all_match = False
+            continue
+
+        # Compare all valid pixels
+        npy_valid = np.isfinite(npy_emb).all(axis=2)
+        zarr_valid = np.isfinite(zarr_emb).all(axis=2)
+        both_valid = npy_valid & zarr_valid
+        n_valid = int(both_valid.sum())
+
+        if n_valid == 0:
+            table.add_row(str(year), f"{h}x{w}", "0", "-", "-", "[yellow]no valid pixels[/yellow]")
+            continue
+
+        diff = np.abs(npy_emb[both_valid] - zarr_emb[both_valid])
+        max_diff = float(diff.max())
+        mean_diff = float(diff.mean())
+        exact = max_diff == 0.0
+        size_note = f"{h}x{w}"
+
+        if exact:
+            table.add_row(
+                str(year), size_note, f"{n_valid:,}", "0", "0",
+                "[green]PASS[/green]",
+            )
+        else:
+            table.add_row(
+                str(year), size_note, f"{n_valid:,}",
+                f"{max_diff:.8f}", f"{mean_diff:.8f}",
+                "[red]FAIL[/red]",
+            )
+            all_match = False
+
+    console.print(table)
+
+    if all_match:
+        console.print(f"\n[green]All {len(years)} years match exactly.[/green]")
+        return 0
+    else:
+        console.print(f"\n[red]Some years did not match.[/red]")
+        return 1
+
+
 def main():
     """Main entry point for the geotessera-registry CLI tool."""
     # Configure logging with rich handler
@@ -3247,6 +3380,29 @@ Directory Structure:
         help="Reprocess zones even if completion markers exist",
     )
     zarr_gp_parser.set_defaults(func=zarr_global_preview_command)
+
+    # Verify-tile command
+    verify_parser = subparsers.add_parser(
+        "verify-tile",
+        help="Verify NPY tiles and zarr store produce identical embeddings at a point",
+    )
+    verify_parser.add_argument(
+        "--lon", type=float, default=-2.969398,
+        help="Longitude (default: -2.969398, Liverpool)",
+    )
+    verify_parser.add_argument(
+        "--lat", type=float, default=53.434288,
+        help="Latitude (default: 53.434288, Liverpool)",
+    )
+    verify_parser.add_argument(
+        "--years", default="2017,2024,2025",
+        help="Years to verify (default: 2017,2024,2025)",
+    )
+    verify_parser.add_argument(
+        "--store", default="https://dl2.geotessera.org/zarr/v2/store.zarr",
+        help="Zarr store URL",
+    )
+    verify_parser.set_defaults(func=verify_tile_command)
 
     args = parser.parse_args()
 
