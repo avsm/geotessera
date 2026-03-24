@@ -2883,6 +2883,89 @@ def zarr_global_preview_command(args):
     return 0
 
 
+def print_command(args):
+    """Print embedding values at a point from both NPY and zarr sources."""
+    import numpy as np
+    from rich.console import Console
+    from rich.table import Table
+
+    console = Console()
+    lon, lat, year = args.lon, args.lat, args.year
+    n = 16
+
+    console.print(f"Embedding at ({lon}, {lat}), year {year}")
+    console.print()
+
+    # NPY path: use sample_embeddings_at_points with metadata to see which tile
+    from .core import GeoTessera
+    gt = GeoTessera()
+
+    try:
+        npy_emb, npy_meta = gt.sample_embeddings_at_points(
+            [(lon, lat)], year=year, include_metadata=True,
+        )
+        npy_emb = npy_emb[0]
+        meta = npy_meta[0] if npy_meta[0] else {}
+    except Exception as e:
+        console.print(f"[red]NPY error: {e}[/red]")
+        return 1
+
+    npy_finite = np.isfinite(npy_emb).all()
+    console.print(f"[bold]NPY[/bold] (GeoTessera.sample_embeddings_at_points)")
+    console.print(f"  Tile: ({meta.get('tile_lon')}, {meta.get('tile_lat')}), "
+                  f"CRS: {meta.get('crs')}, pixel: ({meta.get('pixel_row')}, {meta.get('pixel_col')})")
+    console.print(f"  Norm: {np.linalg.norm(npy_emb):.4f}" if npy_finite else "  [yellow]NaN (no data)[/yellow]")
+    console.print()
+
+    # Zarr path: use GeoTesseraZarr.sample_at (handles zone routing)
+    import math
+    from .store import GeoTesseraZarr, _zone_for_lon
+    gz = GeoTesseraZarr(args.store)
+    zarr_zone = _zone_for_lon(lon)
+
+    try:
+        zarr_emb = gz.sample_at(lon, lat, year=year)
+    except Exception as e:
+        console.print(f"[red]Zarr error: {e}[/red]")
+        return 1
+
+    zarr_finite = np.isfinite(zarr_emb).all()
+    console.print(f"[bold]Zarr[/bold] (GeoTesseraZarr.sample_at)")
+    console.print(f"  Zone: utm{zarr_zone:02d}")
+    console.print(f"  Store: {args.store}")
+    console.print(f"  Norm: {np.linalg.norm(zarr_emb):.4f}" if zarr_finite else "  [yellow]NaN (no data)[/yellow]")
+    console.print()
+
+    # Table
+    table = Table(title=f"First {n} bands")
+    table.add_column("Band", style="bold", justify="right")
+    table.add_column("NPY", justify="right")
+    table.add_column("Zarr", justify="right")
+    table.add_column("Diff", justify="right")
+
+    for i in range(n):
+        nv = npy_emb[i]
+        zv = zarr_emb[i]
+        if np.isnan(nv) or np.isnan(zv):
+            table.add_row(str(i), f"{nv:.6f}", f"{zv:.6f}", "[dim]NaN[/dim]")
+        else:
+            d = abs(float(nv) - float(zv))
+            style = "" if d == 0 else "[red]" if d > 0.5 else "[yellow]"
+            end = "" if not style else "[/]"
+            table.add_row(str(i), f"{nv:.6f}", f"{zv:.6f}", f"{style}{d:.6f}{end}")
+
+    console.print(table)
+
+    if npy_finite and zarr_finite:
+        max_diff = float(np.max(np.abs(npy_emb - zarr_emb)))
+        cosine = float(np.dot(npy_emb, zarr_emb) / (np.linalg.norm(npy_emb) * np.linalg.norm(zarr_emb)))
+        if max_diff == 0:
+            console.print("\n[green]Exact match[/green]")
+        else:
+            console.print(f"\n[yellow]Max diff: {max_diff:.6f}, cosine similarity: {cosine:.6f}[/yellow]")
+    return 0
+
+
 def verify_tile_command(args):
     """Verify that NPY tile and zarr store produce identical embeddings for a full tile."""
     import numpy as np
@@ -3403,6 +3486,20 @@ Directory Structure:
         help="Zarr store URL",
     )
     verify_parser.set_defaults(func=verify_tile_command)
+
+    # Print command
+    print_parser = subparsers.add_parser(
+        "print",
+        help="Print embedding values at a point from both NPY and zarr",
+    )
+    print_parser.add_argument("--lon", type=float, required=True, help="Longitude")
+    print_parser.add_argument("--lat", type=float, required=True, help="Latitude")
+    print_parser.add_argument("--year", type=int, required=True, help="Year")
+    print_parser.add_argument(
+        "--store", default="https://dl2.geotessera.org/zarr/v2/store.zarr",
+        help="Zarr store URL",
+    )
+    print_parser.set_defaults(func=print_command)
 
     args = parser.parse_args()
 
