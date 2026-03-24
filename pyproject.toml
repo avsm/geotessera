@@ -39,7 +39,6 @@ dependencies = [
     "dask",
     "fsspec",
     "aiohttp",
-    "pystac",
     "topozarr>=0.0.5",
     "geozarr-toolkit",
 ]
