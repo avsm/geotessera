@@ -20,7 +20,7 @@ import pandas as pd
 import geopandas as gpd
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Callable, Any, List, Optional
+from typing import Callable, Any, List, Optional, Tuple
 
 from rich.console import Console
 from rich.panel import Panel
@@ -424,12 +424,6 @@ def find_tiff_files_by_blocks(base_dir):
 
     return files_by_block
 
-
-def generate_master_registry(registry_dir):
-    """Generate a master registry.txt file containing hashes of all registry files."""
-    # This function is no longer used but kept for compatibility
-    # The actual generation of registry.txt should be done separately
-    pass
 
 
 def create_landmasks_parquet_database(base_dir, output_path, console):
@@ -2523,6 +2517,480 @@ def file_check_command(args):
     return 0
 
 
+# ---------------------------------------------------------------------------
+# stac-index command
+# ---------------------------------------------------------------------------
+
+
+def _store_bbox_wgs84(attrs: dict) -> list[float]:
+    """Compute the WGS84 bounding box [west, south, east, north] from store attrs.
+
+    Each store covers exactly one UTM zone, so longitude is determined directly
+    from the zone number.  Latitude is derived by reprojecting the northing
+    extremes at the zone's central meridian.
+    """
+    from pyproj import Transformer
+
+    from .zarr import _get_tessera_attr
+    utm_zone = _get_tessera_attr(attrs, "utm_zone")
+    west = (utm_zone - 1) * 6 - 180
+    east = utm_zone * 6 - 180
+
+    transform = attrs["spatial:transform"]
+    pixel_size = transform[0]
+    origin_northing = transform[5]
+    height_px = attrs["grid_height"]
+    epsg = int(attrs["proj:code"].split(":")[1])
+
+    n_max = origin_northing
+    n_min = origin_northing - height_px * pixel_size
+
+    # Reproject northing at the central meridian (500 000 m false easting)
+    transformer = Transformer.from_crs(f"EPSG:{epsg}", "EPSG:4326", always_xy=True)
+    _, lats = transformer.transform([500_000, 500_000], [n_min, n_max])
+
+    return [west, min(lats), east, max(lats)]
+
+
+def _zarr_store_to_stac_item(
+    zone_grp,
+    zone_name: str,
+    year: int,
+    root_attrs: dict,
+    year_store_path: Path,
+):
+    """Build a pystac Item from a zone group within a year store, or None on failure."""
+    import pystac
+    from datetime import datetime, timezone
+
+    label = f"{year_store_path.name}/{zone_name}"
+
+    try:
+        attrs = dict(zone_grp.attrs)
+    except Exception as e:
+        logger.warning("Skipping %s: cannot read attrs (%s)", label, e)
+        return None
+
+    # Required attributes
+    from .zarr import _get_tessera_attr
+    # Accept both old unprefixed and new tessera:-prefixed attribute names
+    required_spatial = ["proj:code", "spatial:transform"]
+    missing = [k for k in required_spatial if k not in attrs]
+    if _get_tessera_attr(attrs, "utm_zone") is None:
+        missing.append("tessera:utm_zone")
+    if missing:
+        logger.warning("Skipping %s: missing attrs %s", label, missing)
+        return None
+
+    # Read grid dimensions from the scales array
+    try:
+        scales_shape = zone_grp["scales"].shape
+        attrs["grid_height"] = scales_shape[0]
+        attrs["grid_width"] = scales_shape[1]
+    except Exception as e:
+        logger.warning("Skipping %s: cannot read scales shape (%s)", label, e)
+        return None
+
+    # Compute bounding box
+    try:
+        bbox = _store_bbox_wgs84(attrs)
+    except Exception as e:
+        logger.warning("Skipping %s: bbox computation failed (%s)", label, e)
+        return None
+
+    item_id = f"{zone_name}_{year}"
+    dt = datetime(year, 1, 1, tzinfo=timezone.utc)
+
+    # Build WGS84 polygon from bbox
+    west, south, east, north = bbox
+    geometry = {
+        "type": "Polygon",
+        "coordinates": [[
+            [west, south],
+            [east, south],
+            [east, north],
+            [west, north],
+            [west, south],
+        ]],
+    }
+
+    # Determine number of bands
+    try:
+        n_bands = zone_grp["embeddings"].shape[2]
+    except Exception:
+        n_bands = 128
+
+    # Check for dataset version mismatch
+    dataset_version = root_attrs.get("tessera:dataset_version", "")
+    dir_version = year_store_path.parent.name
+    if dataset_version and dir_version and dataset_version != dir_version:
+        logger.warning(
+            "%s: dataset version %r != directory %r",
+            label, dataset_version, dir_version,
+        )
+
+    properties = {
+        "tessera:utm_zone": _get_tessera_attr(attrs, "utm_zone"),
+        "proj:code": attrs["proj:code"],
+        "grid_width": attrs["grid_width"],
+        "grid_height": attrs["grid_height"],
+        "tessera:n_bands": n_bands,
+        "tessera:has_rgb_preview": _get_tessera_attr(attrs, "has_rgb_preview", False),
+        "tessera:build_version": _get_tessera_attr(attrs, "build_version",
+                                                    attrs.get("geotessera_version", "unknown")),
+        "tessera:dataset_version": dataset_version,
+    }
+
+    item = pystac.Item(
+        id=item_id,
+        geometry=geometry,
+        bbox=bbox,
+        datetime=dt,
+        properties=properties,
+    )
+
+    # Asset href: placeholder; caller sets the final relative path
+    item.add_asset(
+        "zarr",
+        pystac.Asset(
+            href=zone_name,
+            media_type="application/x-zarr-v3",
+            roles=["data"],
+            title="Zarr v3 embedding store",
+        ),
+    )
+
+    return item
+
+
+def _parse_year_range(s: str) -> list[int]:
+    """Parse a year range like '2017-2025' or '2017,2019,2024'."""
+    if "-" in s and "," not in s:
+        start, end = s.split("-", 1)
+        return list(range(int(start), int(end) + 1))
+    return [int(y.strip()) for y in s.split(",")]
+
+
+def _parse_zone_list(s: str) -> list[int]:
+    """Parse a zone list like '29,30,31' or '29-34'."""
+    if "-" in s and "," not in s:
+        start, end = s.split("-", 1)
+        return list(range(int(start), int(end) + 1))
+    return [int(z.strip()) for z in s.split(",")]
+
+
+def _find_registry(base_dir: str, registry_dir: Optional[str] = None) -> Tuple[str, str]:
+    """Find the registry directory from base_dir. Returns (base_dir, registry_dir)."""
+    if registry_dir is None:
+        candidate = Path(base_dir)
+        for _ in range(3):
+            if (candidate / "registry.parquet").exists():
+                return base_dir, str(candidate)
+            candidate = candidate.parent
+    return base_dir, registry_dir or base_dir
+
+
+def zarr_init_command(args):
+    """Create an empty tessera store with time dimension."""
+    from rich.console import Console
+    from .registry import Registry
+    from .zarr import init_store
+
+    console = Console()
+
+    base_dir = args.base_dir
+    base_dir, registry_dir = _find_registry(base_dir, args.registry_dir)
+
+    registry = Registry(
+        version="v1",
+        embeddings_dir=base_dir,
+        registry_dir=registry_dir,
+    )
+
+    years = _parse_year_range(args.years)
+    output = Path(args.output)
+
+    try:
+        import importlib.metadata
+        version = importlib.metadata.version("geotessera")
+    except Exception:
+        version = "unknown"
+
+    try:
+        init_store(
+            registry, output, years,
+            geotessera_version=version,
+            model_version=args.model_version,
+            console=console,
+        )
+    except FileExistsError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        return 1
+
+    return 0
+
+
+def zarr_fill_command(args):
+    """Incrementally fill a tessera store with tile data."""
+    import warnings
+    from rich.console import Console
+    from .registry import Registry
+    from .zarr import fill_store
+
+    warnings.filterwarnings("ignore", message="Object at .* is not recognized")
+
+    console = Console()
+
+    base_dir = args.base_dir
+    base_dir, registry_dir = _find_registry(base_dir, args.registry_dir)
+
+    registry = Registry(
+        version="v1",
+        embeddings_dir=base_dir,
+        registry_dir=registry_dir,
+    )
+
+    store_path = Path(args.store_path)
+    year = args.year
+    zones = _parse_zone_list(args.zones) if args.zones else None
+
+    n = fill_store(
+        registry, store_path,
+        year=year, zones=zones,
+        with_rgb=args.with_rgb,
+        console=console,
+        workers=args.workers,
+    )
+
+    console.print(f"\n{emoji('✅ ')}{n} shards written")
+    return 0
+
+
+def zarr_rgb_command(args):
+    """Generate RGB previews for a tessera store."""
+    import re
+    import warnings
+    import zarr
+    from rich.console import Console
+    from .zarr import add_rgb_preview
+
+    warnings.filterwarnings("ignore", message="Object at .* is not recognized")
+
+    console = Console()
+    store_path = Path(args.store_path)
+
+    root = zarr.open_group(str(store_path), mode="r", use_consolidated=False)
+    root_attrs = dict(root.attrs)
+    all_years = root_attrs.get("tessera:years", [])
+    if not all_years:
+        console.print("[red]Error: not a tessera store (no tessera:years)[/red]")
+        return 1
+
+    years = _parse_year_range(args.years) if args.years else all_years
+    zones = _parse_zone_list(args.zones) if args.zones else None
+
+    zone_pattern = re.compile(r"^utm(\d{2})$")
+    all_zone_nums = sorted(
+        int(m.group(1)) for name in root.keys()
+        if (m := zone_pattern.match(name))
+    )
+    target_zones = [z for z in all_zone_nums if zones is None or z in zones]
+
+    console.print(f"Generating RGB previews for [bold]{store_path}[/bold]")
+    console.print(f"  Years: {years}")
+    console.print(f"  Zones: {target_zones}")
+
+    for year in years:
+        if year not in all_years:
+            console.print(f"  [yellow]Year {year} not in store, skipping[/yellow]")
+            continue
+        time_index = all_years.index(year)
+        for zone_num in target_zones:
+            add_rgb_preview(
+                store_path, zone_num, time_index,
+                workers=args.workers, console=console,
+            )
+
+    return 0
+
+
+def zarr_global_preview_command(args):
+    """Build global EPSG:4326 RGB pyramid from zone-level RGB."""
+    import warnings
+    import zarr
+    from rich.console import Console
+    from .zarr import build_global_preview
+
+    warnings.filterwarnings("ignore", message="Object at .* is not recognized")
+
+    console = Console()
+    store_path = Path(args.store_path)
+
+    root = zarr.open_group(str(store_path), mode="r", use_consolidated=False)
+    root_attrs = dict(root.attrs)
+    all_years = root_attrs.get("tessera:years", [])
+    if not all_years:
+        console.print("[red]Error: not a tessera store (no tessera:years)[/red]")
+        return 1
+
+    year = args.year
+    if year not in all_years:
+        console.print(f"[red]Error: year {year} not in store (available: {all_years})[/red]")
+        return 1
+
+    time_index = all_years.index(year)
+    zones = _parse_zone_list(args.zones) if args.zones else None
+
+    build_global_preview(
+        store_path=store_path,
+        time_index=time_index,
+        zones=zones,
+        num_levels=args.levels,
+        workers=args.workers,
+        console=console,
+        force=args.force,
+    )
+
+    return 0
+
+
+def stac_index_command(args):
+    """Scan a directory of consolidated year Zarr stores and generate a static STAC catalog."""
+    import re
+    import zarr
+    import pystac
+    from datetime import datetime, timezone
+
+    zarr_dir = Path(args.zarr_dir).resolve()
+    output_dir = Path(args.output_dir).resolve() if args.output_dir else zarr_dir
+
+    if not zarr_dir.is_dir():
+        console.print(f"[red]Error:[/red] {zarr_dir} is not a directory")
+        return 1
+
+    # Discover consolidated year stores ({YYYY}.zarr)
+    year_pattern = re.compile(r"^(\d{4})\.zarr$")
+    zone_pattern = re.compile(r"^utm(\d{2})$")
+    year_stores = []
+    for entry in sorted(zarr_dir.iterdir()):
+        if entry.is_dir() and year_pattern.match(entry.name):
+            year_stores.append(entry)
+
+    if not year_stores:
+        console.print(f"[red]Error:[/red] No {{YYYY}}.zarr stores found in {zarr_dir}")
+        return 1
+
+    # Discover zone groups and cache store roots to avoid re-opening
+    year_store_info = []  # (path, root, root_attrs, year, zone_names)
+    for year_store_path in year_stores:
+        root = zarr.open_group(str(year_store_path), mode="r", use_consolidated=False)
+        root_attrs = dict(root.attrs)
+        yr = root_attrs.get("tessera:year",
+                            root_attrs.get("year",
+                                           int(year_store_path.name.removesuffix(".zarr"))))
+        zones = [n for n in sorted(root.keys()) if zone_pattern.match(n)]
+        if zones:
+            year_store_info.append((year_store_path, root, root_attrs, yr, zones))
+
+    total_zones = sum(len(info[4]) for info in year_store_info)
+    console.print(f"Found {len(year_stores)} year store(s), {total_zones} zone group(s) in {zarr_dir}")
+
+    # Build items grouped by year
+    items_by_year: dict[int, list["pystac.Item"]] = defaultdict(list)
+    skipped = 0
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Reading store metadata", total=total_zones)
+        for year_store_path, root, root_attrs, year, zone_names in year_store_info:
+            for zone_name in zone_names:
+                zone_grp = root[zone_name]
+                item = _zarr_store_to_stac_item(
+                    zone_grp, zone_name, year, root_attrs, year_store_path,
+                )
+                if item is not None:
+                    # Fix asset href to be relative to the item's JSON location
+                    # Item JSON will be at: output_dir/geotessera-{year}/{item.id}/{item.id}.json
+                    item_json_dir = output_dir / f"geotessera-{year}" / item.id
+                    zarr_asset = item.assets["zarr"]
+                    zarr_asset.href = os.path.relpath(
+                        year_store_path / zone_name, item_json_dir,
+                    )
+                    items_by_year[year].append(item)
+                else:
+                    skipped += 1
+                progress.advance(task)
+
+    if not items_by_year:
+        console.print("[red]Error:[/red] No valid stores found")
+        return 1
+
+    if skipped:
+        console.print(f"[yellow]Skipped {skipped} zone group(s) with errors[/yellow]")
+
+    # Create root catalog
+    catalog = pystac.Catalog(
+        id="geotessera",
+        title="Geotessera Embedding Stores",
+        description="Static STAC catalog of Geotessera Zarr v3 embedding stores",
+    )
+
+    # Create one collection per year
+    for year in sorted(items_by_year):
+        items = items_by_year[year]
+
+        # Union bounding box
+        all_bboxes = [it.bbox for it in items]
+        extent_bbox = [
+            min(b[0] for b in all_bboxes),
+            min(b[1] for b in all_bboxes),
+            max(b[2] for b in all_bboxes),
+            max(b[3] for b in all_bboxes),
+        ]
+
+        spatial_extent = pystac.SpatialExtent(bboxes=[extent_bbox])
+        temporal_extent = pystac.TemporalExtent(intervals=[
+            [
+                datetime(year, 1, 1, tzinfo=timezone.utc),
+                datetime(year, 12, 31, 23, 59, 59, tzinfo=timezone.utc),
+            ]
+        ])
+
+        collection = pystac.Collection(
+            id=f"geotessera-{year}",
+            title=f"Geotessera {year}",
+            description=f"Geotessera embedding stores for {year}",
+            extent=pystac.Extent(spatial=spatial_extent, temporal=temporal_extent),
+        )
+
+        for item in items:
+            collection.add_item(item)
+
+        catalog.add_child(collection)
+
+    # Normalize hrefs and save
+    catalog.normalize_hrefs(str(output_dir))
+    catalog.save(catalog_type=pystac.CatalogType.SELF_CONTAINED)
+
+    # Summary
+    total_items = sum(len(v) for v in items_by_year.values())
+    console.print(
+        f"\n{emoji('✅ ')}STAC catalog written to {output_dir}\n"
+        f"  {len(items_by_year)} collection(s), {total_items} item(s)"
+    )
+    for year in sorted(items_by_year):
+        zones = sorted(it.properties["tessera:utm_zone"] for it in items_by_year[year])
+        console.print(f"  {year}: UTM zones {zones}")
+
+    return 0
+
+
+
 def main():
     """Main entry point for the geotessera-registry CLI tool."""
     # Configure logging with rich handler
@@ -2765,6 +3233,139 @@ Directory Structure:
         help="Parquet files to check for duplicates (output from file-scan command)",
     )
     file_check_parser.set_defaults(func=file_check_command)
+
+    # Stac-index command
+    stac_index_parser = subparsers.add_parser(
+        "stac-index",
+        help="Generate a static STAC catalog from a directory of Zarr stores",
+    )
+    stac_index_parser.add_argument(
+        "zarr_dir",
+        help="Directory containing {year}.zarr stores",
+    )
+    stac_index_parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Output directory for STAC JSON files (default: same as zarr_dir)",
+    )
+    stac_index_parser.set_defaults(func=stac_index_command)
+
+    # Zarr-init command
+    zarr_init_parser = subparsers.add_parser(
+        "zarr-init",
+        help="Create an empty tessera store with time dimension",
+    )
+    zarr_init_parser.add_argument(
+        "base_dir",
+        help="Base directory containing downloaded tile data",
+    )
+    zarr_init_parser.add_argument(
+        "--years", required=True,
+        help="Year range (e.g. 2017-2025 or 2017,2019,2024)",
+    )
+    zarr_init_parser.add_argument(
+        "--output", required=True, type=str,
+        help="Output store path (e.g. tessera.zarr)",
+    )
+    zarr_init_parser.add_argument(
+        "--model-version", default="1.0",
+        help="Embedding model version (default: 1.0)",
+    )
+    zarr_init_parser.add_argument(
+        "--registry-dir", type=str, default=None,
+        help="Directory containing registry.parquet (default: auto-detected)",
+    )
+    zarr_init_parser.set_defaults(func=zarr_init_command)
+
+    # Zarr-fill command
+    zarr_fill_parser = subparsers.add_parser(
+        "zarr-fill",
+        help="Incrementally fill a tessera store with tile data",
+    )
+    zarr_fill_parser.add_argument(
+        "base_dir",
+        help="Base directory containing downloaded tile data",
+    )
+    zarr_fill_parser.add_argument(
+        "store_path", type=str,
+        help="Path to existing tessera store",
+    )
+    zarr_fill_parser.add_argument(
+        "--year", type=int, default=None,
+        help="Year to fill (default: all years)",
+    )
+    zarr_fill_parser.add_argument(
+        "--zones", default=None,
+        help="Zone numbers to fill (e.g. 29-34). Default: all initialised zones",
+    )
+    zarr_fill_parser.add_argument(
+        "--with-rgb", action="store_true",
+        help="Also generate RGB previews for filled zones",
+    )
+    zarr_fill_parser.add_argument(
+        "--workers", type=int, default=None,
+        help="Number of parallel workers (default: 4)",
+    )
+    zarr_fill_parser.add_argument(
+        "--registry-dir", type=str, default=None,
+        help="Directory containing registry.parquet (default: auto-detected)",
+    )
+    zarr_fill_parser.set_defaults(func=zarr_fill_command)
+
+    # Zarr-rgb command
+    zarr_rgb_parser = subparsers.add_parser(
+        "zarr-rgb",
+        help="Generate RGB previews for a tessera store",
+    )
+    zarr_rgb_parser.add_argument(
+        "store_path", type=str,
+        help="Path to tessera store",
+    )
+    zarr_rgb_parser.add_argument(
+        "--years", default=None,
+        help="Year range (e.g. 2024 or 2017-2025). Default: all years",
+    )
+    zarr_rgb_parser.add_argument(
+        "--zones", default=None,
+        help="Zone numbers (e.g. 29-34). Default: all zones",
+    )
+    zarr_rgb_parser.add_argument(
+        "--workers", type=int, default=None,
+        help="Number of parallel workers",
+    )
+    zarr_rgb_parser.set_defaults(func=zarr_rgb_command)
+
+    # Zarr-global-preview command
+    zarr_gp_parser = subparsers.add_parser(
+        "zarr-global-preview",
+        help="Build global EPSG:4326 RGB pyramid from zone-level RGB",
+    )
+    zarr_gp_parser.add_argument(
+        "store_path", type=str,
+        help="Path to tessera store",
+    )
+    zarr_gp_parser.add_argument(
+        "--year", type=int, required=True,
+        help="Year to build the global preview for",
+    )
+    zarr_gp_parser.add_argument(
+        "--zones", default=None,
+        help="Zone numbers to include (e.g. 29-34). Default: all with RGB",
+    )
+    zarr_gp_parser.add_argument(
+        "--levels", type=int, default=10,
+        help="Number of pyramid levels (default: 10)",
+    )
+    zarr_gp_parser.add_argument(
+        "--workers", type=int, default=4,
+        help="Number of parallel workers (default: 4)",
+    )
+    zarr_gp_parser.add_argument(
+        "--force", action="store_true",
+        help="Reprocess zones even if completion markers exist",
+    )
+    zarr_gp_parser.set_defaults(func=zarr_global_preview_command)
 
     args = parser.parse_args()
 
