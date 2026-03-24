@@ -426,8 +426,29 @@ def find_tiff_files_by_blocks(base_dir):
 
 
 
+def _check_tiff_has_land(file_path):
+    """Check if a landmask TIFF contains any land pixels (non-zero data).
+
+    Args:
+        file_path: Path to the TIFF file
+
+    Returns:
+        True if the TIFF has at least one non-zero pixel, False otherwise
+    """
+    import rasterio
+
+    try:
+        with rasterio.open(file_path) as src:
+            data = src.read()
+            return data.max() > 0
+    except Exception:
+        return False
+
+
 def create_landmasks_parquet_database(base_dir, output_path, console):
     """Create a Parquet database for landmasks by reading from SHA256SUM file.
+
+    Validates each TIFF in parallel, skipping ocean-only tiles (all-zero data).
 
     Args:
         base_dir: Base directory containing global_0.1_degree_tiff_all
@@ -451,9 +472,9 @@ def create_landmasks_parquet_database(base_dir, output_path, console):
         console.print(f"[red]SHA256SUM file not found:[/red] {sha256sum_file}")
         return False
 
-    records = []
+    # Phase 1: Parse SHA256SUM file to collect candidate tiles
+    candidates = []
 
-    # Progress tracking
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -494,20 +515,19 @@ def create_landmasks_parquet_database(base_dir, output_path, console):
                                     lon = float(lon_str)
                                     lat = float(lat_str)
 
-                                    # Get file size
                                     file_path = os.path.join(base_dir, filename)
-                                    file_size = (
-                                        os.path.getsize(file_path)
-                                        if os.path.exists(file_path)
-                                        else 0
-                                    )
+                                    if not os.path.exists(file_path):
+                                        continue
 
-                                    records.append(
+                                    file_size = os.path.getsize(file_path)
+
+                                    candidates.append(
                                         {
                                             "lat": lat,
                                             "lon": lon,
                                             "hash": checksum,
                                             "file_size": file_size,
+                                            "file_path": file_path,
                                         }
                                     )
                                 except (ValueError, IndexError):
@@ -519,11 +539,80 @@ def create_landmasks_parquet_database(base_dir, output_path, console):
             console.print(f"[red]Error reading SHA256SUM file: {e}[/red]")
             return False
 
-        if not records:
-            console.print("[red]No landmask tiles found in SHA256SUM file[/red]")
-            return False
+    if not candidates:
+        console.print("[red]No landmask tiles found in SHA256SUM file[/red]")
+        return False
 
-        # Convert to GeoParquet
+    # Phase 2: Validate TIFFs in parallel, skip all-zero (ocean-only) tiles
+    records = []
+    skipped_ocean = 0
+    num_workers = min(multiprocessing.cpu_count(), 16)
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TextColumn("•"),
+        TextColumn("[dim]{task.fields[status]}", justify="left"),
+        console=console,
+    ) as progress:
+        validate_task = progress.add_task(
+            "Validating landmask TIFFs...",
+            total=len(candidates),
+            status=f"0 land / 0 ocean ({num_workers} workers)",
+        )
+
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            future_to_candidate = {
+                executor.submit(_check_tiff_has_land, c["file_path"]): c
+                for c in candidates
+            }
+
+            for future in as_completed(future_to_candidate):
+                candidate = future_to_candidate[future]
+                try:
+                    has_land = future.result()
+                except Exception:
+                    has_land = False
+
+                if has_land:
+                    records.append(
+                        {
+                            "lat": candidate["lat"],
+                            "lon": candidate["lon"],
+                            "hash": candidate["hash"],
+                            "file_size": candidate["file_size"],
+                        }
+                    )
+                else:
+                    skipped_ocean += 1
+
+                progress.update(
+                    validate_task,
+                    advance=1,
+                    status=f"{len(records):,} land / {skipped_ocean:,} ocean",
+                )
+
+    if skipped_ocean > 0:
+        console.print(
+            f"[yellow]Skipped {skipped_ocean:,} ocean-only TIFFs (all-zero data)[/yellow]"
+        )
+
+    if not records:
+        console.print("[red]No land tiles found after validation[/red]")
+        return False
+
+    # Phase 3: Convert to GeoParquet
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TextColumn("•"),
+        TextColumn("[dim]{task.fields[status]}", justify="left"),
+        console=console,
+    ) as progress:
         parquet_task = progress.add_task(
             "Creating GeoParquet database...",
             total=100,
@@ -560,6 +649,7 @@ def create_landmasks_parquet_database(base_dir, output_path, console):
             ) as temp_file:
                 temp_path = temp_file.name
 
+            os.chmod(temp_path, 0o644)
             gdf.to_parquet(temp_path, compression="zstd", index=False)
             os.rename(temp_path, output_path)
 
@@ -576,6 +666,7 @@ def create_landmasks_parquet_database(base_dir, output_path, console):
     # Summary table
     summary_table = Table(show_header=False, box=None)
     summary_table.add_row("📊 Records:", f"{len(records):,}")
+    summary_table.add_row("🚫 Skipped ocean:", f"{skipped_ocean:,}")
     summary_table.add_row("💾 File size:", f"{file_size:,} bytes")
     summary_table.add_row(
         "🌍 Coordinates:",
@@ -713,6 +804,7 @@ def create_parquet_database_from_filesystem(base_dir, output_path, console):
             ) as temp_file:
                 temp_path = temp_file.name
 
+            os.chmod(temp_path, 0o644)
             gdf.to_parquet(temp_path, compression="zstd", index=False)
             os.rename(temp_path, output_path)
 
@@ -816,6 +908,32 @@ def check_command(args):
 
     checked_tiles = 0
 
+    truncated_files: list = []
+
+    def _check_npy_integrity(path: str) -> Optional[str]:
+        """Verify a .npy file header matches its file size.
+
+        Returns an error message if truncated, None if OK.
+        """
+        try:
+            file_size = os.path.getsize(path)
+            # Read numpy header to get dtype and shape without mmap
+            with open(path, "rb") as f:
+                version = np.lib.format.read_magic(f)
+                shape, fortran, dtype = np.lib.format._read_array_header(f, version)
+                header_size = f.tell()
+            expected_data = int(np.prod(shape)) * dtype.itemsize
+            expected_total = header_size + expected_data
+            if file_size < expected_total:
+                return (
+                    f"truncated: {file_size:,} bytes on disk, "
+                    f"expected {expected_total:,} "
+                    f"(shape={shape}, dtype={dtype})"
+                )
+        except Exception as e:
+            return f"unreadable: {e}"
+        return None
+
     def validate_tile(tile_info: TileInfo):
         """Callback to validate each tile."""
         nonlocal checked_tiles
@@ -826,6 +944,13 @@ def check_command(args):
             raise FileNotFoundError(f"Missing embedding: {tile_info.embedding_path}")
         if not os.path.exists(tile_info.scales_path):
             raise FileNotFoundError(f"Missing scales: {tile_info.scales_path}")
+
+        # Check .npy file integrity (detects truncated downloads)
+        for path in [tile_info.embedding_path, tile_info.scales_path]:
+            if path.endswith(".npy"):
+                err = _check_npy_integrity(path)
+                if err is not None:
+                    truncated_files.append((path, err))
 
         # Verify hashes if requested
         if verify_hashes:
@@ -875,21 +1000,48 @@ def check_command(args):
             return 1
 
     # Show results
+    has_errors = len(truncated_files) > 0
     summary_table = Table(show_header=False, box=None)
-    summary_table.add_row("🔍 Tiles checked:", f"{checked_tiles:,}")
-    summary_table.add_row("✅ Status:", "All checks passed")
+    summary_table.add_row("Tiles checked:", f"{checked_tiles:,}")
+    summary_table.add_row("Truncated files:", f"{len(truncated_files):,}")
     if verify_hashes:
-        summary_table.add_row("🔐 Hash verification:", "All hashes verified")
+        summary_table.add_row("Hash verification:", "All hashes verified")
     else:
-        summary_table.add_row("🔐 Hash verification:", "Skipped (use --verify-hashes)")
+        summary_table.add_row("Hash verification:", "Skipped (use --verify-hashes)")
 
-    console.print(
-        Panel(
-            summary_table,
-            title="[bold green]✅ Tessera Structure Check Complete[/bold green]",
-            border_style="green",
+    if has_errors:
+        console.print(
+            Panel(
+                summary_table,
+                title="[bold red]Tessera Structure Check: errors found[/bold red]",
+                border_style="red",
+            )
         )
-    )
+        console.print(
+            f"\n[red]Truncated .npy files ({len(truncated_files)}):[/red]"
+        )
+        for path, err in sorted(truncated_files):
+            console.print(f"  {path}")
+            console.print(f"    [dim]{err}[/dim]")
+
+        # Write truncated files list
+        output_dir = Path(base_dir)
+        truncated_file = output_dir / "truncated_files.txt"
+        with open(truncated_file, "w") as f:
+            for path, err in sorted(truncated_files):
+                f.write(f"{path}\t{err}\n")
+        console.print(
+            f"\n[dim]Truncated file list written to {truncated_file}[/dim]"
+        )
+    else:
+        summary_table.add_row("Status:", "All checks passed")
+        console.print(
+            Panel(
+                summary_table,
+                title="[bold green]Tessera Structure Check Complete[/bold green]",
+                border_style="green",
+            )
+        )
 
     # Display warning summary if there are any skipped directories
     if warnings:
@@ -935,7 +1087,7 @@ def check_command(args):
                 f"[dim]Written {len(missing_scales)} paths to {missing_scales_file}[/dim]"
             )
 
-    return 0
+    return 1 if has_errors else 0
 
 
 def list_command(args):
@@ -1433,39 +1585,48 @@ def scan_command(args):
     repr_dir = os.path.join(base_dir, "global_0.1_degree_representation")
     tiles_dir = os.path.join(base_dir, "global_0.1_degree_tiff_all")
 
+    only = getattr(args, "only", None)
+
     # Create embeddings Parquet database
     embeddings_parquet_path = os.path.join(output_dir, "registry.parquet")
-    if os.path.exists(repr_dir):
-        if not create_parquet_database_from_filesystem(
-            base_dir, embeddings_parquet_path, console
-        ):
-            console.print("[red]Failed to create embeddings parquet database[/red]")
+    if only in (None, "embeddings"):
+        if os.path.exists(repr_dir):
+            if not create_parquet_database_from_filesystem(
+                base_dir, embeddings_parquet_path, console
+            ):
+                console.print(
+                    "[red]Failed to create embeddings parquet database[/red]"
+                )
+                return 1
+        else:
+            console.print(
+                f"[red]Error: Embeddings directory not found: {repr_dir}[/red]"
+            )
             return 1
-    else:
-        console.print(f"[red]Error: Embeddings directory not found: {repr_dir}[/red]")
-        return 1
 
     # Create landmasks Parquet database
     landmasks_parquet_path = os.path.join(output_dir, "landmasks.parquet")
-    if os.path.exists(tiles_dir):
-        if not create_landmasks_parquet_database(
-            tiles_dir, landmasks_parquet_path, console
-        ):
+    if only in (None, "landmasks"):
+        if os.path.exists(tiles_dir):
+            if not create_landmasks_parquet_database(
+                tiles_dir, landmasks_parquet_path, console
+            ):
+                console.print(
+                    "[yellow]Warning: Failed to create landmasks parquet database[/yellow]"
+                )
+                # Don't return error, landmasks are optional
+        else:
             console.print(
-                "[yellow]Warning: Failed to create landmasks parquet database[/yellow]"
+                f"[yellow]Warning: Landmasks directory not found: {tiles_dir}[/yellow]"
             )
-            # Don't return error, landmasks are optional
-    else:
-        console.print(
-            f"[yellow]Warning: Landmasks directory not found: {tiles_dir}[/yellow]"
-        )
 
     # Show final summary
     summary_lines = ["[green]✅ Registry Generation Complete[/green]\n"]
     summary_lines.append("📊 Generated outputs:")
     summary_lines.append("• Parquet databases:")
-    summary_lines.append(f"  → {embeddings_parquet_path} (embeddings)")
-    if os.path.exists(landmasks_parquet_path):
+    if only in (None, "embeddings"):
+        summary_lines.append(f"  → {embeddings_parquet_path} (embeddings)")
+    if only in (None, "landmasks") and os.path.exists(landmasks_parquet_path):
         summary_lines.append(f"  → {landmasks_parquet_path} (landmasks)")
     summary_lines.append(f"📁 Output directory: {output_dir}")
 
@@ -2316,12 +2477,24 @@ def file_scan_command(args):
     df["lon_i"] = (df["lon"] * 100).round().astype(np.int32)
     df["lat_i"] = (df["lat"] * 100).round().astype(np.int32)
 
-    # Save to parquet
+    # Save to parquet (atomic write via temp file + rename)
+    import tempfile
+
     try:
-        # Create output directory if it doesn't exist
         output_file.parent.mkdir(parents=True, exist_ok=True)
 
-        df.to_parquet(output_file, index=False)
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=output_file.parent,
+            prefix=f".{output_file.name}_tmp_",
+            suffix=".parquet",
+            delete=False,
+        ) as temp_file:
+            temp_path = temp_file.name
+
+        os.chmod(temp_path, 0o644)
+        df.to_parquet(temp_path, index=False)
+        os.rename(temp_path, str(output_file))
 
         console.print(
             Panel.fit(
@@ -2361,6 +2534,8 @@ def file_scan_command(args):
         return 0
 
     except Exception as e:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
         console.print(f"[red]Error writing parquet file: {e}[/red]")
         import traceback
 
@@ -3162,6 +3337,12 @@ Directory Structure:
         type=str,
         default=None,
         help="Output directory for registry and parquet files (default: same as base_dir)",
+    )
+    scan_parser.add_argument(
+        "--only",
+        choices=["embeddings", "landmasks"],
+        default=None,
+        help="Only generate the specified parquet database (default: both)",
     )
     scan_parser.set_defaults(func=scan_command)
 
