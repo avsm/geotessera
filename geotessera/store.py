@@ -62,6 +62,35 @@ def _zone_for_lon(lon: float) -> int:
     return max(1, min(60, int(math.floor((lon + 180) / 6)) + 1))
 
 
+def _to_wgs84(
+    x: float, y: float, crs: str = "EPSG:4326",
+) -> Tuple[float, float]:
+    """Convert (x, y) in any CRS to WGS84 (lon, lat).  No-op if already 4326."""
+    if crs == "EPSG:4326":
+        return x, y
+    proj = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+    return proj.transform(x, y)
+
+
+def _zone_for_point(x: float, y: float, crs: str = "EPSG:4326") -> int:
+    """Determine UTM zone for a point in any CRS.
+
+    For UTM EPSG codes (326xx/327xx), extracts the zone directly.
+    Otherwise projects to WGS84 and computes from longitude.
+    """
+    from pyproj import CRS as ProjCRS
+
+    if crs != "EPSG:4326":
+        proj_crs = ProjCRS.from_user_input(crs)
+        utm_zone = proj_crs.utm_zone
+        if utm_zone is not None:
+            # pyproj returns e.g. "29N" or "30S"
+            return int(utm_zone[:-1])
+
+    lon, _ = _to_wgs84(x, y, crs)
+    return _zone_for_lon(lon)
+
+
 def open_zone(
     store_url: str = DEFAULT_STORE,
     *,
@@ -185,10 +214,27 @@ class TesseraAccessor:
 
     # -- Point sampling -----------------------------------------------------
 
-    def sample_at(self, lon: float, lat: float, year: int) -> np.ndarray:
-        """Sample a single dequantised embedding.  Returns ``(B,)`` float32."""
-        e, n = self._to_utm.transform(lon, lat)
-        log.debug("sample_at(%.6f, %.6f) → UTM(%.1f, %.1f)", lon, lat, e, n)
+    def sample_at(
+        self, x: float, y: float, year: int, *, crs: str = "EPSG:4326",
+    ) -> np.ndarray:
+        """Sample a single dequantised embedding.  Returns ``(B,)`` float32.
+
+        Args:
+            x: Easting or longitude.
+            y: Northing or latitude.
+            year: Year to sample.
+            crs: Input coordinate CRS (default WGS84).  Accepts any
+                pyproj-compatible CRS string.
+        """
+        if crs == f"EPSG:{self._epsg}":
+            e, n = x, y
+        elif crs == "EPSG:4326":
+            e, n = self._to_utm.transform(x, y)
+        else:
+            proj = Transformer.from_crs(crs, f"EPSG:{self._epsg}", always_xy=True)
+            e, n = proj.transform(x, y)
+
+        log.debug("sample_at(%.6f, %.6f, crs=%s) → UTM(%.1f, %.1f)", x, y, crs, e, n)
 
         # Use tile transform coords (xc/yc) if available, else regular (x/y)
         if "xc" in self._ds.coords:
@@ -210,13 +256,19 @@ class TesseraAccessor:
         coords: List[Tuple[float, float]],
         year: int,
         *,
+        crs: str = "EPSG:4326",
         progress: bool = True,
     ) -> np.ndarray:
-        """Sample embeddings at ``(lon, lat)`` points.  Returns ``(N, B)`` float32."""
+        """Sample embeddings at points.  Returns ``(N, B)`` float32.
+
+        Args:
+            coords: List of (x, y) tuples in the given CRS.
+            crs: Input coordinate CRS (default WGS84).
+        """
         it = coords
         if progress:
             it = track(coords, description="Sampling points...", transient=True)
-        return np.array([self.sample_at(lon, lat, year) for lon, lat in it])
+        return np.array([self.sample_at(x, y, year, crs=crs) for x, y in it])
 
     # -- Region reading -----------------------------------------------------
 
@@ -225,15 +277,29 @@ class TesseraAccessor:
         bbox: Tuple[float, float, float, float],
         year: int,
         *,
+        crs: str = "EPSG:4326",
         progress: bool = False,
     ) -> Tuple[np.ndarray, rasterio.transform.Affine]:
         """Read and dequantise a bbox region.
 
+        Args:
+            bbox: (x_min, y_min, x_max, y_max) in the given CRS.
+            crs: Input bbox CRS (default WGS84).
+
         Returns ``(mosaic, transform)`` where mosaic is ``(H, W, B)``
         float32 and transform is a rasterio Affine for the window.
         """
-        e_nw, n_nw = self._to_utm.transform(bbox[0], bbox[3])
-        e_se, n_se = self._to_utm.transform(bbox[2], bbox[1])
+        zone_crs = f"EPSG:{self._epsg}"
+        if crs == zone_crs:
+            e_nw, n_nw = bbox[0], bbox[3]
+            e_se, n_se = bbox[2], bbox[1]
+        elif crs == "EPSG:4326":
+            e_nw, n_nw = self._to_utm.transform(bbox[0], bbox[3])
+            e_se, n_se = self._to_utm.transform(bbox[2], bbox[1])
+        else:
+            proj = Transformer.from_crs(crs, zone_crs, always_xy=True)
+            e_nw, n_nw = proj.transform(bbox[0], bbox[3])
+            e_se, n_se = proj.transform(bbox[2], bbox[1])
         e_min, e_max = min(e_nw, e_se), max(e_nw, e_se)
         n_min, n_max = min(n_nw, n_se), max(n_nw, n_se)
 
@@ -332,22 +398,35 @@ class GeoTesseraZarr:
 
     # -- Point sampling (cross-zone) ----------------------------------------
 
-    def sample_at(self, lon: float, lat: float, year: int) -> np.ndarray:
+    def sample_at(
+        self, x: float, y: float, year: int, *, crs: str = "EPSG:4326",
+    ) -> np.ndarray:
         """Sample a single embedding, routing to the correct zone.
+
+        Args:
+            x: Easting or longitude.
+            y: Northing or latitude.
+            crs: Input CRS (default WGS84).
 
         Returns ``(B,)`` float32.
         """
-        ds = self.open_zone(lon=lon)
-        return ds.tessera.sample_at(lon, lat, year)
+        z = _zone_for_point(x, y, crs)
+        ds = self.open_zone(zone=z)
+        return ds.tessera.sample_at(x, y, year, crs=crs)
 
     def sample_points(
         self,
         coords: List[Tuple[float, float]],
         year: int,
         *,
+        crs: str = "EPSG:4326",
         progress: bool = True,
     ) -> np.ndarray:
-        """Sample embeddings at ``(lon, lat)`` points, routing each to its zone.
+        """Sample embeddings at points, routing each to its zone.
+
+        Args:
+            coords: List of (x, y) tuples in the given CRS.
+            crs: Input CRS (default WGS84).
 
         Returns ``(N, B)`` float32.  Points outside coverage get NaN rows.
         """
@@ -355,8 +434,8 @@ class GeoTesseraZarr:
         if progress:
             it = track(coords, description="Sampling points...", transient=True)
         return np.array([
-            self.open_zone(lon=lon).tessera.sample_at(lon, lat, year)
-            for lon, lat in it
+            self.sample_at(x, y, year, crs=crs)
+            for x, y in it
         ])
 
     # -- Region reading (dominant zone) -------------------------------------
@@ -366,19 +445,22 @@ class GeoTesseraZarr:
         bbox: Tuple[float, float, float, float],
         year: int,
         *,
+        crs: str = "EPSG:4326",
         progress: bool = False,
     ) -> Tuple[np.ndarray, rasterio.transform.Affine, str]:
         """Read and dequantise a bbox region.
 
+        Args:
+            bbox: (x_min, y_min, x_max, y_max) in the given CRS.
+            crs: Input bbox CRS (default WGS84).
+
         Uses the dominant UTM zone (from bbox centre).  Returns
         ``(mosaic, transform, crs)`` where mosaic is ``(H, W, B)`` float32.
         """
-        z_w = _zone_for_lon(bbox[0])
-        z_e = _zone_for_lon(bbox[2])
-        if z_w != z_e:
-            log.warning("Bbox spans UTM zones %d-%d, using zone %d (centre)",
-                        z_w, z_e, _zone_for_lon((bbox[0] + bbox[2]) / 2))
+        # Convert bbox centre to WGS84 for zone routing
+        cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+        z = _zone_for_point(cx, cy, crs)
 
-        ds = self.open_zone(bbox=bbox)
-        mosaic, transform = ds.tessera.read_region(bbox, year, progress=progress)
+        ds = self.open_zone(zone=z)
+        mosaic, transform = ds.tessera.read_region(bbox, year, crs=crs, progress=progress)
         return mosaic, transform, ds.tessera.crs
