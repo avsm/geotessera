@@ -104,28 +104,17 @@ def open_zone(
         **kwargs,
     )
 
-    # Check for tile transforms — these may not be in the consolidated
-    # metadata (written after zarr-init), so read zone attrs directly
-    # from zarr which always reads the zone's own zarr.json.
+    # Attach computed piecewise tile transform — reproduces the tile
+    # generation geometry (0.1° WGS84 → UTM projection) to compute
+    # exact per-pixel coordinates without stored metadata.
     from .tile_transform import TesseraTileTransform
     try:
-        import zarr as zarr_lib
-        # Read zone attrs directly, bypassing consolidated metadata at root
-        # (tile_transforms are added by zarr-fill after zarr-init freezes
-        # the consolidated metadata)
-        zone_grp = zarr_lib.open_group(
-            store_url, mode="r", path=f"utm{z:02d}",
-            use_consolidated=False,
-        )
-        zone_attrs = dict(zone_grp.attrs)
-        transform = TesseraTileTransform.from_zone_attrs(zone_attrs)
-    except Exception:
-        transform = None
-
-    if transform is not None:
+        transform = TesseraTileTransform.from_zone_attrs(ds.attrs)
         idx = xr.indexes.CoordinateTransformIndex(transform)
         ds = ds.assign_coords(xr.Coordinates.from_xindex(idx))
-        log.debug("Attached TesseraTileTransform with %d tiles", len(transform.tiles))
+        log.debug("Attached TesseraTileTransform for EPSG:%d", transform.epsg)
+    except Exception as exc:
+        log.debug("Could not attach tile transform: %s", exc)
 
     return ds
 
