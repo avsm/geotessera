@@ -34,7 +34,7 @@ from rich.progress import track
 
 log = logging.getLogger(__name__)
 
-DEFAULT_STORE = "https://dl2.geotessera.org/zarr/v3/store.zarr"
+DEFAULT_STORE = "https://dl2.geotessera.org/zarr/v2/store.zarr"
 
 # Shard-aligned chunk sizes so dask tasks match zarr shards
 SHARD_CHUNKS = {"time": 1, "band": 128, "y": 4096, "x": 4096}

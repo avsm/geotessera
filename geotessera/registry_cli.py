@@ -3482,7 +3482,7 @@ Directory Structure:
         help="Years to verify (default: 2017,2024,2025)",
     )
     verify_parser.add_argument(
-        "--store", default="https://dl2.geotessera.org/zarr/v3/store.zarr",
+        "--store", default="https://dl2.geotessera.org/zarr/v2/store.zarr",
         help="Zarr store URL",
     )
     verify_parser.set_defaults(func=verify_tile_command)
@@ -3496,7 +3496,7 @@ Directory Structure:
     print_parser.add_argument("--lat", type=float, required=True, help="Latitude")
     print_parser.add_argument("--year", type=int, required=True, help="Year")
     print_parser.add_argument(
-        "--store", default="https://dl2.geotessera.org/zarr/v3/store.zarr",
+        "--store", default="https://dl2.geotessera.org/zarr/v2/store.zarr",
         help="Zarr store URL",
     )
     print_parser.set_defaults(func=print_command)
