@@ -104,10 +104,24 @@ def open_zone(
         **kwargs,
     )
 
-    # Attach piecewise tile transform if available — enables exact per-pixel
-    # coordinates via CoordinateTransformIndex
+    # Check for tile transforms — these may not be in the consolidated
+    # metadata (written after zarr-init), so read zone attrs directly
+    # from zarr which always reads the zone's own zarr.json.
     from .tile_transform import TesseraTileTransform
-    transform = TesseraTileTransform.from_zone_attrs(ds.attrs)
+    try:
+        import zarr as zarr_lib
+        # Read zone attrs directly, bypassing consolidated metadata at root
+        # (tile_transforms are added by zarr-fill after zarr-init freezes
+        # the consolidated metadata)
+        zone_grp = zarr_lib.open_group(
+            store_url, mode="r", path=f"utm{z:02d}",
+            use_consolidated=False,
+        )
+        zone_attrs = dict(zone_grp.attrs)
+        transform = TesseraTileTransform.from_zone_attrs(zone_attrs)
+    except Exception:
+        transform = None
+
     if transform is not None:
         idx = xr.indexes.CoordinateTransformIndex(transform)
         ds = ds.assign_coords(xr.Coordinates.from_xindex(idx))
