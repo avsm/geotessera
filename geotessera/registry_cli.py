@@ -2993,10 +2993,10 @@ def verify_tile_command(args):
     table = Table(title=f"Tile verification at ({lon}, {lat})")
     table.add_column("Year", style="bold")
     table.add_column("Tile size")
-    table.add_column("Valid px")
-    table.add_column("Max |diff|")
-    table.add_column("Mean |diff|")
-    table.add_column("Match", style="bold")
+    table.add_column("Both valid")
+    table.add_column("Breakdown")
+    table.add_column("Overlap mean")
+    table.add_column("Status", style="bold")
 
     all_match = True
 
@@ -3008,7 +3008,7 @@ def verify_tile_command(args):
         # Download the NPY tile covering this point
         try:
             tiles_needed = gt.registry.load_blocks_for_region(
-                (lon - 0.001, lat - 0.001, lon + 0.001, lat + 0.001), year,
+                (lon - 0.005, lat - 0.005, lon + 0.005, lat + 0.005), year,
             )
             if not tiles_needed:
                 table.add_row(str(year), "-", "-", "-", "-", "[yellow]no tile[/yellow]")
@@ -3017,7 +3017,12 @@ def verify_tile_command(args):
             tile_map = gt._ensure_tiles_available(
                 required_coords=coords, year=year, auto_download=True, bbox=None,
             )
-            tile = next(t for t in tile_map.values() if t.is_available())
+            # Pick the tile that matches the registry result, not just any available tile
+            target_coord = next(iter(coords))
+            tile = tile_map.get(target_coord)
+            if tile is None or not tile.is_available():
+                table.add_row(str(year), "-", "-", "-", "-", "[yellow]tile not available[/yellow]")
+                continue
             npy_emb = tile.load_embedding()  # (H, W, 128) float32
         except Exception as e:
             table.add_row(str(year), "-", "-", "-", "-", f"[red]NPY error: {e}[/red]")
@@ -3028,29 +3033,27 @@ def verify_tile_command(args):
         tile_transform = tile.transform
         tile_crs = tile.crs
 
-        # Read the exact zarr pixels that zarr-fill placed this tile's data
-        # into.  The fill code uses round((tile_origin - grid_origin) / px)
-        # to compute the zarr index for tile pixel (0,0).  We replicate that
-        # to get the exact indices, then read via isel and dequantise via
-        # the accessor.
+        # Map NPY tile pixels to zarr indices using the same logic as
+        # zarr-fill: tile origin → zarr offset via round(), then add
+        # the pixel's position within the tile.
         #
-        # Note: sel(method='nearest') with the NPY pixel centres does NOT
-        # work here because the NPY and zarr grids are offset by up to ~5m
-        # (the NPY tile origin has a sub-10m offset from the Sentinel-2
-        # processing while the zarr snaps to a regular 10m grid).
+        # zarr_row = round((zarr_origin_y - tile_origin_y) / px) + tile_row
+        # zarr_col = round((tile_origin_x - zarr_origin_x) / px) + tile_col
         try:
             px = tile_transform.a
             ds = gz.open_zone(lon=lon)
             t_attr = ds.attrs["spatial:transform"]
-            grid_origin_x, grid_origin_y = t_attr[2], t_attr[5]
+            zarr_ox, zarr_oy = t_attr[2], t_attr[5]
 
-            zarr_col0 = round((tile_transform.c - grid_origin_x) / px)
-            zarr_row0 = round((grid_origin_y - tile_transform.f) / px)
+            # Where zarr-fill placed tile pixel (0,0)
+            tile_row0 = round((zarr_oy - tile_transform.f) / px)
+            tile_col0 = round((tile_transform.c - zarr_ox) / px)
 
+            # Read the tile-sized slab: zarr[tile_row0:tile_row0+h, tile_col0:tile_col0+w]
             sub = ds.isel(
                 time=gz.years.index(year),
-                y=slice(zarr_row0, zarr_row0 + h),
-                x=slice(zarr_col0, zarr_col0 + w),
+                y=slice(tile_row0, tile_row0 + h),
+                x=slice(tile_col0, tile_col0 + w),
             )
             scales = sub["scales"].values
             emb_int8 = sub["embeddings"].values
@@ -3070,32 +3073,174 @@ def verify_tile_command(args):
             table.add_row(str(year), f"{h}x{w}", "0", "-", "-", "[yellow]no valid pixels[/yellow]")
             continue
 
-        diff = np.abs(npy_emb[both_valid] - zarr_emb[both_valid])
-        max_diff = float(diff.max())
-        mean_diff = float(diff.mean())
-        exact = max_diff == 0.0
-        size_note = f"{h}x{w}"
+        # Categorise every pixel
+        exact_match = both_valid & (np.abs(npy_emb - zarr_emb).max(axis=2) == 0)
+        water_masked = npy_valid & np.isnan(scales)  # NPY has data, zarr is NaN (water)
+        overlap_diff = both_valid & ~exact_match           # both finite, different values
+        npy_nodata = ~npy_valid                            # NPY is NaN
 
-        if exact:
-            table.add_row(
-                str(year), size_note, f"{n_valid:,}", "0", "0",
-                "[green]PASS[/green]",
-            )
-        else:
-            table.add_row(
-                str(year), size_note, f"{n_valid:,}",
-                f"{max_diff:.8f}", f"{mean_diff:.8f}",
-                "[red]FAIL[/red]",
-            )
+        n_exact = int(exact_match.sum())
+        n_water = int(water_masked.sum())
+        n_overlap = int(overlap_diff.sum())
+        n_nodata = int(npy_nodata.sum())
+
+        table.add_row(
+            str(year), f"{h}x{w}", f"{n_valid:,}",
+            f"{n_exact:,} exact" if n_exact == n_valid else
+            f"[green]{n_exact:,}[/green] match, [cyan]{n_water:,}[/cyan] water, [yellow]{n_overlap:,}[/yellow] overlap",
+            f"{float(np.abs(npy_emb[overlap_diff] - zarr_emb[overlap_diff]).mean()):.4f}" if n_overlap > 0 else "-",
+            "[green]PASS[/green]" if n_overlap == 0 and n_water == 0 else
+            f"[yellow]{n_water + n_overlap:,} differ[/yellow]",
+        )
+        if n_overlap > 0 or n_water > 0:
             all_match = False
+
+        # Build RGB preview from first 3 NPY embedding bands (stretch to 0-255)
+        import rasterio
+        emb_rgb = np.zeros((h, w, 3), dtype=np.uint8)
+        for b in range(3):
+            band = npy_emb[:, :, b].copy()
+            valid_band = band[npy_valid]
+            if len(valid_band) > 0:
+                lo = np.percentile(valid_band, 2)
+                hi = np.percentile(valid_band, 98)
+                if hi > lo:
+                    band = np.clip((band - lo) / (hi - lo), 0, 1)
+                else:
+                    band = np.zeros_like(band)
+            emb_rgb[:, :, b] = (band * 255).astype(np.uint8)
+        emb_rgb[~npy_valid] = 0
+
+        # Diagnostic overlay: green=match, cyan=water, yellow=overlap
+        rgba = np.zeros((h, w, 4), dtype=np.uint8)
+        rgba[exact_match] = [0, 200, 0, 100]      # green, light
+        rgba[water_masked] = [0, 200, 200, 200]    # cyan, strong
+        rgba[overlap_diff] = [255, 200, 0, 200]    # yellow, strong
+        rgba[npy_nodata] = [0, 0, 0, 0]            # transparent
+
+        # Fetch satellite basemap and composite embedding RGB + overlay on top
+        import rasterio
+        from rasterio.warp import calculate_default_transform, reproject, Resampling
+
+        from datetime import datetime as _dt
+        ts = _dt.now().strftime("%H%M%S")
+        tif_path = f"verify_{year}_{ts}.tif"
+        try:
+            import contextily as cx
+            from pyproj import Transformer as ProjTransformer
+
+            # Get tile extent in WGS84 for basemap fetch
+            epsg = int(str(tile_crs).split(":")[1])
+            to_wgs = ProjTransformer.from_crs(f"EPSG:{epsg}", "EPSG:4326", always_xy=True)
+            tile_east = tile_transform.c + w * px
+            tile_south = tile_transform.f - h * px
+            lon_w, lat_s = to_wgs.transform(tile_transform.c, tile_south)
+            lon_e, lat_n = to_wgs.transform(tile_east, tile_transform.f)
+
+            # Fetch basemap in Web Mercator (contextily native)
+            import tempfile, os
+            with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
+                tmp_path = tmp.name
+            cx.bounds2raster(
+                lon_w, lat_s, lon_e, lat_n,
+                ll=True,
+                path=tmp_path,
+                source=cx.providers.Esri.WorldImagery,
+                zoom="auto",
+            )
+            basemap_ds = rasterio.open(tmp_path)
+            basemap = basemap_ds.read()  # (3, bh, bw) or (4, bh, bw)
+            basemap_extent = basemap_ds.transform
+            basemap_crs = basemap_ds.crs
+            basemap_ds.close()
+            os.unlink(tmp_path)
+
+            # Reproject basemap to tile's UTM CRS at the tile's resolution
+            dst_transform = tile_transform
+            n_bands_bm = min(3, basemap.shape[0])  # may have alpha
+            base_utm = np.zeros((3, h, w), dtype=np.uint8)
+            for band in range(n_bands_bm):
+                reproject(
+                    source=basemap[band],
+                    destination=base_utm[band],
+                    src_transform=basemap_extent,
+                    src_crs=basemap_crs,
+                    dst_transform=dst_transform,
+                    dst_crs=f"EPSG:{epsg}",
+                    resampling=Resampling.bilinear,
+                )
+
+            # Composite: basemap → embedding bands (40% opacity) → diagnostic overlay
+            composite = base_utm.copy()  # (3, H, W)
+
+            # Blend embedding RGB onto basemap at 40% opacity
+            emb_alpha = 0.4
+            for band in range(3):
+                bg = composite[band].astype(np.float32)
+                fg = emb_rgb[:, :, band].astype(np.float32)
+                composite[band] = (fg * emb_alpha + bg * (1 - emb_alpha)).astype(np.uint8)
+
+            # Blend diagnostic overlay on top
+            diag_alpha = rgba[:, :, 3].astype(np.float32) / 255.0
+            for band in range(3):
+                fg = rgba[:, :, band].astype(np.float32)
+                bg = composite[band].astype(np.float32)
+                composite[band] = (fg * diag_alpha + bg * (1 - diag_alpha)).astype(np.uint8)
+
+            # Draw crosshair marker at the query lon/lat
+            from pyproj import Transformer as _ProjT
+            _to_utm = _ProjT.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True)
+            mark_e, mark_n = _to_utm.transform(lon, lat)
+            mark_row, mark_col = rasterio.transform.rowcol(tile_transform, mark_e, mark_n)
+            if 0 <= mark_row < h and 0 <= mark_col < w:
+                arm = 12
+                marker_color = [255, 0, 0]
+                for dr in range(-arm, arm + 1):
+                    for dt in range(-1, 2):
+                        for r, c in [(mark_row + dt, mark_col + dr),
+                                     (mark_row + dr, mark_col + dt)]:
+                            if 0 <= r < h and 0 <= c < w:
+                                for b in range(3):
+                                    composite[b, r, c] = marker_color[b]
+            else:
+                console.print(f"  [yellow]Crosshair out of tile bounds: pixel ({mark_row}, {mark_col}), tile {h}x{w}[/yellow]")
+
+            # Write composited GeoTIFF (RGB, no alpha)
+            with rasterio.open(
+                tif_path, "w", driver="GTiff",
+                height=h, width=w, count=3, dtype="uint8",
+                crs=str(tile_crs), transform=tile_transform,
+                compress="lzw",
+            ) as dst:
+                dst.write(composite)
+            console.print(f"  Wrote [bold]{tif_path}[/bold] (with satellite basemap)")
+
+        except ImportError:
+            # contextily not available — composite embedding bands + overlay
+            composite = np.zeros((3, h, w), dtype=np.uint8)
+            for band in range(3):
+                composite[band] = emb_rgb[:, :, band]
+            diag_alpha = rgba[:, :, 3].astype(np.float32) / 255.0
+            for band in range(3):
+                fg = rgba[:, :, band].astype(np.float32)
+                bg = composite[band].astype(np.float32)
+                composite[band] = (fg * diag_alpha + bg * (1 - diag_alpha)).astype(np.uint8)
+            with rasterio.open(
+                tif_path, "w", driver="GTiff",
+                height=h, width=w, count=3, dtype="uint8",
+                crs=str(tile_crs), transform=tile_transform,
+                compress="lzw",
+            ) as dst:
+                dst.write(composite)
+            console.print(f"  Wrote [bold]{tif_path}[/bold] (embedding bands + overlay)")
 
     console.print(table)
 
     if all_match:
-        console.print(f"\n[green]All {len(years)} years match exactly.[/green]")
+        console.print(f"\n[green]All years match exactly.[/green]")
         return 0
     else:
-        console.print(f"\n[red]Some years did not match.[/red]")
+        console.print(f"\n[yellow]Some pixels differ (see verify_{{year}}.tif overlays).[/yellow]")
         return 1
 
 

@@ -40,6 +40,7 @@ dependencies = [
     "fsspec",
     "aiohttp",
     "geozarr-toolkit",
+    "contextily",
 ]
 
 [project.urls]
