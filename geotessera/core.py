@@ -1598,37 +1598,26 @@ class GeoTessera:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Create a wrapper callback to handle two-phase progress
-        def fetch_progress_callback(current: int, total: int, status: str = None):
-            # Phase 1: Fetching tiles (0-50% of total progress)
-            overall_progress = int((current / total) * 50)
-            display_status = status or f"Fetching tile {current}/{total}"
-            progress_callback(overall_progress, 100, display_status)
-
         # Fetch tiles with progress tracking
         if progress_callback:
-            progress_callback(0, 100, "Loading registry blocks...")
+            progress_callback(0, 100, "Starting download...")
 
-        tiles = list(
-            self.fetch_embeddings(
-                tiles_to_fetch, fetch_progress_callback if progress_callback else None
-            )
-        )
-        if progress_callback:
-            total_tiles = len(tiles_to_fetch)
+        tiles_to_fetch = list(tiles_to_fetch)
+        total_tiles = len(tiles_to_fetch)
 
-        if not tiles:
-            self.logger.warning("No tiles found in bounding box")
+        if total_tiles == 0:
+            self.logger.info("No tiles to export")
+            if progress_callback:
+                progress_callback(100, 100, "No tiles to export")
             return []
 
-        if progress_callback:
-            progress_callback(
-                50, 100, f"Fetched {total_tiles} tiles, starting GeoTIFF export..."
-            )
+        tiles = self.fetch_embeddings(
+            tiles_to_fetch, progress_callback if progress_callback else None
+        )
 
         created_files = []
 
-        # Sequential GeoTIFF writing
+        # Sequential fetching of tile data and writing GeoTIFFs
         for i, (year, tile_lon, tile_lat, embedding, crs, transform) in enumerate(
             tiles
         ):
@@ -1636,13 +1625,6 @@ class GeoTessera:
             geotiff_rel_path = tile_to_geotiff_path(tile_lon, tile_lat, year)
             output_path = output_dir / EMBEDDINGS_DIR_NAME / geotiff_rel_path
             output_path.parent.mkdir(parents=True, exist_ok=True)
-
-            # Update progress to show we're starting this file
-            if progress_callback:
-                export_progress = int(50 + (i / total_tiles) * 50)
-                progress_callback(
-                    export_progress, 100, f"Creating {output_path.name}..."
-                )
 
             # Select bands
             if bands is not None:
@@ -1697,20 +1679,19 @@ class GeoTessera:
 
             # Update progress for GeoTIFF export phase
             if progress_callback:
-                # Phase 2: Exporting GeoTIFFs (50-100% of total progress)
-                export_progress = int(50 + ((i + 1) / total_tiles) * 50)
                 progress_callback(
-                    export_progress,
-                    100,
+                    i + 1,
+                    total_tiles,
                     f"Exported {output_path.name} ({i + 1}/{total_tiles})",
                 )
 
         if progress_callback:
             progress_callback(
-                100, 100, f"Completed! Exported {len(created_files)} GeoTIFF files"
+                total_tiles, total_tiles,
+                f"Completed! Exported {len(created_files)} GeoTIFF file(s)"
             )
 
-        self.logger.info(f"Exported {len(created_files)} GeoTIFF files to {output_dir}")
+        self.logger.info(f"Exported {len(created_files)} GeoTIFF file(s) to {output_dir}")
         return created_files
 
     def merge_geotiffs_to_mosaic(

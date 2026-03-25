@@ -29,6 +29,7 @@ from geotessera.registry import (
     tile_from_world,
     tile_to_landmask_filename,
     tile_to_embedding_paths,
+    tile_to_geotiff_path,
 )
 from rich.progress import Progress, TaskID, BarColumn, TextColumn, TimeRemainingColumn
 from rich.table import Table
@@ -1353,20 +1354,46 @@ def download(
 
             match format:
                 case "tiff":
-                    # Export as GeoTIFF files
-                    files = gt.export_embedding_geotiffs(
-                        tiles_to_fetch,
-                        output_dir=output,
-                        bands=bands_list,
-                        compress=compress,
-                        progress_callback=create_download_progress_callback(
-                            progress, task
-                        ),
-                    )
+                    skipped_files = 0
+                    filtered_tiles = []
+                    for tile_year, tile_lon, tile_lat in tiles_to_fetch:
+                        geotiff_path = (
+                            output
+                            / EMBEDDINGS_DIR_NAME
+                            / tile_to_geotiff_path(tile_lon, tile_lat, tile_year)
+                        )
+                        if geotiff_path.exists():
+                            skipped_files += 1
+                        else:
+                            filtered_tiles.append((tile_year, tile_lon, tile_lat))
 
-                    rprint(
-                        f"\n[green]{emoji('✅ ')}SUCCESS: Exported {len(files)} GeoTIFF files[/green]"
-                    )
+                    total_tiles = len(filtered_tiles)
+                    progress.update(task, total=max(total_tiles, 1), completed=0)
+
+                    if not filtered_tiles:
+                        progress.update(task, completed=1, status="Complete")
+                        files = []
+                    else:
+                        files = gt.export_embedding_geotiffs(
+                            filtered_tiles,
+                            output_dir=output,
+                            bands=bands_list,
+                            compress=compress,
+                            progress_callback=create_download_progress_callback(
+                                progress, task
+                            ),
+                        )
+
+                    if not filtered_tiles:
+                        rprint(
+                            f"\n[green]{emoji('✅ ')}SUCCESS: All {len(tiles_to_fetch)} GeoTIFF(s) already exist[/green]"
+                        )
+                    else:
+                        rprint(
+                            f"\n[green]{emoji('✅ ')}SUCCESS: Exported {len(files)} GeoTIFF(s)"
+                            + (f" ({skipped_files} skipped)" if skipped_files > 0 else "")
+                            + "[/green]"
+                        )
                     rprint(
                         "   Each file preserves its native UTM projection from landmask tiles"
                     )
