@@ -2811,18 +2811,27 @@ def zarr_rgb_command(args):
     root = zarr.open_group(str(store_path), mode="r", use_consolidated=False)
     root_attrs = dict(root.attrs)
     all_years = root_attrs.get("tessera:years", [])
-    if not all_years:
-        console.print("[red]Error: not a tessera store (no tessera:years)[/red]")
-        return 1
-
-    years = _parse_year_range(args.years) if args.years else all_years
-    zones = _parse_zone_list(args.zones) if args.zones else None
 
     zone_pattern = re.compile(r"^utm(\d{2})$")
     all_zone_nums = sorted(
         int(m.group(1)) for name in root.keys()
         if (m := zone_pattern.match(name))
     )
+
+    # Derive years from first zone's time coord if not in root attrs
+    if not all_years and all_zone_nums:
+        try:
+            time_arr = root[f"utm{all_zone_nums[0]:02d}"]["time"][:]
+            all_years = [int(v) for v in time_arr]
+        except Exception:
+            pass
+    if not all_years:
+        console.print("[red]Error: could not determine years from store[/red]")
+        return 1
+
+    years = _parse_year_range(args.years) if args.years else all_years
+    zones = _parse_zone_list(args.zones) if args.zones else None
+
     target_zones = [z for z in all_zone_nums if zones is None or z in zones]
 
     console.print(f"Generating RGB previews for [bold]{store_path}[/bold]")
@@ -2858,8 +2867,19 @@ def zarr_global_preview_command(args):
     root = zarr.open_group(str(store_path), mode="r", use_consolidated=False)
     root_attrs = dict(root.attrs)
     all_years = root_attrs.get("tessera:years", [])
+    # Derive years from first zone's time coord if not in root attrs
     if not all_years:
-        console.print("[red]Error: not a tessera store (no tessera:years)[/red]")
+        import re as _re
+        for name in sorted(root.keys()):
+            if _re.match(r"^utm\d{2}$", name):
+                try:
+                    time_arr = root[name]["time"][:]
+                    all_years = [int(v) for v in time_arr]
+                    break
+                except Exception:
+                    continue
+    if not all_years:
+        console.print("[red]Error: could not determine years from store[/red]")
         return 1
 
     year = args.year
@@ -2879,6 +2899,131 @@ def zarr_global_preview_command(args):
         console=console,
         force=args.force,
     )
+
+    return 0
+
+
+def migrate_metadata_command(args):
+    """Rewrite zarr store attrs from tessera: to geoemb: convention."""
+    import re
+    import warnings
+    import zarr
+    from rich.console import Console
+    from .zarr import GEOEMB_CONVENTION
+
+    console = Console()
+    store_path = Path(args.store_path)
+    dry_run = args.dry_run
+
+    if dry_run:
+        console.print(f"[bold yellow]DRY RUN[/bold yellow] — no changes will be written")
+
+    console.print(f"Migrating metadata for [bold]{store_path}[/bold]")
+
+    root = zarr.open_group(str(store_path), mode="r" if dry_run else "r+",
+                           zarr_format=3, use_consolidated=False)
+    root_attrs = dict(root.attrs)
+
+    # --- Root group changes ---
+    old_build_version = root_attrs.get("tessera:build_version", "")
+    old_model_version = root_attrs.get("tessera:model_version", "1.0")
+    old_n_bands = root_attrs.get("tessera:n_bands", 128)
+
+    # Keys to remove from root
+    root_remove_keys = [
+        "tessera:dataset_version",
+        "tessera:years",
+        "tessera:model_version",
+        "tessera:build_version",
+    ]
+
+    # New root attrs
+    new_root_attrs = {
+        "geoemb:type": "pixel",
+        "geoemb:dimensions": int(old_n_bands),
+        "geoemb:model": f"https://geotessera.org/model/{old_model_version}",
+        "geoemb:source_data": [
+            "https://sentinel.esa.int/web/sentinel/missions/sentinel-1",
+            "https://sentinel.esa.int/web/sentinel/missions/sentinel-2",
+        ],
+        "geoemb:data_type": "int8",
+        "geoemb:gsd": 10.0,
+        "geoemb:spatial_layout": "utm_zones",
+        "geoemb:build_version": old_build_version,
+        "geoemb:quantization": {
+            "method": "per_pixel_scale",
+            "original_dtype": "float32",
+            "quantized_dtype": "int8",
+            "scale_array": "scales",
+            "nodata": "+inf",
+        },
+    }
+
+    # Update zarr_conventions on root: replace tessera entry with geoemb
+    old_conventions = root_attrs.get("zarr_conventions", [])
+    new_conventions = [
+        c for c in old_conventions
+        if c.get("name") != "tessera:"
+    ]
+    new_conventions.insert(0, GEOEMB_CONVENTION)
+
+    console.print(f"\n  [bold]Root group:[/bold]")
+    for key in root_remove_keys:
+        if key in root_attrs:
+            console.print(f"    Remove: {key} = {root_attrs[key]!r}")
+    for key, val in new_root_attrs.items():
+        console.print(f"    Add: {key} = {val!r}")
+    console.print(f"    Update: zarr_conventions → geoemb: entry")
+
+    if not dry_run:
+        for key in root_remove_keys:
+            if key in root_attrs:
+                del root.attrs[key]
+        root.attrs.update(new_root_attrs)
+        root.attrs["zarr_conventions"] = new_conventions
+
+    # --- Zone group changes ---
+    zone_pattern = re.compile(r"^utm(\d{2})$")
+    zone_names = sorted(
+        name for name in root.keys()
+        if zone_pattern.match(name)
+    )
+
+    for zone_name in zone_names:
+        console.print(f"\n  [bold]Zone {zone_name}:[/bold]")
+        zone_grp = root[zone_name]
+        zone_attrs = dict(zone_grp.attrs)
+
+        # Remove ALL tessera:* attributes from zone
+        tessera_keys = [k for k in zone_attrs if k.startswith("tessera:")]
+        for key in tessera_keys:
+            console.print(f"    Remove: {key} = {zone_attrs[key]!r}")
+
+        # Update zarr_conventions: remove tessera entry, keep proj: and spatial:
+        zone_conventions = zone_attrs.get("zarr_conventions", [])
+        zone_new_conventions = [
+            c for c in zone_conventions
+            if c.get("name") != "tessera:"
+        ]
+
+        if len(zone_conventions) != len(zone_new_conventions):
+            console.print(f"    Update: zarr_conventions — remove tessera: entry "
+                          f"(keeping {len(zone_new_conventions)} conventions)")
+
+        if not dry_run:
+            for key in tessera_keys:
+                del zone_grp.attrs[key]
+            zone_grp.attrs["zarr_conventions"] = zone_new_conventions
+
+    # --- Reconsolidate ---
+    if not dry_run:
+        console.print(f"\n  Reconsolidating metadata...")
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Consolidated metadata")
+            zarr.consolidate_metadata(str(store_path))
+        console.print(f"  [green]Migration complete[/green]")
+    else:
+        console.print(f"\n  [yellow]Dry run complete — no changes written[/yellow]")
 
     return 0
 
@@ -3608,6 +3753,21 @@ Directory Structure:
         help="Reprocess zones even if completion markers exist",
     )
     zarr_gp_parser.set_defaults(func=zarr_global_preview_command)
+
+    # Migrate-metadata command
+    migrate_parser = subparsers.add_parser(
+        "migrate-metadata",
+        help="Rewrite zarr store attrs from tessera: to geoemb: convention",
+    )
+    migrate_parser.add_argument(
+        "store_path", type=str,
+        help="Path to tessera zarr store",
+    )
+    migrate_parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Print what would change without writing",
+    )
+    migrate_parser.set_defaults(func=migrate_metadata_command)
 
     # Verify-tile command
     verify_parser = subparsers.add_parser(

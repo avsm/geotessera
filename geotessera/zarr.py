@@ -88,6 +88,13 @@ TESSERA_CONVENTION = {
     "name": "tessera:",
     "description": "Quantised geospatial embedding vectors with per-pixel dequantisation scales",
 }
+GEOEMB_CONVENTION = {
+    "uuid": "61c12cc5-0e28-4056-999a-480cf3fb7e4c",
+    "name": "geoemb:",
+    "description": "Geoembeddings convention for geospatial embedding arrays with model provenance",
+    "spec_url": "https://github.com/geo-embeddings/embeddings-zarr-convention/blob/v1/README.md",
+    "schema_url": "https://raw.githubusercontent.com/geo-embeddings/embeddings-zarr-convention/refs/tags/v1/schema.json",
+}
 
 
 def _get_tessera_attr(attrs, short_name: str, default=None):
@@ -931,11 +938,25 @@ def init_store(
     # preserves attributes correctly.
     root = zarr.open_group(str(output_path), mode="w", zarr_format=3)
     root.attrs.update({
-        "zarr_conventions": [TESSERA_CONVENTION],
-        "tessera:dataset_version": "v2",
-        "tessera:years": years,
-        "tessera:model_version": model_version,
-        "tessera:build_version": geotessera_version,
+        "zarr_conventions": [GEOEMB_CONVENTION],
+        "geoemb:type": "pixel",
+        "geoemb:dimensions": N_BANDS,
+        "geoemb:model": f"https://geotessera.org/model/{model_version}",
+        "geoemb:source_data": [
+            "https://sentinel.esa.int/web/sentinel/missions/sentinel-1",
+            "https://sentinel.esa.int/web/sentinel/missions/sentinel-2",
+        ],
+        "geoemb:data_type": "int8",
+        "geoemb:gsd": 10.0,
+        "geoemb:spatial_layout": "utm_zones",
+        "geoemb:build_version": geotessera_version,
+        "geoemb:quantization": {
+            "method": "per_pixel_scale",
+            "original_dtype": "float32",
+            "quantized_dtype": "int8",
+            "scale_array": "scales",
+            "nodata": "+inf",
+        },
     })
 
     # Create each zone group from landmask coverage
@@ -1068,18 +1089,7 @@ def _create_zone_group(
         if conv.get("uuid") == "689b58e2-cf7b-45e0-9fff-9cfc0883d6b4":
             conv["description"] = "Spatial coordinate information"
 
-    # Add tessera convention registration alongside the geozarr ones
-    geozarr_attrs.setdefault("zarr_conventions", []).insert(0, TESSERA_CONVENTION)
-
-    # Add tessera-specific attributes
-    geozarr_attrs.update({
-        "tessera:dataset_version": "v2",
-        "tessera:years": grid.years,
-        "tessera:utm_zone": grid.zone,
-        "tessera:n_bands": N_BANDS,
-        "tessera:model_version": model_version,
-        "tessera:build_version": build_version,
-    })
+    # Zone groups only carry proj: and spatial: conventions (geoemb: is on root)
 
     store.attrs.update(geozarr_attrs)
 
@@ -1245,10 +1255,20 @@ def fill_store(
 
     root = zarr.open_group(str(store_path), mode="r", use_consolidated=False)
     root_attrs = dict(root.attrs)
+    # Derive years: tessera:years (old stores) or from first zone's time coord
     all_years = root_attrs.get("tessera:years", [])
+    if not all_years:
+        for member_name in sorted(root.keys()):
+            if member_name.startswith("utm"):
+                try:
+                    time_arr = root[member_name]["time"][:]
+                    all_years = [int(v) for v in time_arr]
+                    break
+                except Exception:
+                    continue
 
     if not all_years:
-        raise ValueError("Store has no tessera:years attribute")
+        raise ValueError("Store has no years (checked root attrs and zone time coords)")
 
     fill_years = [year] if year is not None else all_years
 

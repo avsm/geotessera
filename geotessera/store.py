@@ -171,7 +171,15 @@ class TesseraAccessor:
         self._to_wgs = Transformer.from_crs(
             f"EPSG:{self._epsg}", "EPSG:4326", always_xy=True,
         )
-        self._years: list[int] = list(attrs.get("tessera:years", []))
+        # Derive years: try tessera:years (backwards compat), else from time coord
+        if "tessera:years" in attrs:
+            self._years: list[int] = list(attrs["tessera:years"])
+        elif "time" in ds.coords:
+            self._years = [int(v) for v in ds.coords["time"].values]
+        else:
+            self._years = []
+        # Read n_bands from geoemb:dimensions if available, else from band dim
+        self._n_bands: int = int(attrs.get("geoemb:dimensions", ds.sizes.get("band", 128)))
         t = attrs["spatial:transform"]
         self._px: float = float(t[0])
         log.debug("TesseraAccessor: EPSG:%d, years=%s", self._epsg, self._years)
@@ -196,7 +204,7 @@ class TesseraAccessor:
     @property
     def n_bands(self) -> int:
         """Number of embedding bands."""
-        return int(self._ds.sizes["band"])
+        return self._n_bands
 
     # -- Dequantisation -----------------------------------------------------
 
@@ -360,9 +368,29 @@ class GeoTesseraZarr:
         self.url = store_url.rstrip("/")
         root = zarr.open_group(self.url, mode="r")
         root_attrs = dict(root.attrs)
-        self.years: list[int] = root_attrs.get("tessera:years", [])
-        self.model_version: str = root_attrs.get("tessera:model_version", "")
-        self.build_version: str = root_attrs.get("tessera:build_version", "")
+        # Read model and build version: geoemb: first, tessera: fallback
+        self.model_version: str = root_attrs.get(
+            "geoemb:model", root_attrs.get("tessera:model_version", ""),
+        )
+        self.build_version: str = root_attrs.get(
+            "geoemb:build_version", root_attrs.get("tessera:build_version", ""),
+        )
+        # Derive years: tessera:years first (backwards compat with old stores),
+        # then read the time coordinate array from the first available zone
+        if "tessera:years" in root_attrs:
+            self.years: list[int] = list(root_attrs["tessera:years"])
+        else:
+            self.years = []
+            # Try to read from the first zone's time coordinate
+            for member_name in sorted(root.keys()):
+                if member_name.startswith("utm"):
+                    try:
+                        zone_grp = root[member_name]
+                        time_arr = zone_grp["time"][:]
+                        self.years = [int(v) for v in time_arr]
+                        break
+                    except Exception:
+                        continue
         self._cache: dict[int, xr.Dataset] = {}
         log.info("GeoTesseraZarr: %s, years=%s, model=%s",
                  self.url, self.years, self.model_version)
@@ -392,6 +420,7 @@ class GeoTesseraZarr:
 
         if z not in self._cache:
             ds = open_zone(self.url, zone=z)
+            # Inject years from root so the accessor can find them
             ds.attrs.setdefault("tessera:years", self.years)
             self._cache[z] = ds
         return self._cache[z]
