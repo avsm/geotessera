@@ -20,7 +20,7 @@ import pandas as pd
 import geopandas as gpd
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Callable, Any, List, Optional
+from typing import Callable, Any, List, Optional, Tuple
 
 from rich.console import Console
 from rich.panel import Panel
@@ -423,13 +423,6 @@ def find_tiff_files_by_blocks(base_dir):
                     files_by_block[block_key].append(file_path)
 
     return files_by_block
-
-
-def generate_master_registry(registry_dir):
-    """Generate a master registry.txt file containing hashes of all registry files."""
-    # This function is no longer used but kept for compatibility
-    # The actual generation of registry.txt should be done separately
-    pass
 
 
 def _check_tiff_has_land(file_path):
@@ -1023,9 +1016,7 @@ def check_command(args):
                 border_style="red",
             )
         )
-        console.print(
-            f"\n[red]Truncated .npy files ({len(truncated_files)}):[/red]"
-        )
+        console.print(f"\n[red]Truncated .npy files ({len(truncated_files)}):[/red]")
         for path, err in sorted(truncated_files):
             console.print(f"  {path}")
             console.print(f"    [dim]{err}[/dim]")
@@ -1036,9 +1027,7 @@ def check_command(args):
         with open(truncated_file, "w") as f:
             for path, err in sorted(truncated_files):
                 f.write(f"{path}\t{err}\n")
-        console.print(
-            f"\n[dim]Truncated file list written to {truncated_file}[/dim]"
-        )
+        console.print(f"\n[dim]Truncated file list written to {truncated_file}[/dim]")
     else:
         summary_table.add_row("Status:", "All checks passed")
         console.print(
@@ -1600,9 +1589,7 @@ def scan_command(args):
             if not create_parquet_database_from_filesystem(
                 base_dir, embeddings_parquet_path, console
             ):
-                console.print(
-                    "[red]Failed to create embeddings parquet database[/red]"
-                )
+                console.print("[red]Failed to create embeddings parquet database[/red]")
                 return 1
         else:
             console.print(
@@ -2698,6 +2685,565 @@ def file_check_command(args):
     return 0
 
 
+def _parse_int_range(s: str) -> list[int]:
+    """Parse an int range like '2017-2025' or '29,30,31'."""
+    if "-" in s and "," not in s:
+        start, end = s.split("-", 1)
+        return list(range(int(start), int(end) + 1))
+    return [int(v.strip()) for v in s.split(",")]
+
+
+def _find_registry(
+    base_dir: str, registry_dir: Optional[str] = None
+) -> Tuple[str, str]:
+    """Find the registry directory from base_dir. Returns (base_dir, registry_dir)."""
+    if registry_dir is None:
+        candidate = Path(base_dir)
+        for _ in range(3):
+            if (candidate / "registry.parquet").exists():
+                return base_dir, str(candidate)
+            candidate = candidate.parent
+    return base_dir, registry_dir or base_dir
+
+
+def zarr_init_command(args):
+    """Create an empty tessera store with time dimension."""
+    from rich.console import Console
+    from .registry import Registry
+    from .zarr import init_store
+
+    console = Console()
+
+    base_dir = args.base_dir
+    base_dir, registry_dir = _find_registry(base_dir, args.registry_dir)
+
+    registry = Registry(
+        version="v1",
+        embeddings_dir=base_dir,
+        registry_dir=registry_dir,
+    )
+
+    years = _parse_int_range(args.years)
+    output = Path(args.output)
+
+    try:
+        import importlib.metadata
+
+        version = importlib.metadata.version("geotessera")
+    except Exception:
+        version = "unknown"
+
+    try:
+        init_store(
+            registry,
+            output,
+            years,
+            geotessera_version=version,
+            model_version=args.model_version,
+            console=console,
+        )
+    except FileExistsError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        return 1
+
+    return 0
+
+
+def zarr_fill_command(args):
+    """Incrementally fill a tessera store with tile data."""
+    import warnings
+    from rich.console import Console
+    from .registry import Registry
+    from .zarr import fill_store
+
+    warnings.filterwarnings("ignore", message="Object at .* is not recognized")
+
+    console = Console()
+
+    base_dir = args.base_dir
+    base_dir, registry_dir = _find_registry(base_dir, args.registry_dir)
+
+    registry = Registry(
+        version="v1",
+        embeddings_dir=base_dir,
+        registry_dir=registry_dir,
+    )
+
+    store_path = Path(args.store_path)
+    year = args.year
+    zones = _parse_int_range(args.zones) if args.zones else None
+
+    n = fill_store(
+        registry,
+        store_path,
+        year=year,
+        zones=zones,
+        console=console,
+        workers=args.workers,
+    )
+
+    console.print(f"\n{emoji('✅ ')}{n} shards written")
+    return 0
+
+
+def zarr_global_preview_command(args):
+    """Build global EPSG:4326 RGB pyramid from zone-level embeddings."""
+    import warnings
+    from rich.console import Console
+    from .zarr import build_global_preview
+
+    warnings.filterwarnings("ignore", message="Object at .* is not recognized")
+
+    console = Console()
+    store_path = Path(args.store_path)
+    zones = _parse_int_range(args.zones) if args.zones else None
+
+    build_global_preview(
+        store_path=store_path,
+        year=args.year,
+        zones=zones,
+        num_levels=args.levels,
+        workers=args.workers,
+        console=console,
+        force=args.force,
+    )
+
+    return 0
+
+
+def print_command(args):
+    """Print embedding values at a point from both NPY and zarr sources."""
+    import numpy as np
+    from rich.console import Console
+    from rich.table import Table
+
+    console = Console()
+    lon, lat, year = args.lon, args.lat, args.year
+    n = 16
+
+    console.print(f"Embedding at ({lon}, {lat}), year {year}")
+    console.print()
+
+    # NPY path: use sample_embeddings_at_points with metadata to see which tile
+    from .core import GeoTessera
+
+    gt = GeoTessera()
+
+    try:
+        npy_emb, npy_meta = gt.sample_embeddings_at_points(
+            [(lon, lat)],
+            year=year,
+            include_metadata=True,
+        )
+        npy_emb = npy_emb[0]
+        meta = npy_meta[0] if npy_meta[0] else {}
+    except Exception as e:
+        console.print(f"[red]NPY error: {e}[/red]")
+        return 1
+
+    npy_finite = np.isfinite(npy_emb).all()
+    console.print("[bold]NPY[/bold] (GeoTessera.sample_embeddings_at_points)")
+    console.print(
+        f"  Tile: ({meta.get('tile_lon')}, {meta.get('tile_lat')}), "
+        f"CRS: {meta.get('crs')}, pixel: ({meta.get('pixel_row')}, {meta.get('pixel_col')})"
+    )
+    console.print(
+        f"  Norm: {np.linalg.norm(npy_emb):.4f}"
+        if npy_finite
+        else "  [yellow]NaN (no data)[/yellow]"
+    )
+    console.print()
+
+    # Zarr path: use GeoTesseraZarr.sample_at (handles zone routing)
+    from .store import GeoTesseraZarr, _zone_for_lon
+
+    gz = GeoTesseraZarr(args.store)
+    zarr_zone = _zone_for_lon(lon)
+
+    try:
+        zarr_emb = gz.sample_at(lon, lat, year=year)
+    except Exception as e:
+        console.print(f"[red]Zarr error: {e}[/red]")
+        return 1
+
+    zarr_finite = np.isfinite(zarr_emb).all()
+    console.print("[bold]Zarr[/bold] (GeoTesseraZarr.sample_at)")
+    console.print(f"  Zone: utm{zarr_zone:02d}")
+    console.print(f"  Store: {args.store}")
+    console.print(
+        f"  Norm: {np.linalg.norm(zarr_emb):.4f}"
+        if zarr_finite
+        else "  [yellow]NaN (no data)[/yellow]"
+    )
+    console.print()
+
+    # Table
+    table = Table(title=f"First {n} bands")
+    table.add_column("Band", style="bold", justify="right")
+    table.add_column("NPY", justify="right")
+    table.add_column("Zarr", justify="right")
+    table.add_column("Diff", justify="right")
+
+    for i in range(n):
+        nv = npy_emb[i]
+        zv = zarr_emb[i]
+        if np.isnan(nv) or np.isnan(zv):
+            table.add_row(str(i), f"{nv:.6f}", f"{zv:.6f}", "[dim]NaN[/dim]")
+        else:
+            d = abs(float(nv) - float(zv))
+            style = "" if d == 0 else "[red]" if d > 0.5 else "[yellow]"
+            end = "" if not style else "[/]"
+            table.add_row(str(i), f"{nv:.6f}", f"{zv:.6f}", f"{style}{d:.6f}{end}")
+
+    console.print(table)
+
+    if npy_finite and zarr_finite:
+        max_diff = float(np.max(np.abs(npy_emb - zarr_emb)))
+        cosine = float(
+            np.dot(npy_emb, zarr_emb)
+            / (np.linalg.norm(npy_emb) * np.linalg.norm(zarr_emb))
+        )
+        if max_diff == 0:
+            console.print("\n[green]Exact match[/green]")
+        else:
+            console.print(
+                f"\n[yellow]Max diff: {max_diff:.6f}, cosine similarity: {cosine:.6f}[/yellow]"
+            )
+    return 0
+
+
+def verify_tile_command(args):
+    """Verify that NPY tile and zarr store produce identical embeddings for a full tile."""
+    import numpy as np
+    from rich.console import Console
+    from rich.table import Table
+
+    console = Console()
+
+    lon, lat = args.lon, args.lat
+    store_url = args.store
+    years = _parse_int_range(args.years)
+
+    console.print(f"Verifying full tile at ({lon}, {lat})")
+    console.print("  NPY source: geotessera tile download")
+    console.print(f"  Zarr source: {store_url}")
+    console.print(f"  Years: {years}")
+    console.print()
+
+    from .core import GeoTessera
+    from .store import GeoTesseraZarr
+
+    gt = GeoTessera()
+    gz = GeoTesseraZarr(store_url)
+
+    table = Table(title=f"Tile verification at ({lon}, {lat})")
+    table.add_column("Year", style="bold")
+    table.add_column("Tile size")
+    table.add_column("Both valid")
+    table.add_column("Breakdown")
+    table.add_column("Overlap mean")
+    table.add_column("Status", style="bold")
+
+    all_match = True
+
+    for year in years:
+        if year not in gz.years:
+            table.add_row(
+                str(year), "-", "-", "-", "-", "[yellow]not in store[/yellow]"
+            )
+            continue
+
+        # Download the NPY tile covering this point
+        try:
+            tiles_needed = gt.registry.load_blocks_for_region(
+                (lon - 0.005, lat - 0.005, lon + 0.005, lat + 0.005),
+                year,
+            )
+            if not tiles_needed:
+                table.add_row(str(year), "-", "-", "-", "-", "[yellow]no tile[/yellow]")
+                continue
+            coords = {(tlon, tlat) for (_, tlon, tlat) in tiles_needed}
+            tile_map = gt._ensure_tiles_available(
+                required_coords=coords,
+                year=year,
+                auto_download=True,
+                bbox=None,
+            )
+            # Pick the tile that matches the registry result, not just any available tile
+            target_coord = next(iter(coords))
+            tile = tile_map.get(target_coord)
+            if tile is None or not tile.is_available():
+                table.add_row(
+                    str(year), "-", "-", "-", "-", "[yellow]tile not available[/yellow]"
+                )
+                continue
+            npy_emb = tile.load_embedding()  # (H, W, 128) float32
+        except Exception as e:
+            table.add_row(str(year), "-", "-", "-", "-", f"[red]NPY error: {e}[/red]")
+            all_match = False
+            continue
+
+        h, w, n_bands = npy_emb.shape
+        tile_transform = tile.transform
+        tile_crs = tile.crs
+
+        # Map NPY tile pixels to zarr indices using the same logic as
+        # zarr-fill: tile origin → zarr offset via round(), then add
+        # the pixel's position within the tile.
+        #
+        # zarr_row = round((zarr_origin_y - tile_origin_y) / px) + tile_row
+        # zarr_col = round((tile_origin_x - zarr_origin_x) / px) + tile_col
+        try:
+            px = tile_transform.a
+            ds = gz.open_zone(lon=lon)
+            t_attr = ds.attrs["spatial:transform"]
+            zarr_ox, zarr_oy = t_attr[2], t_attr[5]
+
+            # Where zarr-fill placed tile pixel (0,0)
+            tile_row0 = round((zarr_oy - tile_transform.f) / px)
+            tile_col0 = round((tile_transform.c - zarr_ox) / px)
+
+            # Read the tile-sized slab: zarr[tile_row0:tile_row0+h, tile_col0:tile_col0+w]
+            sub = ds.isel(
+                time=gz.years.index(year),
+                y=slice(tile_row0, tile_row0 + h),
+                x=slice(tile_col0, tile_col0 + w),
+            )
+            scales = sub["scales"].values
+            emb_int8 = sub["embeddings"].values
+            zarr_emb = ds.tessera.dequantise(emb_int8, scales)
+        except Exception as e:
+            table.add_row(
+                str(year), f"{h}x{w}", "-", "-", "-", f"[red]Zarr error: {e}[/red]"
+            )
+            all_match = False
+            continue
+
+        # Compare all valid pixels
+        npy_valid = np.isfinite(npy_emb).all(axis=2)
+        zarr_valid = np.isfinite(zarr_emb).all(axis=2)
+        both_valid = npy_valid & zarr_valid
+        n_valid = int(both_valid.sum())
+
+        if n_valid == 0:
+            table.add_row(
+                str(year), f"{h}x{w}", "0", "-", "-", "[yellow]no valid pixels[/yellow]"
+            )
+            continue
+
+        # Categorise every pixel
+        exact_match = both_valid & (np.abs(npy_emb - zarr_emb).max(axis=2) == 0)
+        water_masked = npy_valid & np.isnan(scales)  # NPY has data, zarr is NaN (water)
+        overlap_diff = both_valid & ~exact_match  # both finite, different values
+        npy_nodata = ~npy_valid  # NPY is NaN
+
+        n_exact = int(exact_match.sum())
+        n_water = int(water_masked.sum())
+        n_overlap = int(overlap_diff.sum())
+
+        table.add_row(
+            str(year),
+            f"{h}x{w}",
+            f"{n_valid:,}",
+            f"{n_exact:,} exact"
+            if n_exact == n_valid
+            else f"[green]{n_exact:,}[/green] match, [cyan]{n_water:,}[/cyan] water, [yellow]{n_overlap:,}[/yellow] overlap",
+            f"{float(np.abs(npy_emb[overlap_diff] - zarr_emb[overlap_diff]).mean()):.4f}"
+            if n_overlap > 0
+            else "-",
+            "[green]PASS[/green]"
+            if n_overlap == 0 and n_water == 0
+            else f"[yellow]{n_water + n_overlap:,} differ[/yellow]",
+        )
+        if n_overlap > 0 or n_water > 0:
+            all_match = False
+
+        # Build RGB preview from first 3 NPY embedding bands (stretch to 0-255)
+        import rasterio
+
+        emb_rgb = np.zeros((h, w, 3), dtype=np.uint8)
+        for b in range(3):
+            band = npy_emb[:, :, b].copy()
+            valid_band = band[npy_valid]
+            if len(valid_band) > 0:
+                lo = np.percentile(valid_band, 2)
+                hi = np.percentile(valid_band, 98)
+                if hi > lo:
+                    band = np.clip((band - lo) / (hi - lo), 0, 1)
+                else:
+                    band = np.zeros_like(band)
+            emb_rgb[:, :, b] = (band * 255).astype(np.uint8)
+        emb_rgb[~npy_valid] = 0
+
+        # Diagnostic overlay: green=match, cyan=water, yellow=overlap
+        rgba = np.zeros((h, w, 4), dtype=np.uint8)
+        rgba[exact_match] = [0, 200, 0, 100]  # green, light
+        rgba[water_masked] = [0, 200, 200, 200]  # cyan, strong
+        rgba[overlap_diff] = [255, 200, 0, 200]  # yellow, strong
+        rgba[npy_nodata] = [0, 0, 0, 0]  # transparent
+
+        # Fetch satellite basemap and composite embedding RGB + overlay on top
+        from rasterio.warp import reproject, Resampling
+
+        from datetime import datetime as _dt
+
+        ts = _dt.now().strftime("%H%M%S")
+        tif_path = f"verify_{year}_{ts}.tif"
+        try:
+            import contextily as cx
+            from pyproj import Transformer as ProjTransformer
+
+            # Get tile extent in WGS84 for basemap fetch
+            epsg = int(str(tile_crs).split(":")[1])
+            to_wgs = ProjTransformer.from_crs(
+                f"EPSG:{epsg}", "EPSG:4326", always_xy=True
+            )
+            tile_east = tile_transform.c + w * px
+            tile_south = tile_transform.f - h * px
+            lon_w, lat_s = to_wgs.transform(tile_transform.c, tile_south)
+            lon_e, lat_n = to_wgs.transform(tile_east, tile_transform.f)
+
+            # Fetch basemap in Web Mercator (contextily native)
+            import tempfile
+            import os
+
+            with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
+                tmp_path = tmp.name
+            cx.bounds2raster(
+                lon_w,
+                lat_s,
+                lon_e,
+                lat_n,
+                ll=True,
+                path=tmp_path,
+                source=cx.providers.Esri.WorldImagery,
+                zoom="auto",
+            )
+            basemap_ds = rasterio.open(tmp_path)
+            basemap = basemap_ds.read()  # (3, bh, bw) or (4, bh, bw)
+            basemap_extent = basemap_ds.transform
+            basemap_crs = basemap_ds.crs
+            basemap_ds.close()
+            os.unlink(tmp_path)
+
+            # Reproject basemap to tile's UTM CRS at the tile's resolution
+            dst_transform = tile_transform
+            n_bands_bm = min(3, basemap.shape[0])  # may have alpha
+            base_utm = np.zeros((3, h, w), dtype=np.uint8)
+            for band in range(n_bands_bm):
+                reproject(
+                    source=basemap[band],
+                    destination=base_utm[band],
+                    src_transform=basemap_extent,
+                    src_crs=basemap_crs,
+                    dst_transform=dst_transform,
+                    dst_crs=f"EPSG:{epsg}",
+                    resampling=Resampling.bilinear,
+                )
+
+            # Composite: basemap → embedding bands (40% opacity) → diagnostic overlay
+            composite = base_utm.copy()  # (3, H, W)
+
+            # Blend embedding RGB onto basemap at 40% opacity
+            emb_alpha = 0.4
+            for band in range(3):
+                bg = composite[band].astype(np.float32)
+                fg = emb_rgb[:, :, band].astype(np.float32)
+                composite[band] = (fg * emb_alpha + bg * (1 - emb_alpha)).astype(
+                    np.uint8
+                )
+
+            # Blend diagnostic overlay on top
+            diag_alpha = rgba[:, :, 3].astype(np.float32) / 255.0
+            for band in range(3):
+                fg = rgba[:, :, band].astype(np.float32)
+                bg = composite[band].astype(np.float32)
+                composite[band] = (fg * diag_alpha + bg * (1 - diag_alpha)).astype(
+                    np.uint8
+                )
+
+            # Draw crosshair marker at the query lon/lat
+            from pyproj import Transformer as _ProjT
+
+            _to_utm = _ProjT.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True)
+            mark_e, mark_n = _to_utm.transform(lon, lat)
+            mark_row, mark_col = rasterio.transform.rowcol(
+                tile_transform, mark_e, mark_n
+            )
+            if 0 <= mark_row < h and 0 <= mark_col < w:
+                arm = 12
+                marker_color = [255, 0, 0]
+                for dr in range(-arm, arm + 1):
+                    for dt in range(-1, 2):
+                        for r, c in [
+                            (mark_row + dt, mark_col + dr),
+                            (mark_row + dr, mark_col + dt),
+                        ]:
+                            if 0 <= r < h and 0 <= c < w:
+                                for b in range(3):
+                                    composite[b, r, c] = marker_color[b]
+            else:
+                console.print(
+                    f"  [yellow]Crosshair out of tile bounds: pixel ({mark_row}, {mark_col}), tile {h}x{w}[/yellow]"
+                )
+
+            # Write composited GeoTIFF (RGB, no alpha)
+            with rasterio.open(
+                tif_path,
+                "w",
+                driver="GTiff",
+                height=h,
+                width=w,
+                count=3,
+                dtype="uint8",
+                crs=str(tile_crs),
+                transform=tile_transform,
+                compress="lzw",
+            ) as dst:
+                dst.write(composite)
+            console.print(f"  Wrote [bold]{tif_path}[/bold] (with satellite basemap)")
+
+        except ImportError:
+            # contextily not available — composite embedding bands + overlay
+            composite = np.zeros((3, h, w), dtype=np.uint8)
+            for band in range(3):
+                composite[band] = emb_rgb[:, :, band]
+            diag_alpha = rgba[:, :, 3].astype(np.float32) / 255.0
+            for band in range(3):
+                fg = rgba[:, :, band].astype(np.float32)
+                bg = composite[band].astype(np.float32)
+                composite[band] = (fg * diag_alpha + bg * (1 - diag_alpha)).astype(
+                    np.uint8
+                )
+            with rasterio.open(
+                tif_path,
+                "w",
+                driver="GTiff",
+                height=h,
+                width=w,
+                count=3,
+                dtype="uint8",
+                crs=str(tile_crs),
+                transform=tile_transform,
+                compress="lzw",
+            ) as dst:
+                dst.write(composite)
+            console.print(
+                f"  Wrote [bold]{tif_path}[/bold] (embedding bands + overlay)"
+            )
+
+    console.print(table)
+
+    if all_match:
+        console.print("\n[green]All years match exactly.[/green]")
+        return 0
+    else:
+        console.print(
+            "\n[yellow]Some pixels differ (see verify_{year}.tif overlays).[/yellow]"
+        )
+        return 1
+
+
 def main():
     """Main entry point for the geotessera-registry CLI tool."""
     # Configure logging with rich handler
@@ -2946,6 +3492,162 @@ Directory Structure:
         help="Parquet files to check for duplicates (output from file-scan command)",
     )
     file_check_parser.set_defaults(func=file_check_command)
+
+    # Zarr-init command
+    zarr_init_parser = subparsers.add_parser(
+        "zarr-init",
+        help="Create an empty tessera store with time dimension",
+    )
+    zarr_init_parser.add_argument(
+        "base_dir",
+        help="Base directory containing downloaded tile data",
+    )
+    zarr_init_parser.add_argument(
+        "--years",
+        required=True,
+        help="Year range (e.g. 2017-2025 or 2017,2019,2024)",
+    )
+    zarr_init_parser.add_argument(
+        "--output",
+        required=True,
+        type=str,
+        help="Output store path (e.g. tessera.zarr)",
+    )
+    zarr_init_parser.add_argument(
+        "--model-version",
+        default="1.0",
+        help="Embedding model version (default: 1.0)",
+    )
+    zarr_init_parser.add_argument(
+        "--registry-dir",
+        type=str,
+        default=None,
+        help="Directory containing registry.parquet (default: auto-detected)",
+    )
+    zarr_init_parser.set_defaults(func=zarr_init_command)
+
+    # Zarr-fill command
+    zarr_fill_parser = subparsers.add_parser(
+        "zarr-fill",
+        help="Incrementally fill a tessera store with tile data",
+    )
+    zarr_fill_parser.add_argument(
+        "base_dir",
+        help="Base directory containing downloaded tile data",
+    )
+    zarr_fill_parser.add_argument(
+        "store_path",
+        type=str,
+        help="Path to existing tessera store",
+    )
+    zarr_fill_parser.add_argument(
+        "--year",
+        type=int,
+        default=None,
+        help="Year to fill (default: all years)",
+    )
+    zarr_fill_parser.add_argument(
+        "--zones",
+        default=None,
+        help="Zone numbers to fill (e.g. 29-34). Default: all initialised zones",
+    )
+    zarr_fill_parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of parallel workers (default: 4)",
+    )
+    zarr_fill_parser.add_argument(
+        "--registry-dir",
+        type=str,
+        default=None,
+        help="Directory containing registry.parquet (default: auto-detected)",
+    )
+    zarr_fill_parser.set_defaults(func=zarr_fill_command)
+
+    # Zarr-global-preview command
+    zarr_gp_parser = subparsers.add_parser(
+        "zarr-global-preview",
+        help="Build global EPSG:4326 RGB pyramid from embeddings",
+    )
+    zarr_gp_parser.add_argument(
+        "store_path",
+        type=str,
+        help="Path to tessera store",
+    )
+    zarr_gp_parser.add_argument(
+        "--year",
+        type=int,
+        default=2024,
+        help="Year to use for the preview (default: 2024)",
+    )
+    zarr_gp_parser.add_argument(
+        "--zones",
+        default=None,
+        help="Zone numbers to include (e.g. 29-34). Default: all",
+    )
+    zarr_gp_parser.add_argument(
+        "--levels",
+        type=int,
+        default=10,
+        help="Number of pyramid levels (default: 10)",
+    )
+    zarr_gp_parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Number of parallel workers (default: 4)",
+    )
+    zarr_gp_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Reprocess zones even if completion markers exist",
+    )
+    zarr_gp_parser.set_defaults(func=zarr_global_preview_command)
+
+    # Verify-tile command
+    verify_parser = subparsers.add_parser(
+        "verify-tile",
+        help="Verify NPY tiles and zarr store produce identical embeddings at a point",
+    )
+    verify_parser.add_argument(
+        "--lon",
+        type=float,
+        default=-2.969398,
+        help="Longitude (default: -2.969398, Liverpool)",
+    )
+    verify_parser.add_argument(
+        "--lat",
+        type=float,
+        default=53.434288,
+        help="Latitude (default: 53.434288, Liverpool)",
+    )
+    verify_parser.add_argument(
+        "--years",
+        default="2017,2024,2025",
+        help="Years to verify (default: 2017,2024,2025)",
+    )
+    verify_parser.add_argument(
+        "--store",
+        default="https://dl2.geotessera.org/zarr/v2/store.zarr",
+        help="Zarr store URL",
+    )
+    verify_parser.set_defaults(func=verify_tile_command)
+
+    # Print command
+    print_parser = subparsers.add_parser(
+        "print",
+        help="Print embedding values at a point from both NPY and zarr",
+    )
+    print_parser.add_argument("--lon", type=float, required=True, help="Longitude")
+    print_parser.add_argument("--lat", type=float, required=True, help="Latitude")
+    print_parser.add_argument("--year", type=int, required=True, help="Year")
+    print_parser.add_argument(
+        "--store",
+        default="https://dl2.geotessera.org/zarr/v2/store.zarr",
+        help="Zarr store URL",
+    )
+    print_parser.set_defaults(func=print_command)
 
     args = parser.parse_args()
 

@@ -291,21 +291,6 @@ def tile_to_geotiff_path(lon: float, lat: float, year: int) -> Path:
     return Path(str(year)) / grid_name / f"{grid_name}_{year}.tiff"
 
 
-def tile_to_zarr_path(lon: float, lat: float, year: int) -> Path:
-    """Generate zarr file path for a tile.
-
-    Args:
-        lon: Tile center longitude
-        lat: Tile center latitude
-        year: Year of embeddings
-
-    Returns:
-        Path: Relative path like "{year}/grid_{lon}_{lat}/grid_{lon}_{lat}_{year}.zarr"
-    """
-    grid_name = tile_to_grid_name(lon, lat)
-    return Path(str(year)) / grid_name / f"{grid_name}_{year}.zarr"
-
-
 def tile_to_landmask_filename(lon: float, lat: float) -> str:
     """Generate landmask filename for a tile.
 
@@ -807,12 +792,12 @@ class Registry:
         # Ensure lon_i/lat_i columns exist (backwards compat with old parquet files)
         if "lon_i" not in self._registry_gdf.columns:
             self._registry_gdf["lon_i"] = (
-                self._registry_gdf["lon"] * 100
-            ).round().astype(np.int32)
+                (self._registry_gdf["lon"] * 100).round().astype(np.int32)
+            )
         if "lat_i" not in self._registry_gdf.columns:
             self._registry_gdf["lat_i"] = (
-                self._registry_gdf["lat"] * 100
-            ).round().astype(np.int32)
+                (self._registry_gdf["lat"] * 100).round().astype(np.int32)
+            )
 
         # Set MultiIndex for O(1) lookups via .loc[(year, lon_i, lat_i)]
         self._registry_gdf["year"] = self._registry_gdf["year"].astype(int)
@@ -895,12 +880,12 @@ class Registry:
                 # Ensure lon_i/lat_i columns exist (backwards compat with old parquet files)
                 if "lon_i" not in self._landmasks_df.columns:
                     self._landmasks_df["lon_i"] = (
-                        self._landmasks_df["lon"] * 100
-                    ).round().astype(np.int32)
+                        (self._landmasks_df["lon"] * 100).round().astype(np.int32)
+                    )
                 if "lat_i" not in self._landmasks_df.columns:
                     self._landmasks_df["lat_i"] = (
-                        self._landmasks_df["lat"] * 100
-                    ).round().astype(np.int32)
+                        (self._landmasks_df["lat"] * 100).round().astype(np.int32)
+                    )
 
                 # Set index for O(1) lookups via .loc[(lon_i, lat_i)]
                 self._landmasks_df = self._landmasks_df.set_index(["lon_i", "lat_i"])
@@ -1032,7 +1017,9 @@ class Registry:
         Returns:
             List of years with available data, sorted in ascending order.
         """
-        return sorted(self._registry_gdf.index.get_level_values("year").unique().tolist())
+        return sorted(
+            self._registry_gdf.index.get_level_values("year").unique().tolist()
+        )
 
     def get_tile_counts_by_year(self) -> Dict[int, int]:
         """Get count of tiles per year using efficient pandas operations.
@@ -1043,9 +1030,13 @@ class Registry:
         # Count unique (lon_i, lat_i) index pairs per year level
         idx = self._registry_gdf.index
         counts = (
-            pd.DataFrame({"year": idx.get_level_values("year"),
-                          "lon_i": idx.get_level_values("lon_i"),
-                          "lat_i": idx.get_level_values("lat_i")})
+            pd.DataFrame(
+                {
+                    "year": idx.get_level_values("year"),
+                    "lon_i": idx.get_level_values("lon_i"),
+                    "lat_i": idx.get_level_values("lat_i"),
+                }
+            )
             .drop_duplicates()
             .groupby("year")
             .size()

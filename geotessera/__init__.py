@@ -54,6 +54,19 @@ from . import visualization
 from . import web
 from . import registry
 
+
+def __getattr__(name):
+    if name == "GeoTesseraZarr":
+        from .store import GeoTesseraZarr
+
+        return GeoTesseraZarr
+    if name == "store":
+        from . import store
+
+        return store
+    raise AttributeError(f"module 'geotessera' has no attribute {name!r}")
+
+
 try:
     import importlib.metadata
 
@@ -62,4 +75,12 @@ except importlib.metadata.PackageNotFoundError:
     # Fallback for development installs
     __version__ = "unknown"
 
-__all__ = ["GeoTessera", "dequantize_embedding", "visualization", "web", "registry"]
+__all__ = [
+    "GeoTessera",
+    "GeoTesseraZarr",
+    "dequantize_embedding",
+    "visualization",
+    "web",
+    "registry",
+    "store",
+]

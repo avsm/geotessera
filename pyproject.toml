@@ -4,7 +4,7 @@ version = "0.7.5"
 description = "Python library interface to the Tessera geofoundation model embeddings"
 readme = "README.md"
 license = {file = "LICENSE.md"}
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -12,7 +12,6 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: GIS",
@@ -37,7 +36,11 @@ dependencies = [
     "xarray",
     "rioxarray",
     "zarr",
-    "dask"
+    "dask",
+    "fsspec",
+    "aiohttp",
+    "geozarr-toolkit",
+    "contextily",
 ]
 
 [project.urls]
