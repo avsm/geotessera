@@ -631,6 +631,7 @@ def calculate_bbox_from_file(
         Bounding box as (min_lon, min_lat, max_lon, max_lat)
     """
     gdf = gpd.read_file(filepath)
+    gdf = gdf.to_crs("EPSG:4326")  # Ensure it's in lat/lon
     bounds = gdf.total_bounds  # [minx, miny, maxx, maxy]
     return tuple(bounds)
 
