@@ -1610,9 +1610,7 @@ class GeoTessera:
                 progress_callback(100, 100, "No tiles to export")
             return []
 
-        tiles = self.fetch_embeddings(
-            tiles_to_fetch, progress_callback if progress_callback else None
-        )
+        tiles = self.fetch_embeddings(tiles_to_fetch)
 
         created_files = []
 
