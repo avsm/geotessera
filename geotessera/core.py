@@ -1188,6 +1188,7 @@ class GeoTessera:
         lat: float,
         year: int,
         progress_callback: Optional[callable] = None,
+        refresh: bool = False,
     ) -> bool:
         """Download a single tile and save it to embeddings_dir.
 
@@ -1199,6 +1200,7 @@ class GeoTessera:
             lat: Latitude (will be snapped to nearest tile center)
             year: Year of embeddings
             progress_callback: Optional callback for download progress
+            refresh: If True, force re-download even if tile exists locally
 
         Returns:
             True if download succeeded, False otherwise
@@ -1220,7 +1222,7 @@ class GeoTessera:
         lon, lat = tile_lon, tile_lat
 
         try:
-            # Download files directly to embeddings_dir (using refresh=True to force download)
+            # Download files to embeddings_dir, skipping tiles already cached locally
             # fetch() handles creating directory structure and saving to correct locations
             self.registry.fetch(
                 year=year,
@@ -1229,7 +1231,7 @@ class GeoTessera:
                 is_scales=False,
                 progressbar=False,
                 progress_callback=progress_callback,
-                refresh=True,
+                refresh=refresh,
             )
 
             self.registry.fetch(
@@ -1239,11 +1241,11 @@ class GeoTessera:
                 is_scales=True,
                 progressbar=False,
                 progress_callback=progress_callback,
-                refresh=True,
+                refresh=refresh,
             )
 
             self.registry.fetch_landmask(
-                lon=lon, lat=lat, progressbar=False, refresh=True
+                lon=lon, lat=lat, progressbar=False, refresh=refresh
             )
 
             return True
