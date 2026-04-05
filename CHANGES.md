@@ -3,6 +3,12 @@
 This release adds cloud-native Zarr access, GeoTIFF download improvements,
 and several registry and CLI fixes.
 
+The Zarr mode is an alternative to the npy, which will continue to be
+supported. The embeddings are currently being transcoded to the new
+format, and a future release will add registry support for the Zarr
+as well for easy queries. For now, this release is mainly providing
+the geotessera-registry support.
+
 ### New Features
 
 - **Zarr v3 store** (`geotessera.store.GeoTesseraZarr`): Cloud-native access
