@@ -227,7 +227,7 @@ Data Organization
 
 **Remote Server Structure**::
 
-    https://dl2.geotessera.org/
+    https://s3.us-west-2.amazonaws.com/tessera-embeddings/
     ├── v1/                              # Dataset version
     │   ├── registry.parquet             # Parquet registry with all metadata
     │   ├── 2024/                        # Year

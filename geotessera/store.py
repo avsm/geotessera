@@ -34,7 +34,7 @@ from rich.progress import track
 
 log = logging.getLogger(__name__)
 
-DEFAULT_STORE = "https://dl2.geotessera.org/zarr/v2/store.zarr"
+DEFAULT_STORE = "https://s3.us-west-2.amazonaws.com/tessera-embeddings/v1/zarr"
 
 # Shard-aligned chunk sizes so dask tasks match zarr shards
 SHARD_CHUNKS = {"time": 1, "band": 128, "y": 4096, "x": 4096}
@@ -354,7 +354,7 @@ class GeoTesseraZarr:
 
     Args:
         store_url: Zarr store URL or local path.  Defaults to the public
-            TESSERA store at ``dl2.geotessera.org``.
+            TESSERA store at ``s3.us-west-2.amazonaws.com/tessera-embeddings``.
 
     Example::
 

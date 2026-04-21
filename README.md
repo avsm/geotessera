@@ -482,7 +482,7 @@ The registry can be loaded from multiple sources (in priority order):
 1. **Local file** (via `--registry-path` or `registry_path` parameter)
 2. **Local directory** (via `--registry-dir` or `registry_dir` parameter, looks for `registry.parquet`)
 3. **Remote URL** (via `--registry-url` or `registry_url` parameter)
-4. **Default remote** (from `https://dl2.geotessera.org/{version}/registry.parquet`)
+4. **Default remote** (from `https://s3.us-west-2.amazonaws.com/tessera-embeddings/{version}/registry.parquet`)
 
 ```python
 # Use local registry file
@@ -529,7 +529,7 @@ print(registry.head())
 ### Tessera Data Structure
 
 ```
-Remote Server (https://dl2.geotessera.org)
+Remote Server (https://s3.us-west-2.amazonaws.com/tessera-embeddings)
 ├── v1/                              # Dataset version
 │   ├── registry.parquet             # Parquet registry with all metadata
 │   ├── 2024/                        # Year

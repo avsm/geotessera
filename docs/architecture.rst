@@ -37,8 +37,8 @@ The library follows a layered architecture:
     └── GeoPandas (geospatial operations)
             ↓
     Storage Layer
-    ├── Remote servers (https://dl2.geotessera.org)
-    ├── Zarr store (https://dl2.geotessera.org/zarr/)
+    ├── Remote servers (https://s3.us-west-2.amazonaws.com/tessera-embeddings)
+    ├── Zarr store (https://s3.us-west-2.amazonaws.com/tessera-embeddings/v1/zarr)
     └── Local cache (~/.cache/geotessera/registry.parquet)
 
 Coordinate System and Grid

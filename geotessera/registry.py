@@ -334,7 +334,7 @@ def tile_to_box(lon: float, lat: float):
 
 
 # Base URL for Tessera data downloads
-TESSERA_BASE_URL = "https://dl2.geotessera.org"
+TESSERA_BASE_URL = "https://s3.us-west-2.amazonaws.com/tessera-embeddings"
 
 # Directory structure constants (mirrors remote structure)
 EMBEDDINGS_DIR_NAME = "global_0.1_degree_representation"  # NPY embeddings and scales

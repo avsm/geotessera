@@ -3629,7 +3629,7 @@ Directory Structure:
     )
     verify_parser.add_argument(
         "--store",
-        default="https://dl2.geotessera.org/zarr/v2/store.zarr",
+        default="https://s3.us-west-2.amazonaws.com/tessera-embeddings/v1/zarr",
         help="Zarr store URL",
     )
     verify_parser.set_defaults(func=verify_tile_command)
@@ -3644,7 +3644,7 @@ Directory Structure:
     print_parser.add_argument("--year", type=int, required=True, help="Year")
     print_parser.add_argument(
         "--store",
-        default="https://dl2.geotessera.org/zarr/v2/store.zarr",
+        default="https://s3.us-west-2.amazonaws.com/tessera-embeddings/v1/zarr",
         help="Zarr store URL",
     )
     print_parser.set_defaults(func=print_command)
