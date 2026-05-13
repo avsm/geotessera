@@ -506,6 +506,11 @@ def download_file_to_temp(
 
         temp_file.close()
 
+        if downloaded != total_size:
+            raise ValueError(
+                f"Download size didn't match expected: got {downloaded}, expected {total_size}"
+            )
+
         # Verify hash if provided
         if expected_hash:
             if progress_callback:
