@@ -1030,8 +1030,8 @@ class GeoTessera:
             List of (lon, lat) tuples
         """
         # Handle list of tuples (most common case)
-        if isinstance(points, list):
-            return points
+        if isinstance(points, Iterable):
+            return list(points)
 
         # Handle GeoJSON FeatureCollection
         if isinstance(points, dict):
