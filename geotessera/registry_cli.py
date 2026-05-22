@@ -20,7 +20,7 @@ import pandas as pd
 import geopandas as gpd
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Callable, Any, List, Optional, Tuple
+from typing import Callable, Any, Dict, Iterator, List, Optional, Tuple
 
 from rich.console import Console
 from rich.panel import Panel
@@ -32,6 +32,8 @@ from rich.progress import (
     TextColumn,
     BarColumn,
     TaskProgressColumn,
+    MofNCompleteColumn,
+    TimeElapsedColumn,
 )
 
 from .registry import (
@@ -2536,6 +2538,279 @@ def file_scan_command(args):
         return 1
 
 
+S3_NS = "{http://s3.amazonaws.com/doc/2006-03-01/}"
+
+
+def _parse_s3_uri(uri: str) -> Tuple[str, str]:
+    """Parse an s3://bucket/prefix URI into (bucket, prefix).
+
+    The prefix is normalised to have no leading slash and a single trailing
+    slash so it can be used directly as a ListObjectsV2 prefix.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(uri)
+    if parsed.scheme != "s3" or not parsed.netloc:
+        raise ValueError(f"Expected s3://bucket/prefix URI, got: {uri}")
+    bucket = parsed.netloc
+    prefix = parsed.path.lstrip("/")
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
+    return bucket, prefix
+
+
+def _s3_list(
+    bucket: str,
+    prefix: str,
+    region: str,
+    delimiter: Optional[str] = None,
+) -> Iterator[Tuple[str, int, str]]:
+    """Yield (key, size, last_modified) for every object under prefix.
+
+    Uses anonymous HTTPS calls to the S3 ListObjectsV2 endpoint. Follows
+    continuation tokens until the listing is exhausted. If delimiter is
+    set, yields CommonPrefixes as (prefix, 0, "") tuples instead of object
+    contents.
+    """
+    import xml.etree.ElementTree as ET
+    from urllib.parse import urlencode
+    from urllib.request import urlopen
+
+    base = f"https://{bucket}.s3.{region}.amazonaws.com/"
+    token: Optional[str] = None
+    while True:
+        params = {"list-type": "2", "prefix": prefix}
+        if delimiter is not None:
+            params["delimiter"] = delimiter
+        if token is not None:
+            params["continuation-token"] = token
+        url = base + "?" + urlencode(params)
+        with urlopen(url, timeout=60) as resp:
+            root = ET.parse(resp).getroot()
+
+        if delimiter is not None:
+            for cp in root.findall(f"{S3_NS}CommonPrefixes"):
+                p = cp.findtext(f"{S3_NS}Prefix") or ""
+                if p:
+                    yield p, 0, ""
+        else:
+            for c in root.findall(f"{S3_NS}Contents"):
+                key = c.findtext(f"{S3_NS}Key") or ""
+                size = int(c.findtext(f"{S3_NS}Size") or "0")
+                lm = c.findtext(f"{S3_NS}LastModified") or ""
+                if key:
+                    yield key, size, lm
+
+        if (root.findtext(f"{S3_NS}IsTruncated") or "false") != "true":
+            return
+        token = root.findtext(f"{S3_NS}NextContinuationToken")
+        if not token:
+            return
+
+
+def s3scan_command(args):
+    """Spider an S3 bucket prefix for embedding tiles and write a parquet inventory.
+
+    Mirrors `file-scan` semantics but reads object listings from S3 via
+    anonymous HTTPS calls to ListObjectsV2. The input URI should point at the
+    parent prefix containing year subdirectories
+    (e.g. ``s3://tessera-embeddings/v1/global_0.1_degree_representation``).
+    """
+    import re
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from datetime import datetime
+
+    console = Console()
+
+    try:
+        bucket, prefix = _parse_s3_uri(args.s3_uri)
+    except ValueError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        return 1
+
+    region = args.region
+
+    if args.output:
+        output_file = Path(args.output).resolve()
+    else:
+        output_file = Path.cwd() / "embedding_inventory.parquet"
+
+    console.print(
+        Panel.fit(
+            f"[bold blue]🔍 Spidering S3 for Embedding Tiles[/bold blue]\n"
+            f"📦 Bucket: {bucket}\n"
+            f"🔑 Prefix: {prefix or '(root)'}\n"
+            f"🌐 Region: {region}\n"
+            f"📄 Output: {output_file}",
+            style="blue",
+        )
+    )
+
+    # Discover year subprefixes (e.g. .../2024/) via a delimited listing.
+    console.print("\n[cyan]Listing year subprefixes...[/cyan]")
+    year_re = re.compile(r"(\d{4})/?$")
+    year_prefixes: List[Tuple[int, str]] = []
+    try:
+        for p, _, _ in _s3_list(bucket, prefix, region, delimiter="/"):
+            tail = p[len(prefix):].rstrip("/")
+            m = year_re.match(tail)
+            if m:
+                year_prefixes.append((int(m.group(1)), p))
+                console.print(f"  Found year prefix: [green]{tail}[/green]")
+    except Exception as e:
+        console.print(f"[red]Error listing S3 prefix: {e}[/red]")
+        return 1
+
+    if not year_prefixes:
+        console.print(
+            "[yellow]No year subprefixes found! Expected entries like 2024/, 2023/, etc.[/yellow]"
+        )
+        return 1
+
+    grid_re = re.compile(r"grid_(-?\d+\.\d+)_(-?\d+\.\d+)(_scales)?\.npy$")
+
+    def _scan_year(year: int, year_prefix: str, progress: Progress, task_id):
+        """List all objects under a year prefix and return per-tile records.
+
+        Advances the supplied progress task once per listed object so the UI
+        updates continuously across paginated listings.
+        """
+        tiles: Dict[Tuple[float, float], Dict[str, Tuple[str, int, str]]] = {}
+        listed = 0
+        for key, size, lm in _s3_list(bucket, year_prefix, region):
+            listed += 1
+            # Batch UI updates: every 50 objects is plenty smooth and avoids
+            # contention on the Progress lock during big listings.
+            if listed % 50 == 0:
+                progress.update(task_id, advance=50)
+            name = key.rsplit("/", 1)[-1]
+            m = grid_re.match(name)
+            if not m:
+                continue
+            lon = float(m.group(1))
+            lat = float(m.group(2))
+            kind = "scales" if m.group(3) else "grid"
+            tiles.setdefault((lon, lat), {})[kind] = (key, size, lm)
+        # Flush the tail of the count.
+        progress.update(task_id, advance=listed % 50)
+
+        out = []
+        for (lon, lat), parts in tiles.items():
+            if "grid" not in parts or "scales" not in parts:
+                continue
+            gkey, gsize, glm = parts["grid"]
+            skey, ssize, slm = parts["scales"]
+            directory = gkey.rsplit("/", 1)[0]
+            base_url = f"s3://{bucket}/"
+            out.append(
+                {
+                    "year": year,
+                    "lon": lon,
+                    "lat": lat,
+                    "directory": base_url + directory,
+                    "grid_path": base_url + gkey,
+                    "scales_path": base_url + skey,
+                    "grid_mtime": datetime.fromisoformat(glm.replace("Z", "+00:00")),
+                    "scales_mtime": datetime.fromisoformat(slm.replace("Z", "+00:00")),
+                    "grid_size": gsize,
+                    "scales_size": ssize,
+                }
+            )
+        progress.update(
+            task_id,
+            description=f"[green]{year}[/green] · {len(out):,} tiles",
+        )
+        return year, out
+
+    console.print(
+        f"\n[cyan]Scanning {len(year_prefixes)} year prefixes ({args.workers} workers)...[/cyan]"
+    )
+
+    records = []
+    years_found = set()
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=20),
+        MofNCompleteColumn(),
+        TextColumn("objs"),
+        TimeElapsedColumn(),
+        console=console,
+        transient=False,
+    ) as progress:
+        year_tasks = {
+            y: progress.add_task(f"[cyan]{y}[/cyan]", total=None)
+            for y, _ in sorted(year_prefixes)
+        }
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = {
+                pool.submit(_scan_year, y, p, progress, year_tasks[y]): y
+                for y, p in sorted(year_prefixes)
+            }
+            for fut in as_completed(futures):
+                year = futures[fut]
+                try:
+                    _, out = fut.result()
+                except Exception as e:
+                    console.print(f"[red]Error scanning year {year}: {e}[/red]")
+                    progress.update(
+                        year_tasks[year],
+                        description=f"[red]{year} failed[/red]",
+                    )
+                    continue
+                if out:
+                    years_found.add(year)
+                    records.extend(out)
+
+    if not records:
+        console.print("[yellow]No embedding tiles found![/yellow]")
+        return 1
+
+    console.print(
+        f"\n[cyan]Creating parquet file with {len(records):,} tiles...[/cyan]"
+    )
+    df = pd.DataFrame(records)
+    df = df.sort_values(["year", "lon", "lat"])
+    df["lon_i"] = (df["lon"] * 100).round().astype(np.int32)
+    df["lat_i"] = (df["lat"] * 100).round().astype(np.int32)
+
+    import tempfile
+
+    temp_path = None
+    try:
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=output_file.parent,
+            prefix=f".{output_file.name}_tmp_",
+            suffix=".parquet",
+            delete=False,
+        ) as temp_file:
+            temp_path = temp_file.name
+        os.chmod(temp_path, 0o644)
+        df.to_parquet(temp_path, index=False)
+        os.rename(temp_path, str(output_file))
+
+        console.print(
+            Panel.fit(
+                f"[green]✅ S3 Scan Complete[/green]\n"
+                f"📊 Tiles found: {len(records):,}\n"
+                f"📅 Years: {', '.join(str(y) for y in sorted(years_found))}\n"
+                f"📄 Output: {output_file}",
+                style="green",
+            )
+        )
+        return 0
+    except Exception as e:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+        console.print(f"[red]Error writing parquet file: {e}[/red]")
+        import traceback
+
+        console.print(f"[dim]{traceback.format_exc()}[/dim]")
+        return 1
+
+
 def file_check_command(args):
     """Check multiple inventory parquet files for duplicate year/lon/lat coordinates.
 
@@ -3339,6 +3614,15 @@ Examples:
   # Specify custom output path
   geotessera-registry file-scan /path/to/embeddings --output /path/to/inventory.parquet
 
+  # Spider an S3 bucket prefix to build an inventory parquet (no AWS creds required for public buckets)
+  geotessera-registry s3scan s3://tessera-embeddings/v1/global_0.1_degree_representation
+
+  # This will:
+  # - List year subprefixes (e.g. 2024/, 2023/) via anonymous ListObjectsV2 HTTPS calls
+  # - Paginate listings for each year in parallel and pair grid_*.npy with grid_*_scales.npy
+  # - Use S3 LastModified/Size for the mtime/size columns (no per-object stat calls)
+  # - Emit a parquet file with the same schema as file-scan, but with s3:// URLs in path columns
+
   # Check multiple inventory files for duplicate coordinates (year/lon/lat)
   geotessera-registry file-check machine1_inventory.parquet machine2_inventory.parquet machine3_inventory.parquet
 
@@ -3480,6 +3764,36 @@ Directory Structure:
         help="Output parquet file path (default: INPUT_DIR/embedding_inventory.parquet)",
     )
     file_scan_parser.set_defaults(func=file_scan_command)
+
+    # S3-scan command
+    s3scan_parser = subparsers.add_parser(
+        "s3scan",
+        help="Spider an S3 bucket prefix for embedding tiles and generate an inventory parquet file",
+    )
+    s3scan_parser.add_argument(
+        "s3_uri",
+        help="S3 URI of the parent prefix containing year subdirectories "
+        "(e.g. s3://tessera-embeddings/v1/global_0.1_degree_representation)",
+    )
+    s3scan_parser.add_argument(
+        "--region",
+        type=str,
+        default="us-west-2",
+        help="AWS region of the bucket (default: us-west-2)",
+    )
+    s3scan_parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="Number of concurrent year-prefix listings (default: 8)",
+    )
+    s3scan_parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Output parquet file path (default: ./embedding_inventory.parquet)",
+    )
+    s3scan_parser.set_defaults(func=s3scan_command)
 
     # File-check command
     file_check_parser = subparsers.add_parser(
