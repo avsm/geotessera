@@ -1,6 +1,6 @@
 [project]
 name = "geotessera"
-version = "0.8.0"
+version = "0.9.0"
 description = "Python library interface to the Tessera geofoundation model embeddings"
 readme = "README.md"
 license = {file = "LICENSE.md"}
@@ -41,6 +41,8 @@ dependencies = [
     "aiohttp",
     "geozarr-toolkit",
     "contextily",
+    "botocore>=1.43.14",
+    "awscrt>=0.33.0",
 ]
 
 [project.urls]

@@ -19,6 +19,8 @@ from urllib.request import urlopen, Request
 from urllib.error import HTTPError
 import time
 
+from botocore.httpchecksum import CrtCrc64NvmeChecksum
+
 try:
     import pandas as pd
 except ImportError:
@@ -33,6 +35,96 @@ except ImportError:
 
 # Constants for block-based registry management
 BLOCK_SIZE = 5  # 5x5 degree blocks
+
+# Default dataset variant. The bare ``global_0.1_degree_representation`` dir on
+# S3 corresponds to this variant; named variants get a ``.<name>`` suffix.
+DEFAULT_VARIANT = "vultr"
+
+
+def _parse_dataset_version(spec: str) -> Tuple[str, str]:
+    """Parse a flexible dataset-version spec.
+
+    Returns ``(s3_path_component, normalized_version)``. Accepts inputs like
+    ``"v1"``, ``"1"``, ``"1.0"``, ``"v1.0"`` (all → ``("v1", "1.0")``) and
+    ``"v1.1"``, ``"1.1"`` (→ ``("v1.1", "1.1")``). The legacy S3 layout uses
+    ``v1/`` for the 1.0 series — `.0` minors are stripped from the path.
+    """
+    s = spec.strip()
+    if s.startswith("v"):
+        s = s[1:]
+    parts = s.split(".")
+    major = parts[0]
+    minor = parts[1] if len(parts) > 1 else "0"
+    norm = f"{major}.{minor}"
+    path = f"v{major}" if minor == "0" else f"v{major}.{minor}"
+    return path, norm
+
+
+def _variant_subdir(variant: str) -> str:
+    """Map a variant name to its embeddings-dir name on S3."""
+    if variant == DEFAULT_VARIANT:
+        return EMBEDDINGS_DIR_NAME
+    return f"{EMBEDDINGS_DIR_NAME}.{variant}"
+
+
+def _version_path_from_norm(norm: str) -> str:
+    """Inverse of ``_parse_dataset_version`` for the path component.
+
+    ``"1.0"`` → ``"v1"`` (legacy S3 layout uses ``v1/`` for the 1.0 series);
+    ``"1.1"`` → ``"v1.1"``; ``"2.0"`` → ``"v2"``; etc.
+    """
+    major, _, minor = norm.partition(".")
+    if not minor or minor == "0":
+        return f"v{major}"
+    return f"v{major}.{minor}"
+
+
+# Well-known dataset versions on the public bucket. Used by the client when a
+# multi-version operation (e.g. ``coverage --by-source --dataset-version=all``)
+# needs to enumerate manifests without a separate listing call. Extend this as
+# new versions are published.
+KNOWN_VERSIONS = ("v1", "v1.1")
+
+# Sidecar filename written into output directories alongside downloaded tiles
+# (NPY format) to record which dataset version/variant produced the files.
+TESSERA_METADATA_FILENAME = "tessera_metadata.json"
+
+
+def write_tessera_metadata(
+    output_dir: Union[str, Path],
+    dataset_version: str,
+    dataset_variant: str,
+    extra: Optional[Dict[str, object]] = None,
+) -> Path:
+    """Write a ``tessera_metadata.json`` sidecar describing a download.
+
+    The local layout always uses ``global_0.1_degree_representation/`` for NPY
+    tiles regardless of variant; this sidecar records the provenance so
+    downstream tools can recover which dataset was downloaded.
+    """
+    import json
+    from datetime import datetime, timezone
+
+    version_path, version_norm = _parse_dataset_version(dataset_version)
+    payload: Dict[str, object] = {
+        "dataset_version": version_norm,
+        "dataset_version_path": version_path,
+        "dataset_variant": dataset_variant,
+        "embeddings_subdir": EMBEDDINGS_DIR_NAME,
+        "s3_embeddings_subdir": _variant_subdir(dataset_variant),
+        "source_url_prefix": (
+            f"{TESSERA_BASE_URL}/{version_path}/{_variant_subdir(dataset_variant)}/"
+        ),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if extra:
+        payload.update(extra)
+
+    out = Path(output_dir) / TESSERA_METADATA_FILENAME
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    return out
+
 
 # ==============================================================================
 # COORDINATE SYSTEM HIERARCHY
@@ -340,8 +432,8 @@ TESSERA_BASE_URL = "https://s3.us-west-2.amazonaws.com/tessera-embeddings"
 EMBEDDINGS_DIR_NAME = "global_0.1_degree_representation"  # NPY embeddings and scales
 LANDMASKS_DIR_NAME = "global_0.1_degree_tiff_all"  # Landmask TIFFs
 
-# Note: Default registry URLs are constructed with version in Registry.__init__
-# Format: {TESSERA_BASE_URL}/{version}/registry.parquet
+# Note: Default manifest URLs are constructed with version in Registry.__init__
+# Format: {TESSERA_BASE_URL}/{version}/manifest.parquet
 
 
 def download_file_to_temp(
@@ -409,11 +501,37 @@ def download_file_to_temp(
         # All retries exhausted, raise the last exception
         raise last_exception
 
-    # Handle If-Modified-Since for cached files
-    headers = {"User-Agent": "geotessera"}
+    # Handle conditional requests for cached files. We prefer ETag-based
+    # validation (If-None-Match) over time-based (If-Modified-Since) because
+    # the ETag changes deterministically whenever the S3 object is replaced,
+    # whereas Last-Modified can match if the local file's mtime was set from
+    # the prior Last-Modified header. The x-amz-checksum-mode opt-in asks S3
+    # to return the per-object x-amz-checksum-crc64nvme response header so
+    # the downloader can verify content integrity end-to-end.
+    headers = {
+        "User-Agent": "geotessera",
+        "x-amz-checksum-mode": "ENABLED",
+    }
+
+    # The ETag sidecar lives next to the cached file. Tiny (~50 bytes) so
+    # we don't bother with xattrs or a central manifest.
+    etag_sidecar = None
+    if cache_path:
+        etag_sidecar = cache_path.with_suffix(cache_path.suffix + ".etag")
 
     if cache_path and cache_path.exists():
-        # Get the cached file's modification time
+        # Prefer If-None-Match (ETag) over If-Modified-Since when we have a
+        # stored ETag — it's clock- and mtime-agnostic.
+        if etag_sidecar and etag_sidecar.exists():
+            try:
+                stored_etag = etag_sidecar.read_text().strip()
+                if stored_etag:
+                    headers["If-None-Match"] = stored_etag
+            except OSError:
+                pass
+
+        # Belt-and-braces: also send If-Modified-Since so the server can use
+        # whichever validator it has indexed.
         cache_mtime = cache_path.stat().st_mtime
         if_modified_since = formatdate(cache_mtime, usegmt=True)
         headers["If-Modified-Since"] = if_modified_since
@@ -460,6 +578,12 @@ def download_file_to_temp(
             start_time = time.time()
             last_update_time = start_time
 
+            # Compute CRC64NVMe incrementally for server-side checksum verification.
+            # S3 returns x-amz-checksum-crc64nvme as a FULL_OBJECT base64-encoded CRC
+            # on every GET/HEAD when the object was uploaded with that algorithm.
+            expected_crc64nvme_b64 = response.headers.get("x-amz-checksum-crc64nvme")
+            crc64nvme = CrtCrc64NvmeChecksum() if expected_crc64nvme_b64 else None
+
             # Format file size for display
             def format_bytes(bytes_val):
                 """Format bytes as human-readable string."""
@@ -480,6 +604,8 @@ def download_file_to_temp(
                 if not chunk:
                     break
                 temp_file.write(chunk)
+                if crc64nvme is not None:
+                    crc64nvme.update(chunk)
                 downloaded += len(chunk)
 
                 if progress_callback and total_size > 0:
@@ -505,6 +631,20 @@ def download_file_to_temp(
                         last_update_time = current_time
 
         temp_file.close()
+
+        # Verify S3 server-side CRC64NVMe checksum if the server advertised one.
+        if crc64nvme is not None:
+            if progress_callback:
+                progress_callback(downloaded, downloaded, "Verifying CRC64NVMe...")
+            import base64
+
+            actual_crc64nvme_b64 = base64.b64encode(crc64nvme.digest()).decode()
+            if actual_crc64nvme_b64 != expected_crc64nvme_b64:
+                temp_path.unlink()
+                raise ValueError(
+                    f"CRC64NVMe mismatch: expected {expected_crc64nvme_b64}, "
+                    f"got {actual_crc64nvme_b64}"
+                )
 
         # Verify hash if provided
         if expected_hash:
@@ -533,10 +673,24 @@ def download_file_to_temp(
                 # Filesystem errors - permissions, disk full, etc.
                 logging.getLogger(__name__).warning(f"Could not set file mtime: {e}")
 
-        # If caching, atomically move to cache location
+        # If caching, atomically move to cache location and record the new
+        # ETag alongside it so the next request can use If-None-Match.
         if cache_path:
             temp_path.rename(cache_path)
             final_path = cache_path
+            if etag_sidecar is not None:
+                new_etag = response.headers.get("ETag")
+                try:
+                    if new_etag:
+                        etag_sidecar.write_text(new_etag)
+                    elif etag_sidecar.exists():
+                        # Server didn't return an ETag this time — drop the
+                        # stale sidecar rather than reusing a wrong validator.
+                        etag_sidecar.unlink()
+                except OSError as e:
+                    logging.getLogger(__name__).debug(
+                        f"Could not persist ETag sidecar {etag_sidecar}: {e}"
+                    )
         else:
             final_path = temp_path
 
@@ -577,6 +731,7 @@ class Registry:
     def __init__(
         self,
         version: str,
+        variant: str = DEFAULT_VARIANT,
         cache_dir: Optional[Union[str, Path]] = None,
         embeddings_dir: Optional[Union[str, Path]] = None,
         registry_url: Optional[str] = None,
@@ -590,15 +745,19 @@ class Registry:
         """Initialize Registry manager with optimized Parquet registries.
 
         Args:
-            version: Dataset version identifier
+            version: Dataset version. Accepts ``"v1"``/``"1.0"`` or ``"v1.1"``/``"1.1"``.
+            variant: Dataset variant to filter the manifest by. The default
+                ``"vultr"`` corresponds to the bare
+                ``global_0.1_degree_representation`` directory on S3; other
+                values (e.g. ``"cambridge"``) map to the ``.<variant>`` suffix.
             cache_dir: Optional directory for caching Parquet registries only (not data files)
             embeddings_dir: Directory for storing embedding tiles (defaults to current directory).
-                Expected structure: global_0.1_degree_representation/{year}/grid_{lon}_{lat}.npy and _scales.npy,
-                global_0.1_degree_tiff_all/landmask_{lon}_{lat}.tif
+                Expected structure: global_0.1_degree_representation[.<variant>]/{year}/
+                grid_{lon}_{lat}.npy and _scales.npy, global_0.1_degree_tiff_all/landmask_{lon}_{lat}.tif.
                 Tiles are downloaded here and persist for reuse across sessions.
-            registry_url: URL to download embeddings Parquet registry from (default: remote)
-            registry_path: Local path to existing embeddings Parquet registry file
-            registry_dir: Directory containing registry.parquet and landmasks.parquet files (alternative to individual paths)
+            registry_url: URL to download embeddings manifest parquet from (default: remote)
+            registry_path: Local path to existing embeddings manifest parquet file
+            registry_dir: Directory containing manifest.parquet and landmasks.parquet files (alternative to individual paths)
             landmasks_registry_url: URL to download landmasks Parquet registry from (default: remote)
             landmasks_registry_path: Local path to existing landmasks Parquet registry file
             verify_hashes: If True (default), verify SHA256 hashes of downloaded files.
@@ -606,7 +765,20 @@ class Registry:
                 GEOTESSERA_SKIP_HASH=1 environment variable.
             logger: Optional logger instance. If not provided, creates a new one
         """
-        self.version = version
+        # Resolve version into S3 path component and normalised numeric form.
+        self._version_path, self._version_norm = _parse_dataset_version(version)
+        self._variant = variant
+        self._embeddings_subdir = _variant_subdir(variant)
+        # Preserve the original kwarg for callers that still read .version.
+        self.version = self._version_path
+        # Public read-only view of the variant-aware subdir name used both in
+        # local mirrors and S3 URLs.
+        self.embeddings_subdir = self._embeddings_subdir
+        self.variant = self._variant
+        # Populated by _load_registry() with the local path to the manifest
+        # parquet (cache file or user-supplied). Useful for tools that need
+        # the raw unfiltered manifest (e.g. multi-source coverage rendering).
+        self.manifest_path: Optional[Path] = None
         self.logger = logger or logging.getLogger(__name__)
 
         # Check environment variable for hash verification override
@@ -653,7 +825,7 @@ class Registry:
         if registry_dir:
             registry_dir_path = Path(registry_dir)
             if not registry_path:
-                candidate = registry_dir_path / "registry.parquet"
+                candidate = registry_dir_path / "manifest.parquet"
                 if candidate.exists():
                     registry_path = candidate
             if not landmasks_registry_path:
@@ -661,17 +833,22 @@ class Registry:
                 if candidate.exists():
                     landmasks_registry_path = candidate
 
-        # Embeddings GeoParquet registry (GeoDataFrame with spatial index)
+        # Embeddings manifest (GeoDataFrame with spatial index). The wire format
+        # mirrors the file-scan inventory schema; geometry is derived from
+        # lon/lat at load time if the parquet was written as a plain DataFrame.
+        # One manifest per version on S3; the consumer fetches the manifest
+        # matching its dataset_version and filters by variant on load.
         self._registry_gdf: Optional[gpd.GeoDataFrame] = None
         self._registry_url = (
-            registry_url or f"{TESSERA_BASE_URL}/{version}/registry.parquet"
+            registry_url or f"{TESSERA_BASE_URL}/{self._version_path}/manifest.parquet"
         )
         self._registry_path = Path(registry_path) if registry_path else None
 
-        # Landmasks Parquet registry
+        # Landmasks Parquet registry (still per-version on S3).
         self._landmasks_df: Optional[pd.DataFrame] = None
         self._landmasks_registry_url = (
-            landmasks_registry_url or f"{TESSERA_BASE_URL}/{version}/landmasks.parquet"
+            landmasks_registry_url
+            or f"{TESSERA_BASE_URL}/{self._version_path}/landmasks.parquet"
         )
         self._landmasks_registry_path = (
             Path(landmasks_registry_path) if landmasks_registry_path else None
@@ -682,112 +859,117 @@ class Registry:
         self._load_landmasks_registry()
 
     def _load_registry(self):
-        """Load registry as GeoDataFrame (GeoParquet or convert from Parquet) with If-Modified-Since refresh."""
+        """Load manifest as GeoDataFrame with If-Modified-Since refresh.
+
+        The manifest is a plain parquet using the file-scan inventory schema
+        (year, lon, lat, grid_size, scales_size, ...). A Point geometry column
+        is materialised from lon/lat at load time so spatial queries via
+        GeoPandas's R-tree still work.
+        """
         registry_path = None
 
         if self._registry_path and self._registry_path.exists():
             # Load from local file (no updates check for explicit paths)
-            self.logger.info(f"Loading registry from local file: {self._registry_path}")
+            self.logger.info(f"Loading manifest from local file: {self._registry_path}")
             registry_path = self._registry_path
         else:
-            # Use cached version with If-Modified-Since to check for updates
-            registry_cache_path = self._registry_cache_dir / "registry.parquet"
+            # Use cached version with If-Modified-Since to check for updates.
+            # Cache layout mirrors the S3 prefix so multiple versions coexist.
+            registry_cache_path = (
+                self._registry_cache_dir / self._version_path / "manifest.parquet"
+            )
+            registry_cache_path.parent.mkdir(parents=True, exist_ok=True)
 
             if registry_cache_path.exists():
-                self.logger.info(f"Using cached registry: {registry_cache_path}")
-
-                # Validate cached file format before accepting it
-                is_valid_cache = False
+                self.logger.info(f"Using cached manifest: {registry_cache_path}")
                 try:
-                    # Quick check: try to read metadata without loading full file
-                    test_gdf = gpd.read_parquet(registry_cache_path)
-                    if "geometry" in test_gdf.columns and test_gdf.geometry is not None:
-                        is_valid_cache = True
-                    else:
-                        self.logger.warning(
-                            "Cached registry is in old format (missing geometry column)"
-                        )
-                        self.logger.info(
-                            "Forcing download of updated GeoParquet format..."
-                        )
-                except (OSError, ValueError, KeyError, ImportError) as e:
-                    # OSError: File issues, ValueError: Invalid parquet, KeyError: Missing columns, ImportError: Missing deps
-                    self.logger.warning(
-                        f"Cached registry is corrupted or in old format: {e}"
-                    )
-                    self.logger.info("Forcing download of updated registry...")
-
-                # Check for updates using If-Modified-Since (or force download if invalid)
-                try:
-                    if not is_valid_cache:
-                        # Delete invalid cache to force fresh download
-                        registry_cache_path.unlink(missing_ok=True)
-                        self.logger.info("Downloading updated registry...")
-                        result_path = download_file_to_temp(
-                            self._registry_url, cache_path=registry_cache_path
-                        )
-                        registry_path = Path(result_path)
-                        self.logger.info("Registry downloaded successfully")
-                    else:
-                        # Valid cache - check for updates normally
-                        self.logger.info("Checking for registry updates...")
-                        result_path = download_file_to_temp(
-                            self._registry_url, cache_path=registry_cache_path
-                        )
-                        registry_path = Path(result_path)
-                        if result_path == str(registry_cache_path):
-                            self.logger.info(
-                                "Verified with server - registry is current (no download needed)"
-                            )
-                        else:
-                            self.logger.info("Downloaded updated registry from server")
-                except Exception as e:
-                    # If update check fails, use cached version (only if valid)
-                    if is_valid_cache:
-                        self.logger.warning(f"Could not check for updates: {e}")
-                        self.logger.info("Using existing cached registry")
-                        registry_path = registry_cache_path
-                    else:
-                        # Invalid cache and download failed - raise error
-                        raise RuntimeError(
-                            f"Failed to download registry and no valid cache available: {e}"
-                        ) from e
-            else:
-                # Download the registry to cache for the first time
-                self.logger.info(f"Downloading registry from {self._registry_url}")
-                try:
-                    # Download registry with caching
+                    self.logger.info("Checking for manifest updates...")
                     result_path = download_file_to_temp(
                         self._registry_url, cache_path=registry_cache_path
                     )
                     registry_path = Path(result_path)
-                    self.logger.info("Registry downloaded successfully")
+                    if result_path == str(registry_cache_path):
+                        self.logger.info(
+                            "Verified with server - manifest is current (no download needed)"
+                        )
+                    else:
+                        self.logger.info("Downloaded updated manifest from server")
                 except Exception as e:
-                    raise RuntimeError(f"Failed to download registry: {e}") from e
+                    self.logger.warning(f"Could not check for updates: {e}")
+                    self.logger.info("Using existing cached manifest")
+                    registry_path = registry_cache_path
+            else:
+                # Download the manifest to cache for the first time
+                self.logger.info(f"Downloading manifest from {self._registry_url}")
+                try:
+                    result_path = download_file_to_temp(
+                        self._registry_url, cache_path=registry_cache_path
+                    )
+                    registry_path = Path(result_path)
+                    self.logger.info("Manifest downloaded successfully")
+                except Exception as e:
+                    raise RuntimeError(f"Failed to download manifest: {e}") from e
 
-        # Load as GeoParquet (spatial index already embedded)
+        # Load as plain parquet first; promote to GeoDataFrame if needed.
         try:
-            self._registry_gdf = gpd.read_parquet(registry_path)
+            df = pd.read_parquet(registry_path)
         except Exception as e:
-            raise RuntimeError(f"Failed to load registry as GeoParquet: {e}") from e
+            raise RuntimeError(f"Failed to load manifest parquet: {e}") from e
 
-        # Validate it's a proper GeoParquet file
-        if (
-            "geometry" not in self._registry_gdf.columns
-            or self._registry_gdf.geometry is None
-        ):
+        # Record the on-disk manifest path for tools that need the unfiltered
+        # parquet (multi-source coverage rendering, manifest introspection, …).
+        self.manifest_path = Path(registry_path)
+
+        self.logger.info(f"Loaded manifest with {len(df):,} tiles")
+
+        # Validate required columns (file-scan inventory schema).
+        required_columns = {"lat", "lon", "year", "grid_size"}
+        if not required_columns.issubset(df.columns):
+            missing = required_columns - set(df.columns)
+            raise ValueError(f"Manifest is missing required columns: {missing}")
+
+        # Filter to the requested (version, variant) if those columns are present.
+        # Missing columns mean a single-(version, variant) manifest; trust it as-is.
+        before = len(df)
+        if "version" in df.columns:
+            df = df[df["version"].astype(str) == self._version_norm]
+        if "variant" in df.columns:
+            df = df[df["variant"].astype(str) == self._variant]
+        if len(df) != before:
+            self.logger.info(
+                f"Filtered manifest to version={self._version_norm}, "
+                f"variant={self._variant}: {len(df):,} tiles (from {before:,})"
+            )
+        if df.empty:
             raise ValueError(
-                f"Registry file is not a valid GeoParquet file (missing geometry column): {registry_path}\n"
-                "Please regenerate the registry using the latest geotessera-registry scan command."
+                f"Manifest has no rows for version={self._version_norm}, "
+                f"variant={self._variant}. Check the dataset_version and "
+                f"dataset_variant arguments."
             )
 
-        self.logger.info(f"Loaded GeoParquet with {len(self._registry_gdf):,} tiles")
+        # Defensive dedupe: bucket-side misfiling (e.g. a tile filed under the
+        # wrong grid directory) can cause the scanner to emit two rows for the
+        # same (year, lon, lat). Duplicates here would make the MultiIndex
+        # non-unique and turn .loc[] lookups into multi-row Series, which
+        # downstream int(row["grid_size"]) cannot handle.
+        before_dedupe = len(df)
+        df = df.drop_duplicates(subset=["year", "lon", "lat"], keep="first")
+        if len(df) != before_dedupe:
+            self.logger.warning(
+                f"Dropped {before_dedupe - len(df):,} duplicate (year, lon, lat) "
+                "rows from manifest"
+            )
 
-        # Validate registry structure
-        required_columns = {"lat", "lon", "year", "hash", "file_size"}
-        if not required_columns.issubset(self._registry_gdf.columns):
-            missing = required_columns - set(self._registry_gdf.columns)
-            raise ValueError(f"Registry is missing required columns: {missing}")
+        # Materialise geometry from lon/lat for spatial queries (.cx).
+        if "geometry" in df.columns:
+            self._registry_gdf = gpd.GeoDataFrame(
+                df, geometry="geometry", crs="EPSG:4326"
+            )
+        else:
+            geometry = gpd.points_from_xy(df["lon"], df["lat"])
+            self._registry_gdf = gpd.GeoDataFrame(
+                df, geometry=geometry, crs="EPSG:4326"
+            )
 
         # Ensure lon_i/lat_i columns exist (backwards compat with old parquet files)
         if "lon_i" not in self._registry_gdf.columns:
@@ -812,8 +994,12 @@ class Registry:
             )
             self._landmasks_df = pd.read_parquet(self._landmasks_registry_path)
         else:
-            # Use cached version with If-Modified-Since to check for updates
-            landmasks_cache_path = self._registry_cache_dir / "landmasks.parquet"
+            # Use cached version with If-Modified-Since to check for updates.
+            # Cache layout mirrors S3 so multiple versions coexist.
+            landmasks_cache_path = (
+                self._registry_cache_dir / self._version_path / "landmasks.parquet"
+            )
+            landmasks_cache_path.parent.mkdir(parents=True, exist_ok=True)
 
             if landmasks_cache_path.exists():
                 self.logger.info(
@@ -867,9 +1053,11 @@ class Registry:
                     self._landmasks_df = None
                     return
 
-        # Validate landmasks registry structure
+        # Validate landmasks registry structure. Hash columns are no longer
+        # required — integrity is verified via the S3 CRC64NVMe header at
+        # download time.
         if self._landmasks_df is not None:
-            required_columns = {"lat", "lon", "hash", "file_size"}
+            required_columns = {"lat", "lon", "file_size"}
             if not required_columns.issubset(self._landmasks_df.columns):
                 missing = required_columns - set(self._landmasks_df.columns)
                 self.logger.warning(
@@ -1093,7 +1281,9 @@ class Registry:
             embedding_path, scales_path = tile_to_embedding_paths(lon, lat, year)
             path = scales_path if is_scales else embedding_path
 
-        # Determine local file path
+        # Local layout always uses the bare ``global_0.1_degree_representation``
+        # subdir regardless of variant; variant/version provenance lives in the
+        # ``tessera_metadata.json`` sidecar written by the CLI download flow.
         local_path = self._embeddings_dir / EMBEDDINGS_DIR_NAME / path
 
         # Check if file exists locally and not refreshing
@@ -1101,38 +1291,16 @@ class Registry:
             # Use existing local file
             return str(local_path)
 
-        # Query hash from registry for verification if year/lon/lat provided
-        file_hash = None
-        if (
-            self.verify_hashes
-            and self._registry_gdf is not None
-            and year is not None
-            and lon is not None
-            and lat is not None
-        ):
-            try:
-                row = self._lookup_tile(year, lon, lat)
-                if is_scales:
-                    # Use scales_hash column for scales files
-                    if "scales_hash" in row.index:
-                        file_hash = row["scales_hash"]
-                    else:
-                        self.logger.warning(
-                            "Registry missing 'scales_hash' column, skipping hash verification for scales file"
-                        )
-                else:
-                    # Use hash column for embedding files
-                    file_hash = row["hash"]
-            except ValueError:
-                pass  # Tile not in registry, skip hash verification
-
-        # Download to embeddings_dir
+        # Download to embeddings_dir. Integrity is verified end-to-end against
+        # the S3 x-amz-checksum-crc64nvme response header inside the downloader.
         # Use as_posix() to ensure forward slashes in URL even on Windows
         path_str = path.as_posix() if isinstance(path, Path) else path
-        url = f"{TESSERA_BASE_URL}/{self.version}/{EMBEDDINGS_DIR_NAME}/{path_str}"
+        url = (
+            f"{TESSERA_BASE_URL}/{self._version_path}/"
+            f"{self._embeddings_subdir}/{path_str}"
+        )
         downloaded_path = download_file_to_temp(
             url,
-            expected_hash=file_hash,
             progress_callback=progress_callback,
             cache_path=local_path,
         )
@@ -1177,25 +1345,11 @@ class Registry:
             # Use existing local file
             return str(local_path)
 
-        # Query hash from landmasks registry for verification if lon/lat provided
-        file_hash = None
-        if (
-            self.verify_hashes
-            and self._landmasks_df is not None
-            and lon is not None
-            and lat is not None
-        ):
-            try:
-                row = self._lookup_landmask(lon, lat)
-                file_hash = row["hash"]
-            except ValueError:
-                pass  # Landmask not in registry, skip hash verification
-
-        # Download to embeddings_dir
-        url = f"{TESSERA_BASE_URL}/{self.version}/{LANDMASKS_DIR_NAME}/{filename}"
+        # Download to embeddings_dir. Integrity is verified end-to-end against
+        # the S3 x-amz-checksum-crc64nvme response header inside the downloader.
+        url = f"{TESSERA_BASE_URL}/{self._version_path}/{LANDMASKS_DIR_NAME}/{filename}"
         downloaded_path = download_file_to_temp(
             url,
-            expected_hash=file_hash,
             progress_callback=progress_callback,
             cache_path=local_path,
         )
@@ -1264,14 +1418,14 @@ class Registry:
         Raises:
             ValueError: If tile not found in registry or file_size column missing
         """
-        if "file_size" not in self._registry_gdf.columns:
+        if "grid_size" not in self._registry_gdf.columns:
             raise ValueError(
-                "Registry is missing 'file_size' column. "
-                "Please update your registry to include file size metadata."
+                "Manifest is missing 'grid_size' column. "
+                "Please update your manifest to include file size metadata."
             )
 
         row = self._lookup_tile(year, lon, lat)
-        return int(row["file_size"])
+        return int(row["grid_size"])
 
     def get_scales_file_size(self, year: int, lon: float, lat: float) -> int:
         """Get the file size of a scales file from the registry.

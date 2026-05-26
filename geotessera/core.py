@@ -91,6 +91,7 @@ class GeoTessera:
     def __init__(
         self,
         dataset_version: str = "v1",
+        dataset_variant: str = "vultr",
         cache_dir: Optional[Union[str, Path]] = None,
         embeddings_dir: Optional[Union[str, Path]] = None,
         registry_url: Optional[str] = None,
@@ -101,7 +102,13 @@ class GeoTessera:
         """Initialize GeoTessera with Parquet registry.
 
         Args:
-            dataset_version: Tessera dataset version (e.g., 'v1', 'v2')
+            dataset_version: Tessera dataset version. Accepts ``"v1"`` /
+                ``"1.0"`` or ``"v1.1"`` / ``"1.1"`` (the legacy S3 layout uses
+                ``v1/`` for the 1.0 series).
+            dataset_variant: Variant of the embeddings to load (default
+                ``"vultr"``). Other published variants — e.g. ``"cambridge"``
+                — are produced by different model runs and live in
+                ``global_0.1_degree_representation.<variant>`` dirs on S3.
             cache_dir: Directory for caching registry files only (not embedding data)
             embeddings_dir: Directory containing pre-downloaded embedding tiles.
                 Defaults to current working directory if not specified.
@@ -132,6 +139,7 @@ class GeoTessera:
                 GEOTESSERA_SKIP_HASH=1 environment variable.
         """
         self.dataset_version = dataset_version
+        self.dataset_variant = dataset_variant
 
         # Initialize logger
         self.logger = logging.getLogger(__name__)
@@ -144,6 +152,7 @@ class GeoTessera:
 
         self.registry = Registry(
             version=dataset_version,
+            variant=dataset_variant,
             cache_dir=cache_dir,
             embeddings_dir=embeddings_dir,
             registry_url=registry_url,
@@ -157,6 +166,16 @@ class GeoTessera:
     def version(self) -> str:
         """Get the GeoTessera library version."""
         return __version__
+
+    @property
+    def embeddings_subdir(self) -> str:
+        """Variant-aware embeddings subdirectory name (mirrors S3 layout).
+
+        Equals ``global_0.1_degree_representation`` for the default ``vultr``
+        variant and ``global_0.1_degree_representation.<variant>`` otherwise.
+        Used to construct local mirror paths consistent with the bucket.
+        """
+        return self.registry.embeddings_subdir
 
     def embeddings_count(
         self, bbox: Tuple[float, float, float, float], year: int = 2024
@@ -173,7 +192,11 @@ class GeoTessera:
         tiles = self.registry.load_blocks_for_region(bbox, year)
         return len(tiles)
 
-    def export_coverage_map(self, output_file: Optional[str] = None) -> Dict:
+    def export_coverage_map(
+        self,
+        output_file: Optional[str] = None,
+        dataset_id: Optional[str] = None,
+    ) -> Dict:
         """Generate global coverage map showing which tiles have embeddings for which years.
 
         This method loads all registry data and creates a coverage map that can be used
@@ -184,13 +207,17 @@ class GeoTessera:
 
         When output_file is provided, writes a compact split format:
         - coverage.json: metadata + years only (small)
-        - coverage_YYYY.json: array of tile coordinate strings per year
+        - coverage[_dataset_id]_YYYY.json: array of tile coordinate strings per year
 
         The globe.html viewer uses the coverage texture PNG for land/ocean detection
         (no need to store no_coverage or landmasks in JSON).
 
         Args:
             output_file: Optional path to write JSON coverage data. If None, returns dict only.
+            dataset_id: Optional namespace for the per-year files (e.g. ``"v1_vultr"``)
+                so multiple (version, variant) datasets can coexist in one
+                output directory. When set, per-year files become
+                ``coverage_{dataset_id}_{YYYY}.json``.
 
         Returns:
             Dictionary with full coverage information (used in-memory for texture generation).
@@ -251,19 +278,22 @@ class GeoTessera:
         if output_file:
             output_path = Path(output_file)
             output_dir = output_path.parent
+            year_prefix = f"coverage_{dataset_id}_" if dataset_id else "coverage_"
 
             # Main coverage.json: just metadata + years (compact, no indent)
             main_data = {
                 "years": available_years,
                 "metadata": coverage_map["metadata"],
+                "dataset_id": dataset_id,
+                "year_file_prefix": year_prefix,
             }
             with open(output_file, "w", encoding="utf-8") as f:
                 json.dump(main_data, f, separators=(",", ":"))
             self.logger.info(f"Coverage metadata written to {output_file}")
 
-            # Per-year files: coverage_YYYY.json with tile coordinate arrays
+            # Per-year files: coverage[_{dataset_id}]_{YYYY}.json
             for year in available_years:
-                year_file = output_dir / f"coverage_{year}.json"
+                year_file = output_dir / f"{year_prefix}{year}.json"
                 with open(year_file, "w", encoding="utf-8") as f:
                     json.dump(sorted(tiles_by_year[year]), f, separators=(",", ":"))
                 self.logger.info(
@@ -273,7 +303,10 @@ class GeoTessera:
         return coverage_map
 
     def generate_coverage_texture(
-        self, coverage_data: Dict, output_file: Optional[str] = None
+        self,
+        coverage_data: Dict,
+        output_file: Optional[str] = None,
+        tint_color: Optional[Tuple[int, int, int]] = None,
     ) -> str:
         """Generate coverage texture image for globe visualization.
 
@@ -283,6 +316,13 @@ class GeoTessera:
         Args:
             coverage_data: Coverage data dictionary from export_coverage_map()
             output_file: Optional path to save PNG texture. If None, saves as 'coverage_texture.png'
+            tint_color: Optional ``(r, g, b)`` 0-255 tuple. When provided, every
+                tile with coverage is drawn in this colour, shaded by the
+                fraction of available years that tile actually has data for —
+                pale tint for sparse temporal coverage, saturated for full.
+                Used to give each dataset a distinct hue family in
+                multi-dataset mode while still letting the viewer see *how
+                much* of the year range each tile contains at a glance.
 
         Returns:
             Path to the generated texture file
@@ -325,10 +365,43 @@ class GeoTessera:
                 # Generate tile key
                 key = f"{lon:.2f},{lat:.2f}"
 
-                # Determine color based on coverage
-                color = self._get_tile_color(
-                    key, tiles_dict, no_coverage_set, all_years, max_years, latest_year
-                )
+                # Determine color based on coverage. Single-tint mode varies
+                # the shade of one hue per dataset, so within a dataset the
+                # viewer can see *temporal* coverage at a glance (pale =
+                # sparse years, saturated = all years), and across datasets
+                # the hue distinguishes which version/variant.
+                if tint_color is not None:
+                    tile_years = tiles_dict.get(key)
+                    if tile_years:
+                        n = len(tile_years)
+                        # Interpolate exactly between n=1 -> 50% tint and
+                        # n=max_years -> full tint. (max_years=1 collapses
+                        # to full tint for everything.)
+                        if max_years <= 1:
+                            frac = 1.0
+                        else:
+                            frac = 0.5 + 0.5 * (n - 1) / (max_years - 1)
+                        r = int(tint_color[0] * frac + 255 * (1 - frac))
+                        g = int(tint_color[1] * frac + 255 * (1 - frac))
+                        b = int(tint_color[2] * frac + 255 * (1 - frac))
+                        # Alpha also scales lightly with coverage so sparse
+                        # tiles fade more into the globe; keeps a clear visual
+                        # hierarchy when two datasets overlap.
+                        alpha = (
+                            int(140 + 60 * (n / max_years)) if max_years > 0 else 200
+                        )
+                        color = (r, g, b, alpha)
+                    else:
+                        color = (0, 0, 0, 0)
+                else:
+                    color = self._get_tile_color(
+                        key,
+                        tiles_dict,
+                        no_coverage_set,
+                        all_years,
+                        max_years,
+                        latest_year,
+                    )
 
                 # Convert lat/lon to pixel coordinates (equirectangular projection)
                 min_lon = lon - TILE_OFFSET
@@ -1553,7 +1626,9 @@ class GeoTessera:
 
             # Add metadata
             dst.update_tags(
-                TESSERA_DATASET_VERSION=self.dataset_version,
+                TESSERA_DATASET_VERSION=self.registry._version_norm,
+                TESSERA_DATASET_VERSION_PATH=self.registry._version_path,
+                TESSERA_DATASET_VARIANT=self.dataset_variant,
                 TESSERA_YEAR=str(year),
                 TESSERA_TILE_LAT=f"{lat:.2f}",
                 TESSERA_TILE_LON=f"{lon:.2f}",
@@ -1664,9 +1739,14 @@ class GeoTessera:
                     for j in range(128):
                         dst.set_band_description(j + 1, f"Tessera_Band_{j}")
 
-                # Add metadata
+                # Add metadata. Record the resolved version path (v1, v1.1, …)
+                # and variant so the dataset provenance is fully recoverable
+                # from a single TIFF even if it's separated from the
+                # tessera_metadata.json sidecar.
                 dst.update_tags(
-                    TESSERA_DATASET_VERSION=self.dataset_version,
+                    TESSERA_DATASET_VERSION=self.registry._version_norm,
+                    TESSERA_DATASET_VERSION_PATH=self.registry._version_path,
+                    TESSERA_DATASET_VARIANT=self.dataset_variant,
                     TESSERA_YEAR=str(year),
                     TESSERA_TILE_LAT=f"{tile_lat:.2f}",
                     TESSERA_TILE_LON=f"{tile_lon:.2f}",
@@ -1686,11 +1766,14 @@ class GeoTessera:
 
         if progress_callback:
             progress_callback(
-                total_tiles, total_tiles,
-                f"Completed! Exported {len(created_files)} GeoTIFF file(s)"
+                total_tiles,
+                total_tiles,
+                f"Completed! Exported {len(created_files)} GeoTIFF file(s)",
             )
 
-        self.logger.info(f"Exported {len(created_files)} GeoTIFF file(s) to {output_dir}")
+        self.logger.info(
+            f"Exported {len(created_files)} GeoTIFF file(s) to {output_dir}"
+        )
         return created_files
 
     def merge_geotiffs_to_mosaic(

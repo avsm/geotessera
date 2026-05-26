@@ -220,7 +220,7 @@ def gather_tile_infos(
     try:
         year_slice = gdf.loc[year]
         # Filter to tiles that have actual embedding data in the registry
-        valid = year_slice["file_size"] > 0
+        valid = year_slice["grid_size"] > 0
         if "scales_size" in year_slice.columns:
             valid = valid & (year_slice["scales_size"] > 0)
         year_slice = year_slice[valid]
