@@ -882,13 +882,27 @@ class Registry:
 
             if registry_cache_path.exists():
                 self.logger.info(f"Using cached manifest: {registry_cache_path}")
+                # The downloader returns str(cache_path) on both 304 (cached)
+                # and 200 (fresh download with atomic rename), so we can't
+                # tell which happened from the return value. The ETag sidecar
+                # IS rewritten only on a real refresh, so a content change
+                # there is the canonical "was refreshed" signal.
+                etag_sidecar = registry_cache_path.with_suffix(
+                    registry_cache_path.suffix + ".etag"
+                )
+                pre_etag = (
+                    etag_sidecar.read_text() if etag_sidecar.exists() else None
+                )
                 try:
                     self.logger.info("Checking for manifest updates...")
                     result_path = download_file_to_temp(
                         self._registry_url, cache_path=registry_cache_path
                     )
                     registry_path = Path(result_path)
-                    if result_path == str(registry_cache_path):
+                    post_etag = (
+                        etag_sidecar.read_text() if etag_sidecar.exists() else None
+                    )
+                    if pre_etag is not None and pre_etag == post_etag:
                         self.logger.info(
                             "Verified with server - manifest is current (no download needed)"
                         )
@@ -1005,7 +1019,14 @@ class Registry:
                 self.logger.info(
                     f"Using cached landmasks registry: {landmasks_cache_path}"
                 )
-                # Check for updates using If-Modified-Since
+                # Compare the ETag sidecar pre/post: only a 200 (real
+                # refresh) rewrites it; a 304 leaves it untouched.
+                etag_sidecar = landmasks_cache_path.with_suffix(
+                    landmasks_cache_path.suffix + ".etag"
+                )
+                pre_etag = (
+                    etag_sidecar.read_text() if etag_sidecar.exists() else None
+                )
                 try:
                     self.logger.info("Checking for landmasks registry updates...")
                     result_path = download_file_to_temp(
@@ -1013,7 +1034,10 @@ class Registry:
                     )
                     landmasks_path = Path(result_path)
                     self._landmasks_df = pd.read_parquet(landmasks_path)
-                    if result_path == str(landmasks_cache_path):
+                    post_etag = (
+                        etag_sidecar.read_text() if etag_sidecar.exists() else None
+                    )
+                    if pre_etag is not None and pre_etag == post_etag:
                         self.logger.info(
                             "Verified with server - landmasks registry is current (no download needed)"
                         )

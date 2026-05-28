@@ -39,7 +39,7 @@ The library follows a layered architecture:
     Storage Layer
     ├── Remote servers (https://s3.us-west-2.amazonaws.com/tessera-embeddings)
     ├── Zarr store (https://s3.us-west-2.amazonaws.com/tessera-embeddings/v1/zarr)
-    └── Local cache (~/.cache/geotessera/registry.parquet)
+    └── Local cache (~/.cache/geotessera/{v1,v1.1}/manifest.parquet)
 
 Coordinate System and Grid
 --------------------------
@@ -197,77 +197,85 @@ Registry System
 Parquet-Based Registry
 ~~~~~~~~~~~~~~~~~~~~~~
 
-The registry uses a **Parquet file** for efficient data discovery and querying:
+The registry uses one **Parquet manifest per dataset version** for efficient
+data discovery and querying. The manifest is filtered by ``(version,
+variant)`` at load time, then queried by lat/lon/year:
 
-**Registry Structure**:
+**Manifest Structure** (``s3://tessera-embeddings/{v1,v1.1}/manifest.parquet``):
 
 .. code-block::
 
-    registry.parquet (single file with all metadata)
+    manifest.parquet (one per dataset version)
     ├── Columns:
+    │   ├── version          # Normalised dataset version ('1.0', '1.1')
+    │   ├── variant          # Dataset variant ('vultr', 'cambridge', ...)
     │   ├── lon, lat         # Tile center coordinates
-    │   ├── year             # Data year (2017-2025)
-    │   ├── hash             # SHA256 file integrity checksum
-    │   ├── scales_hash      # SHA256 checksum for scales files
-    │   └── file_size        # File size in bytes
-    └── Rows: One per tile
+    │   ├── year             # Data year
+    │   ├── grid_size        # Embedding NPY byte size
+    │   ├── scales_size      # Scales NPY byte size
+    │   ├── grid_path        # Full s3:// URI of the embedding
+    │   ├── scales_path      # Full s3:// URI of the scales
+    │   ├── grid_mtime       # Object mtime on S3
+    │   └── scales_mtime
+    └── Rows: One per (version, variant, year, lon, lat) tile
 
-**Querying the Registry**::
+Integrity is **not** carried in the manifest — it's verified end-to-end at
+download time against S3's ``x-amz-checksum-crc64nvme`` response header.
+
+**Querying the Manifest**::
 
     import pandas as pd
 
-    # Load registry
-    registry = pd.read_parquet("registry.parquet")
+    df = pd.read_parquet("manifest.parquet")  # the v1.1 file
+    # Filter to (version, variant) you want — the manifest can carry both
+    df = df[(df['version'] == '1.1') & (df['variant'] == 'cambridge')]
 
     # Query tiles in a region
     bbox = (-0.2, 51.4, 0.1, 51.6)  # (min_lon, min_lat, max_lon, max_lat)
-    tiles = registry[
-        (registry['lon'] >= bbox[0]) & (registry['lon'] <= bbox[2]) &
-        (registry['lat'] >= bbox[1]) & (registry['lat'] <= bbox[3]) &
-        (registry['year'] == 2024)
+    tiles = df[
+        (df['lon'] >= bbox[0]) & (df['lon'] <= bbox[2]) &
+        (df['lat'] >= bbox[1]) & (df['lat'] <= bbox[3]) &
+        (df['year'] == 2024)
     ]
 
-    # Examples of block-based filtering (internal optimization)
-    def get_block_coordinates(lon, lat):
-        """Get the 5x5 degree block coordinates for a point."""
-        # Round down to nearest 5-degree boundary
-        block_lon = int(lon // 5) * 5
-        block_lat = int(lat // 5) * 5
-        return block_lon, block_lat
+**Manifest Loading Process**:
 
-**Registry Loading Process**:
+1. **Download per-version manifest** (only the one matching ``dataset_version``)
+2. **Filter** to the requested ``(version, variant)``
+3. **Materialise Point geometry** from lon/lat (R-tree spatial index)
+4. **Set MultiIndex** on ``(year, lon_i, lat_i)`` for O(1) lookups
+5. **Cache** the parquet at ``~/.cache/geotessera/{v1,v1.1}/manifest.parquet``
+   with an ETag sidecar for conditional GETs
 
-1. **Download Parquet registry** (if not cached locally, ~few MB)
-2. **Query tiles** for the requested bounding box using pandas
-3. **Filter by year** if specified
-4. **Return matching tiles** as a DataFrame
-5. **Cache registry** in memory for subsequent requests
-
-Registry Sources
+Manifest Sources
 ~~~~~~~~~~~~~~~~
 
-The registry can be loaded from multiple sources:
+The manifest can be loaded from multiple sources:
 
 **1. Default Remote** (recommended)::
 
-    # Downloads and caches registry.parquet automatically
+    # Downloads and caches the v1 manifest automatically.
     from geotessera import GeoTessera
     gt = GeoTessera()
 
-    # Cached at: ~/.cache/geotessera/registry.parquet
+    # Cached at: ~/.cache/geotessera/v1/manifest.parquet
+
+    # Pick a different (version, variant) — see :ref:`dataset-versions`
+    gt = GeoTessera(dataset_version="v1.1", dataset_variant="cambridge")
 
 **2. Local File**::
 
-    gt = GeoTessera(registry_path="/path/to/registry.parquet")
+    gt = GeoTessera(registry_path="/path/to/manifest.parquet")
 
 **3. Local Directory**::
 
-    # Looks for registry.parquet in the directory
-    gt = GeoTessera(registry_dir="/path/to/registry-dir")
+    # Looks for manifest.parquet in the directory (also accepts the legacy
+    # registry.parquet name for backward compat).
+    gt = GeoTessera(registry_dir="/path/to/manifest-dir")
 
 **4. Custom URL**::
 
-    gt = GeoTessera(registry_url="https://example.com/registry.parquet")
+    gt = GeoTessera(registry_url="https://example.com/manifest.parquet")
 
 **5. CLI Option**::
 
@@ -279,23 +287,35 @@ Data Access Layer
 Direct HTTP Downloads
 ~~~~~~~~~~~~~~~~~~~~~
 
-GeoTessera uses direct HTTP downloads with temporary file handling:
+GeoTessera streams tiles directly from S3 over HTTPS:
 
 **Features**:
 
-- **Zero persistent storage**: Tiles downloaded to temp files and cleaned up immediately
-- **Integrity checking**: SHA256 verification for all downloads
+- **Per-output-dir mirroring**: Tiles land in the user-supplied
+  ``--output`` directory and persist there for re-use across runs
+- **Integrity checking**: End-to-end CRC64NVMe verified against S3's
+  ``x-amz-checksum-crc64nvme`` response header during the body stream
+- **Conditional caching**: Per-version manifests use ``If-None-Match`` /
+  ``ETag`` sidecars so unchanged manifests yield a 304 with zero body
 - **Progress callbacks**: Real-time download feedback with speed and size info
-- **Human-readable progress**: Download speeds shown in KB/s, MB/s format
-- **Automatic cleanup**: try/finally blocks ensure no leftover temp files
+- **Resumable**: Existing files in the output dir are skipped on rerun
 
 **Cache Structure**::
 
     ~/.cache/geotessera/
-    └── registry.parquet             # Only the registry is cached (~few MB)
+    ├── v1/
+    │   ├── manifest.parquet           # Per-version tile manifest
+    │   ├── manifest.parquet.etag      # HTTP ETag for conditional GETs
+    │   ├── landmasks.parquet
+    │   └── landmasks.parquet.etag
+    └── v1.1/
+        ├── manifest.parquet
+        ├── manifest.parquet.etag
+        ├── landmasks.parquet
+        └── landmasks.parquet.etag
 
-    # Note: Embedding and landmask tiles are NOT cached
-    # They are downloaded to temporary files and deleted after use
+    # Embedding/landmark tile data lives in the user's --output dir,
+    # not in this cache. The cache holds only per-version manifests.
 
 **Download Process**::
 

@@ -7,6 +7,19 @@ Sentinel-2 satellite imagery to generate 128-channel representation maps at 10m
 resolution, compressing a full year of temporal-spectral features into dense
 representations optimized for downstream geospatial analysis tasks.
 
+.. important::
+
+   **Two Tessera versions are now published.** Prefer the newer **1.1** model
+   wherever it's available; it's a strict improvement over the legacy 1.0
+   line. The 1.1 currently runs in a ``cambridge`` variant — test embeddings
+   produced by the Cambridge team while the model is being rolled out. The
+   legacy 1.0 line is frozen (no new years will be added). **Never mix
+   embeddings from different versions or variants in the same downstream
+   task**: the 128-channel feature spaces are independently learned and not
+   interchangeable. Pick one ``(dataset_version, dataset_variant)`` pair per
+   project. See :ref:`dataset-versions` for full details and the CLI/Python
+   flags.
+
 Overview
 --------
 
@@ -170,42 +183,47 @@ Data Flow
 
 ::
 
-    User Request (lat/lon bbox)
+    User Request (lat/lon bbox, dataset_version, dataset_variant)
         ↓
-    Parquet Registry Lookup (find available tiles from registry.parquet)
+    Per-version Manifest Lookup (filter manifest.parquet by year/lon/lat/variant)
         ↓
-    Direct HTTP Downloads to Temp Files
-        ├── embedding.npy (quantized) → temp file
-        └── embedding_scales.npy → temp file
+    HTTP Downloads (with CRC64NVMe verification on the wire)
+        ├── embedding.npy (int8 quantized) → output_dir
+        └── embedding_scales.npy (float32 scale factors) → output_dir
         ↓
-    Dequantization (multiply arrays)
-        ↓
-    Automatic Cleanup (delete temp files)
+    Dequantization at use time: float = quantized.astype('f4') * scales
         ↓
     Output Format
-        ├── NumPy arrays → Direct analysis
-        └── GeoTIFF → GIS integration
+        ├── NumPy arrays + tessera_metadata.json sidecar → Direct analysis
+        └── GeoTIFF (with TESSERA_DATASET_VERSION/VARIANT tags) → GIS integration
 
-**Storage Note**: Only the Parquet registry (~few MB) is cached locally. All embedding data
-is downloaded on-demand to temporary files and immediately cleaned up, resulting in zero
-persistent storage overhead for tile data.
+**Storage Note**: Manifest + landmask Parquets (~hundreds of MB combined) are
+cached per-version under ``~/.cache/geotessera/{v1,v1.1}/``. Embedding tiles
+land in the user-specified ``--output`` directory (resumable across runs via
+existence checks).
 
-Registry System
+Manifest System
 ~~~~~~~~~~~~~~~
 
-GeoTessera uses a Parquet-based registry system for efficient data access:
+GeoTessera uses a Parquet-based per-version manifest for efficient data access:
 
-* **Single Parquet file**: All tile metadata stored in one efficient ``registry.parquet`` file
-* **Fast queries**: Uses pandas DataFrames for efficient spatial and temporal filtering
-* **Block-based organization**: Internal 5×5 degree geographic blocks for efficient queries
-* **Minimal storage**: Registry file is ~few MB and cached locally
-* **Integrity checking**: SHA256 checksums ensure data integrity during downloads
+* **One manifest per dataset version**: ``s3://tessera-embeddings/{v1,v1.1}/manifest.parquet``.
+  Each carries the file-scan inventory schema (``year, lon, lat, grid_size,
+  scales_size, grid_path, ...``) plus explicit ``version`` and ``variant``
+  columns so a single file covers every variant in that version.
+* **Fast queries**: pandas/GeoPandas DataFrames with spatial R-tree on lon/lat
+* **Block-based queries**: Internal 5×5° geographic blocks keep region lookups O(blocks)
+* **Conditional fetches**: Per-version ETag sidecars enable ``If-None-Match``
+  conditional GETs — refetches only happen when the bucket's ETag actually
+  changes; otherwise the server returns 304 with no body.
+* **Integrity checking**: End-to-end CRC64NVMe verification using S3's
+  ``x-amz-checksum-crc64nvme`` response header on every download.
 
-The registry can be loaded from multiple sources:
+The manifest can be loaded from multiple sources:
 
-1. **Default remote** (recommended, downloads and caches automatically)
+1. **Default remote** (recommended, downloads and caches automatically per version)
 2. **Local file** (via ``--registry-path`` parameter)
-3. **Local directory** (via ``--registry-dir`` parameter, looks for ``registry.parquet``)
+3. **Local directory** (via ``--registry-dir`` parameter, looks for ``manifest.parquet``)
 4. **Custom URL** (via ``--registry-url`` parameter)
 
 Understanding Tessera Embeddings
@@ -222,36 +240,177 @@ The 128 channels capture various environmental features learned by the
 Tessera foundation model, including vegetation patterns, water bodies,
 urban structures, and seasonal changes.
 
+.. _dataset-versions:
+
+Dataset Versions and Variants
+-----------------------------
+
+GeoTessera ships embeddings under two orthogonal axes:
+
+* **dataset version** — the trained Tessera model (``1.0`` or ``1.1``).
+  Different versions have *different 128-channel feature spaces*: a feature
+  vector from one version is **not comparable** to a vector from another.
+* **dataset variant** — for a given version, an independent model run /
+  release channel. The default is ``vultr`` (the production hosting on
+  Vultr); ``cambridge`` is a test deployment by the Cambridge team for the
+  1.1 line.
+
+Currently published combinations on ``s3://tessera-embeddings/``:
+
++-------------+------------------+--------------+----------------+----------------------------------------------------------------+
+| ``version`` | ``S3 path``      | ``variant``  | Years          | Notes                                                          |
++=============+==================+==============+================+================================================================+
+| ``1.0``     | ``v1/``          | ``vultr``    | 2017–2025      | Legacy production line. Frozen — no new years will be added.   |
++-------------+------------------+--------------+----------------+----------------------------------------------------------------+
+| ``1.1``     | ``v1.1/``        | ``cambridge``| 2017–2025      | Newer model. Cambridge test embeddings; active development.    |
++-------------+------------------+--------------+----------------+----------------------------------------------------------------+
+
+Which one should I use?
+~~~~~~~~~~~~~~~~~~~~~~~
+
+**Prefer ``1.1`` / ``cambridge`` for new projects** where it's available
+— it reflects the latest model and is where ongoing development happens.
+Stick with ``1.0`` / ``vultr`` only if you're (a) reproducing prior
+published work that used it, or (b) need a specific tile that the 1.1
+deployment doesn't yet have.
+
+.. warning::
+
+   **Do not mix embeddings from different ``(version, variant)`` pairs in
+   the same analysis.** Each (version, variant) is a distinct learned
+   representation:
+
+   * Cosine similarity, classification heads, clustering, PCA, or any
+     downstream model trained on one set produces meaningless results if
+     fed vectors from another.
+   * Even tiles at the same lat/lon for the same year carry *different
+     numeric values* across versions/variants. The grid geometry matches;
+     the channel semantics do not.
+
+   GeoTessera enforces a single ``(version, variant)`` per ``GeoTessera``
+   instance and records the choice in the ``tessera_metadata.json``
+   sidecar that every download writes — re-check that file before
+   combining datasets from different runs.
+
+Specifying version + variant
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+**CLI** — every data-fetching command (``download``, ``coverage``, ``info``)
+accepts both flags::
+
+    geotessera download \
+        --dataset-version v1.1 \
+        --dataset-variant cambridge \
+        --region-file area.geojson \
+        --year 2024 \
+        --output ./tiles
+
+``--dataset-version`` accepts either form: ``v1`` and ``1.0`` are aliases
+(legacy S3 path uses ``v1/``); ``v1.1`` and ``1.1`` are aliases. The
+internal normalised form (used in manifests and the metadata sidecar) is
+``1.0`` / ``1.1``; the S3 path component is ``v1`` / ``v1.1``.
+
+``--dataset-variant`` defaults to ``vultr`` so unflagged commands keep
+working against the legacy line; pass ``cambridge`` (or any other
+published variant) explicitly.
+
+**Python API**::
+
+    from geotessera import GeoTessera
+
+    # Default: dataset_version='v1', dataset_variant='vultr' (legacy 1.0)
+    gt = GeoTessera()
+
+    # Recommended for new work:
+    gt = GeoTessera(dataset_version='v1.1', dataset_variant='cambridge')
+
+    # Either of these is also accepted:
+    gt = GeoTessera(dataset_version='1.1', dataset_variant='cambridge')
+
+    # Inspect what's loaded:
+    print(gt.dataset_version, gt.dataset_variant)
+    print(sorted(gt.registry.get_available_years()))
+
+What gets recorded
+~~~~~~~~~~~~~~~~~~
+
+Every NPY download drops a ``tessera_metadata.json`` sidecar in the output
+directory with the resolved ``(version, variant)``, the S3 URL prefix the
+tiles came from, generation time, and tile count. Every exported GeoTIFF
+is stamped with ``TESSERA_DATASET_VERSION``, ``TESSERA_DATASET_VERSION_PATH``,
+and ``TESSERA_DATASET_VARIANT`` metadata tags. Use these as the source of
+truth for which run produced a given file — local directory names alone
+won't tell you (NPY tiles always land under ``global_0.1_degree_representation/``
+regardless of variant, by design).
+
+Coverage compositing
+~~~~~~~~~~~~~~~~~~~~
+
+For situations where you want to *visualise* multiple versions/variants
+together (without combining them analytically), ``geotessera coverage
+--by-source`` renders each ``(version, variant)`` group in its own colour
+on the same map and produces an interactive ``globe.html`` with per-dataset
+layer toggles. See the CLI reference for the full flag set.
+
+
 Data Organization
 -----------------
 
-**Remote Server Structure**::
+**Remote Server Structure** (S3, ``us-west-2``)::
 
     https://s3.us-west-2.amazonaws.com/tessera-embeddings/
-    ├── v1/                              # Dataset version
-    │   ├── registry.parquet             # Parquet registry with all metadata
-    │   ├── 2024/                        # Year
-    │   │   ├── grid_0.15_52.05/         # Tile (named by center coords)
-    │   │   │   ├── grid_0.15_52.05.npy              # Quantized embeddings
-    │   │   │   └── grid_0.15_52.05_scales.npy       # Scale factors
-    │   │   └── ...
-    │   └── landmasks/
-    │       ├── grid_0.15_52.05.tiff     # Landmask with projection info
-    │       └── ...
+    ├── v1/                                          # Dataset version 1.0
+    │   ├── manifest.parquet                         # Per-version tile manifest
+    │   ├── landmasks.parquet                        # Landmask manifest
+    │   ├── global_0.1_degree_representation/        # vultr variant (default)
+    │   │   └── 2024/grid_0.15_52.05/grid_0.15_52.05{,_scales}.npy
+    │   └── global_0.1_degree_tiff_all/
+    │       └── grid_0.15_52.05.tiff                 # Landmask TIFF
+    └── v1.1/                                        # Dataset version 1.1
+        ├── manifest.parquet
+        ├── landmasks.parquet                        # Copy of v1's (same grid)
+        └── global_0.1_degree_representation.cambridge/
+            └── 2024/grid_0.15_52.05/grid_0.15_52.05{,_scales}.npy
 
-**Local Cache Structure**::
+Each ``manifest.parquet`` is scoped to one version and lists every
+``(year, lon, lat)`` tile available for that version's variants. The
+client downloads only the manifest matching its ``dataset_version`` and
+filters by ``dataset_variant`` on load.
 
-    ~/.cache/geotessera/                 # Default cache location
-    └── registry.parquet                 # Cached Parquet registry (~few MB)
+**Local Mirror Structure** (when downloading via ``geotessera download``)::
 
-    # Note: Embedding and landmask tiles are NOT cached persistently.
-    # They are downloaded to temporary files and immediately cleaned up after use.
+    output_dir/
+    ├── tessera_metadata.json                        # version/variant provenance
+    ├── global_0.1_degree_representation/            # Always this bare name,
+    │   └── 2024/grid_0.15_52.05/                    # regardless of variant.
+    │       ├── grid_0.15_52.05.npy
+    │       └── grid_0.15_52.05_scales.npy
+    └── global_0.1_degree_tiff_all/
+        └── grid_0.15_52.05.tiff
+
+**Local Cache Structure** (manifests + landmark manifests, per-version)::
+
+    ~/.cache/geotessera/                             # Default cache location
+    ├── v1/
+    │   ├── manifest.parquet
+    │   ├── manifest.parquet.etag                    # HTTP ETag for conditional GETs
+    │   ├── landmasks.parquet
+    │   └── landmasks.parquet.etag
+    └── v1.1/
+        ├── manifest.parquet
+        ├── manifest.parquet.etag
+        ├── landmasks.parquet
+        └── landmasks.parquet.etag
+
+The ``.etag`` sidecars enable conditional ``If-None-Match`` requests: the
+client refetches only when the bucket's ETag has actually changed, and S3
+returns ``304 Not Modified`` (zero body bytes) otherwise.
 
 Embeddings are organized by:
 
-* **Year**: 2017-2025 (depending on availability)
-* **Location**: Global 0.1-degree grid system
-* **Format**: NumPy arrays with shape (height, width, 128)
+* **Year**: 2017–2025 for both ``v1/vultr`` and ``v1.1/cambridge``
+* **Location**: Global 0.1-degree grid system (same grid across all versions)
+* **Format**: NumPy arrays with shape (height, width, 128) after dequantisation
 
 Cache Configuration
 -------------------
