@@ -87,8 +87,9 @@ Run command and check output:
 ### Test Structure
 
 - `tests/cli.t` - CLI command tests
-- `tests/hash.t` - Hash verification tests
+- `tests/tile.t` - Single-tile / `--tile` tests
 - `tests/viz.t` - Visualization tests
+- `tests/v11.t` - v1.1 / variant filtering + sidecar tests
 
 ### Running Tests
 

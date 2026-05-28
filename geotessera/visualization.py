@@ -122,6 +122,236 @@ def analyze_geotiff_coverage(geotiff_paths: List[str]) -> Dict:
     return coverage_info
 
 
+def visualize_sources_coverage(
+    manifest_path: Union[str, Path, List[Union[str, Path]]],
+    output_path: str = "tessera_sources.png",
+    year: Optional[int] = None,
+    width_pixels: int = 2000,
+    show_countries: bool = True,
+    tile_alpha: float = 0.6,
+    tile_size: float = 1.0,
+    versions: Optional[List[str]] = None,
+    variants: Optional[List[str]] = None,
+    region_bbox: Optional[Tuple[float, float, float, float]] = None,
+    region_file: Optional[str] = None,
+    progress_callback: Optional[Callable] = None,
+) -> str:
+    """Render coverage colored by ``(version, variant)`` source from a manifest.
+
+    Reads the raw, unfiltered manifest parquet (so a single global manifest
+    that spans multiple versions and variants can be visualised side-by-side)
+    and renders each ``(version, variant)`` group in a distinct colour with a
+    legend.
+
+    Args:
+        manifest_path: Local path to a manifest parquet — or a list of paths
+            which are concatenated before rendering. With per-version manifests
+            on S3 (``s3://tessera-embeddings/{v}/manifest.parquet``), pass a
+            list to compare versions on a single map.
+        output_path: Output PNG path.
+        year: Optional year filter (applies to all sources).
+        width_pixels: Output image width in pixels.
+        show_countries: Overlay country boundaries.
+        tile_alpha: Tile transparency (0–1).
+        tile_size: Multiplier on tile dimensions (1.0 = actual size).
+        versions: Optional list of normalised versions (e.g. ``["1.0", "1.1"]``)
+            to restrict rendering to. ``None`` = all versions present.
+        variants: Optional list of variant names to restrict to. ``None`` = all.
+        region_bbox: Optional ``(min_lon, min_lat, max_lon, max_lat)`` clip.
+        region_file: Optional GeoJSON/Shapefile to overlay as the region boundary.
+        progress_callback: Optional ``(current, total, status)`` callback.
+
+    Returns:
+        Path to the created PNG file.
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+        from matplotlib.collections import PatchCollection
+        import geodatasets
+    except ImportError:
+        raise ImportError(
+            "Please install required packages: pip install matplotlib geodatasets"
+        )
+
+    from .registry import tile_to_bounds
+
+    if progress_callback:
+        progress_callback(0, 100, "Loading manifest(s)...")
+    if isinstance(manifest_path, (str, Path)):
+        manifest_paths: List[Union[str, Path]] = [manifest_path]
+    else:
+        manifest_paths = list(manifest_path)
+    df = pd.concat([pd.read_parquet(p) for p in manifest_paths], ignore_index=True)
+    required = {"lat", "lon", "year"}
+    if not required.issubset(df.columns):
+        raise ValueError(
+            f"Manifest at {manifest_path} is missing required columns: "
+            f"{required - set(df.columns)}"
+        )
+    # Tag missing version/variant columns so old single-source manifests still
+    # render as one group.
+    if "version" not in df.columns:
+        df["version"] = "unknown"
+    if "variant" not in df.columns:
+        df["variant"] = "unknown"
+
+    if year is not None:
+        df = df[df["year"] == year]
+    if versions:
+        df = df[df["version"].astype(str).isin([str(v) for v in versions])]
+    if variants:
+        df = df[df["variant"].astype(str).isin(variants)]
+    if region_bbox:
+        min_lon, min_lat, max_lon, max_lat = region_bbox
+        # Tile centres are 0.05° off the integer grid; expand bbox by half a
+        # tile so partially-overlapping tiles are kept.
+        df = df[
+            (df["lon"] >= min_lon - 0.05)
+            & (df["lon"] <= max_lon + 0.05)
+            & (df["lat"] >= min_lat - 0.05)
+            & (df["lat"] <= max_lat + 0.05)
+        ]
+
+    if df.empty:
+        raise ValueError(
+            "No tiles to render after filtering. Check --year / --dataset-version "
+            "/ --dataset-variant / region constraints."
+        )
+
+    # Stable colour assignment per (version, variant). matplotlib's tab10 has
+    # 10 distinguishable colours; cycle if we have more sources.
+    groups = sorted(
+        {(str(v), str(var)) for v, var in zip(df["version"], df["variant"])}
+    )
+    cmap = plt.get_cmap("tab10")
+    group_colors = {g: cmap(i % cmap.N) for i, g in enumerate(groups)}
+
+    if progress_callback:
+        progress_callback(5, 100, f"Found {len(groups)} source(s), {len(df):,} tiles")
+
+    world = None
+    if show_countries:
+        world = gpd.read_file(geodatasets.get_path("naturalearth.land"))
+        if region_bbox:
+            from shapely.geometry import box
+
+            world = world.clip(box(*region_bbox))
+
+    if region_bbox:
+        min_lon, min_lat, max_lon, max_lat = region_bbox
+        aspect_ratio = (max_lat - min_lat) / max(max_lon - min_lon, 1e-9)
+    else:
+        aspect_ratio = 0.5
+
+    dpi = 100
+    fig_width = width_pixels / dpi
+    fig, ax = plt.subplots(1, 1, figsize=(fig_width, fig_width * aspect_ratio), dpi=dpi)
+
+    if world is not None:
+        if progress_callback:
+            progress_callback(10, 100, "Plotting world map...")
+        world.plot(ax=ax, color="lightgray", edgecolor="darkgray", linewidth=0.5)
+
+    rectangles = []
+    total = len(df)
+    if progress_callback:
+        progress_callback(20, 100, f"Building {total:,} tile rectangles...")
+    half = 0.05 * tile_size
+    # Pull arrays directly — orders of magnitude faster than per-row Pandas access.
+    lons = df["lon"].to_numpy()
+    lats = df["lat"].to_numpy()
+    versions_arr = df["version"].astype(str).to_numpy()
+    variants_arr = df["variant"].astype(str).to_numpy()
+    for i in range(len(df)):
+        if progress_callback and (i % 5000 == 0 or i == total - 1):
+            progress_callback(
+                20 + int((i / max(total, 1)) * 50),
+                100,
+                f"Tile {i + 1}/{total}",
+            )
+        west, south, east, north = tile_to_bounds(lons[i], lats[i])
+        if tile_size != 1.0:
+            cl, cb = lons[i], lats[i]
+            west, east = cl - half, cl + half
+            south, north = cb - half, cb + half
+        color = group_colors[(versions_arr[i], variants_arr[i])]
+        rectangles.append(
+            mpatches.Rectangle(
+                (west, south),
+                east - west,
+                north - south,
+                linewidth=0,
+                facecolor=color,
+                alpha=tile_alpha,
+            )
+        )
+
+    if progress_callback:
+        progress_callback(70, 100, "Adding tiles to map...")
+    ax.add_collection(PatchCollection(rectangles, match_original=True))
+
+    if region_bbox:
+        min_lon, min_lat, max_lon, max_lat = region_bbox
+        lon_buf = (max_lon - min_lon) * 0.05
+        lat_buf = (max_lat - min_lat) * 0.05
+        ax.set_xlim(min_lon - lon_buf, max_lon + lon_buf)
+        ax.set_ylim(min_lat - lat_buf, max_lat + lat_buf)
+    else:
+        ax.set_xlim(-180, 180)
+        ax.set_ylim(-90, 90)
+
+    ax.set_xlabel("Longitude", fontsize=12)
+    ax.set_ylabel("Latitude", fontsize=12)
+    title_parts = ["Tessera Coverage by Source"]
+    if year is not None:
+        title_parts.append(f"Year {year}")
+    if region_bbox:
+        title_parts.append("(Region View)")
+    ax.set_title(" – ".join(title_parts), fontsize=14, fontweight="bold")
+
+    if region_file:
+        try:
+            region_gdf = gpd.read_file(region_file)
+            region_gdf.plot(
+                ax=ax,
+                facecolor="none",
+                edgecolor="red",
+                linewidth=2,
+                alpha=0.8,
+                linestyle="--",
+            )
+        except Exception as e:
+            logger.warning(f"Could not load region file: {e}")
+
+    ax.grid(True, alpha=0.3, linestyle="--")
+
+    legend_elements = [
+        mpatches.Patch(
+            color=group_colors[(v, var)],
+            alpha=tile_alpha,
+            label=f"{v} / {var} ({((versions_arr == v) & (variants_arr == var)).sum():,} tiles)",
+        )
+        for v, var in groups
+    ]
+    if world is not None:
+        legend_elements.append(mpatches.Patch(color="lightgray", label="Land masses"))
+    if region_file:
+        legend_elements.append(
+            mpatches.Patch(facecolor="none", edgecolor="red", label="Region boundary")
+        )
+    ax.legend(handles=legend_elements, loc="lower left", fontsize=10)
+
+    if progress_callback:
+        progress_callback(90, 100, "Saving image to disk...")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=dpi, bbox_inches="tight")
+    plt.close()
+    if progress_callback:
+        progress_callback(100, 100, "Done!")
+    return output_path
+
+
 def visualize_global_coverage(
     tessera_client,
     output_path: str = "tessera_coverage.png",

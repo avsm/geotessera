@@ -110,7 +110,7 @@ try {
     $versionOutput = Invoke-Geotessera -Arguments @("version")
     $versionOutput = ($versionOutput | Out-String).Trim()
 
-    $expectedVersion = "0.8.0"
+    $expectedVersion = "0.9.0"
     $versionPassed = $versionOutput -eq $expectedVersion
     Write-TestResult -TestName "Version command returns $expectedVersion" -Passed $versionPassed -Details "Got: $versionOutput"
 
@@ -127,8 +127,11 @@ try {
     $hasAvailableYears = $infoString -match "Available years"
     Write-TestResult -TestName "Info command shows 'Available years'" -Passed $hasAvailableYears
 
-    $hasDownloadingRegistry = $infoString -match "Downloading registry"
-    Write-TestResult -TestName "Info command shows registry download" -Passed $hasDownloadingRegistry
+    # Manifest replaces the old per-version registry.parquet (see PR #250).
+    # Either of these phrases is acceptable — a cold run downloads the
+    # manifest fresh; a warm cache logs "Using cached manifest" instead.
+    $hasManifestFetch = $infoString -match "(Downloading|Using cached) manifest"
+    Write-TestResult -TestName "Info command fetches manifest" -Passed $hasManifestFetch
 
     if ($Verbose) {
         Write-Host "Output:"
@@ -387,8 +390,11 @@ try {
             $hasGlobeTitle = $globeContent -match "GeoTessera Globe Visualization"
             Write-TestResult -TestName "globe.html has correct title" -Passed $hasGlobeTitle
 
-            $hasLegend = $globeContent -match "Legend:"
-            Write-TestResult -TestName "globe.html has legend" -Passed $hasLegend
+            # PR #250 replaced the static "Legend:" block with a dynamic
+            # per-dataset "Layers" panel populated client-side from
+            # coverage.json. Assert on the new anchor instead.
+            $hasLayerPanel = $globeContent -match '<div id="layerList"'
+            Write-TestResult -TestName "globe.html has layers panel" -Passed $hasLayerPanel
         } catch {
             Write-TestResult -TestName "globe.html is readable as UTF-8" -Passed $false -Details $_.Exception.Message
         }

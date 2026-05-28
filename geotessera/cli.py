@@ -5,6 +5,7 @@ Focused on downloading tiles and creating visualizations from the generated GeoT
 
 # Will configure logging after imports
 
+import os
 import webbrowser
 import threading
 import time
@@ -165,7 +166,6 @@ def emoji(text):
     Returns:
         The emoji text if capable terminal, empty string otherwise
     """
-    import os
     import sys
 
     # Check for dumb terminal
@@ -332,9 +332,15 @@ def info(
     dataset_version: Annotated[
         str,
         typer.Option(
-            "--dataset-version", help="Tessera dataset version (e.g., v1, v2)"
+            "--dataset-version", help="Tessera dataset version (e.g., v1, v1.1)"
         ),
     ] = "v1",
+    dataset_variant: Annotated[
+        str,
+        typer.Option(
+            "--dataset-variant", help="Tessera dataset variant (default: vultr)"
+        ),
+    ] = "vultr",
     verbose: Annotated[
         bool, typer.Option("--verbose", "-v", help="Verbose output")
     ] = False,
@@ -495,7 +501,9 @@ def info(
 
     else:
         # Show library info
-        gt = GeoTessera(dataset_version=dataset_version)
+        gt = GeoTessera(
+            dataset_version=dataset_version, dataset_variant=dataset_variant
+        )
         years = gt.registry.get_available_years()
 
         # Count tiles per year using fast pandas operations
@@ -592,9 +600,34 @@ def coverage(
         bool,
         typer.Option("--no-multi-year-colors", help="Disable multi-year color coding"),
     ] = False,
+    by_source: Annotated[
+        bool,
+        typer.Option(
+            "--by-source",
+            help="Render each (version, variant) source in a distinct colour. "
+            "When set without an explicit --dataset-version/--dataset-variant, "
+            "downloads every known version's manifest and renders all sources.",
+        ),
+    ] = False,
     dataset_version: Annotated[
-        str, typer.Option("--dataset-version", help="Tessera dataset version")
-    ] = "v1",
+        Optional[str],
+        typer.Option(
+            "--dataset-version",
+            help="Tessera dataset version (e.g. v1, v1.1). Defaults to v1 "
+            "for the single-source view; with --by-source, omitting this "
+            "flag means 'all known versions'. Pass 'all' explicitly to "
+            "force the multi-version view.",
+        ),
+    ] = None,
+    dataset_variant: Annotated[
+        Optional[str],
+        typer.Option(
+            "--dataset-variant",
+            help="Tessera dataset variant. Defaults to vultr for the "
+            "single-source view; with --by-source, omitting this means "
+            "'all variants'. Pass 'all' explicitly to force the multi-variant view.",
+        ),
+    ] = None,
     cache_dir: Annotated[
         Optional[Path], typer.Option("--cache-dir", help="Cache directory")
     ] = None,
@@ -786,8 +819,29 @@ def coverage(
     if verbose:
         rprint("[blue]Initializing GeoTessera...[/blue]")
 
+    # Resolve flag defaults. The defaults differ between single-source and
+    # --by-source modes so the "complete picture" rendering doesn't require
+    # the user to type --dataset-version=all every time.
+    if by_source:
+        version_spec = dataset_version if dataset_version is not None else "all"
+        variant_spec = dataset_variant if dataset_variant is not None else "all"
+    else:
+        version_spec = dataset_version if dataset_version is not None else "v1"
+        variant_spec = dataset_variant if dataset_variant is not None else "vultr"
+
+    # The placeholder GeoTessera below initialises one Registry to get its
+    # cache paths; additional manifests are downloaded into the same cache
+    # dir when by-source spans multiple versions.
+    init_version = (
+        "v1" if (by_source and version_spec.lower() == "all") else version_spec
+    )
+    init_variant = (
+        "vultr" if (by_source and variant_spec.lower() == "all") else variant_spec
+    )
+
     gt = GeoTessera(
-        dataset_version=dataset_version,
+        dataset_version=init_version,
+        dataset_variant=init_variant,
         cache_dir=str(cache_dir) if cache_dir else None,
         registry_dir=str(registry_dir) if registry_dir else None,
     )
@@ -813,6 +867,26 @@ def coverage(
                     f"[blue]Generating coverage map for year: {year if year else 'All years'}[/blue]"
                 )
 
+            # Resolve --output into (png_path, ancillary_dir). When the user
+            # passes a directory-style path (no image suffix, or trailing slash,
+            # or an existing directory), treat it as a folder and put both the
+            # PNG and the ancillary coverage.json / globe.html / per-year files
+            # inside it. Otherwise the path is a PNG file and ancillaries go
+            # next to it in the parent directory.
+            image_suffixes = {".png", ".jpg", ".jpeg"}
+            looks_like_dir = (
+                output.suffix.lower() not in image_suffixes
+                or output.is_dir()
+                or str(output).endswith(("/", os.sep))
+            )
+            if looks_like_dir:
+                ancillary_dir = output
+                ancillary_dir.mkdir(parents=True, exist_ok=True)
+                output = ancillary_dir / "tessera_coverage.png"
+            else:
+                ancillary_dir = output.parent or Path(".")
+                ancillary_dir.mkdir(parents=True, exist_ok=True)
+
             # When using region files or countries, default to no countries for cleaner view
             show_countries_final = not no_countries and not region_file and not country
 
@@ -829,20 +903,78 @@ def coverage(
             ):
                 region_file_to_use = country_geojson_file
 
-            output_path = visualize_global_coverage(
-                tessera_client=gt,
-                output_path=str(output),
-                year=year,
-                width_pixels=width_pixels,
-                show_countries=show_countries_final,
-                tile_color=tile_color,
-                tile_alpha=tile_alpha,
-                tile_size=tile_size,
-                multi_year_colors=not no_multi_year_colors,
-                progress_callback=create_progress_callback(progress, task),
-                region_bbox=region_bbox,
-                region_file=region_file_to_use,
-            )
+            if by_source:
+                # Multi-source render. With per-version manifests on S3 we
+                # download one manifest per requested dataset version and
+                # concat them in the renderer.
+                from geotessera.visualization import visualize_sources_coverage
+                from geotessera.registry import (
+                    _parse_dataset_version,
+                    download_file_to_temp,
+                    KNOWN_VERSIONS,
+                    TESSERA_BASE_URL,
+                )
+
+                if version_spec.lower() == "all":
+                    target_version_paths = list(KNOWN_VERSIONS)
+                else:
+                    vpath, _ = _parse_dataset_version(version_spec)
+                    target_version_paths = [vpath]
+
+                manifest_paths = []
+                for vp in target_version_paths:
+                    cache_path = (
+                        gt.registry._registry_cache_dir / vp / "manifest.parquet"
+                    )
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    if vp == gt.registry._version_path:
+                        # Already downloaded during GeoTessera init.
+                        manifest_paths.append(gt.registry.manifest_path)
+                        continue
+                    url = f"{TESSERA_BASE_URL}/{vp}/manifest.parquet"
+                    try:
+                        manifest_paths.append(
+                            Path(download_file_to_temp(url, cache_path=cache_path))
+                        )
+                    except Exception as e:
+                        rprint(f"[yellow]Skipping {vp}: {e}[/yellow]")
+
+                if not manifest_paths:
+                    rprint("[red]No manifests available to render.[/red]")
+                    raise typer.Exit(1)
+
+                variants_filter = None
+                if variant_spec.lower() != "all":
+                    variants_filter = [variant_spec]
+
+                output_path = visualize_sources_coverage(
+                    manifest_path=manifest_paths,
+                    output_path=str(output),
+                    year=year,
+                    width_pixels=width_pixels,
+                    show_countries=show_countries_final,
+                    tile_alpha=tile_alpha,
+                    tile_size=tile_size,
+                    variants=variants_filter,
+                    region_bbox=region_bbox,
+                    region_file=region_file_to_use,
+                    progress_callback=create_progress_callback(progress, task),
+                )
+            else:
+                output_path = visualize_global_coverage(
+                    tessera_client=gt,
+                    output_path=str(output),
+                    year=year,
+                    width_pixels=width_pixels,
+                    show_countries=show_countries_final,
+                    tile_color=tile_color,
+                    tile_alpha=tile_alpha,
+                    tile_size=tile_size,
+                    multi_year_colors=not no_multi_year_colors,
+                    progress_callback=create_progress_callback(progress, task),
+                    region_bbox=region_bbox,
+                    region_file=region_file_to_use,
+                )
 
         rprint(f"[green]{emoji('✅ ')}Coverage map saved to: {output_path}[/green]")
 
@@ -886,37 +1018,143 @@ def coverage(
                         f"[cyan]{emoji('📅 ')}Years covered: {min(years)}-{max(years)}[/cyan]"
                     )
 
-        # Also generate JSON + HTML globe visualization
+        # Also generate JSON + HTML globe visualization. In --by-source mode
+        # we emit one texture + per-year JSON set per (version, variant) so
+        # globe.html can toggle layers.
         rprint("\n[blue]Generating interactive globe visualization...[/blue]")
         try:
-            # Determine output paths for JSON and HTML in same directory as PNG
-            output_dir = Path(output_path).parent
-            json_path = output_dir / "coverage.json"
-            texture_path = output_dir / "coverage_texture.png"
+            output_dir = ancillary_dir
             globe_html_path = output_dir / "globe.html"
 
-            # Export coverage map data
-            coverage_data = gt.export_coverage_map(output_file=str(json_path))
+            # Build the list of datasets the globe should know about.
+            #   Single-source coverage: just the one (version, variant) selected.
+            #   --by-source coverage: every (version, variant) the user asked for.
+            from geotessera.registry import (
+                _parse_dataset_version,
+                KNOWN_VERSIONS,
+            )
 
-            # Generate coverage texture (server-side for performance)
-            rprint("[blue]Generating coverage texture (3600x1800 pixels)...[/blue]")
-            gt.generate_coverage_texture(coverage_data, output_file=str(texture_path))
+            datasets_to_export = []  # list of dicts: {dataset_version, dataset_variant, dataset_id, color}
+            # Stable tab10-ish palette so layer colours match the static PNG.
+            palette = [
+                (31, 119, 180),  # tab:blue
+                (255, 127, 14),  # tab:orange
+                (44, 160, 44),  # tab:green
+                (214, 39, 40),  # tab:red
+                (148, 103, 189),  # tab:purple
+                (140, 86, 75),  # tab:brown
+            ]
+            if by_source:
+                # Walk the same combos that the static PNG rendered.
+                version_paths = (
+                    list(KNOWN_VERSIONS)
+                    if version_spec.lower() == "all"
+                    else [_parse_dataset_version(version_spec)[0]]
+                )
+                # For variant we'd ideally probe each manifest; for now treat
+                # 'all' as the wildcard and let the per-dataset GeoTessera init
+                # fail-soft if the (version, variant) pair has no rows.
+                variant_choices = (
+                    [variant_spec]
+                    if variant_spec.lower() != "all"
+                    else ["vultr", "cambridge"]  # current known variants
+                )
+                combos = [(v, var) for v in version_paths for var in variant_choices]
+            else:
+                combos = [(init_version, init_variant)]
+
+            color_idx = 0
+            for vspec, vrnt in combos:
+                vpath, vnorm = _parse_dataset_version(vspec)
+                dataset_id = f"{vpath}_{vrnt}"
+                color = palette[color_idx % len(palette)]
+                color_idx += 1
+                datasets_to_export.append(
+                    {
+                        "dataset_version": vspec,
+                        "dataset_version_norm": vnorm,
+                        "dataset_version_path": vpath,
+                        "dataset_variant": vrnt,
+                        "dataset_id": dataset_id,
+                        "color": color,
+                    }
+                )
+
+            # Per-dataset GeoTessera instances. Reuse `gt` when its
+            # (version, variant) matches a combo so we don't redownload.
+            dataset_index = []  # entries that will land in coverage.json
+            for ds in datasets_to_export:
+                if (
+                    ds["dataset_version_path"] == gt.registry._version_path
+                    and ds["dataset_variant"] == gt.registry._variant
+                ):
+                    ds_gt = gt
+                else:
+                    try:
+                        from geotessera import GeoTessera as _GT
+
+                        ds_gt = _GT(
+                            dataset_version=ds["dataset_version"],
+                            dataset_variant=ds["dataset_variant"],
+                            cache_dir=str(cache_dir) if cache_dir else None,
+                            registry_dir=str(registry_dir) if registry_dir else None,
+                        )
+                    except Exception as e:
+                        rprint(f"[yellow]Skipping {ds['dataset_id']}: {e}[/yellow]")
+                        continue
+
+                ds_id = ds["dataset_id"]
+                json_path = output_dir / f"coverage_{ds_id}.json"
+                texture_path = output_dir / f"coverage_texture_{ds_id}.png"
+
+                rprint(f"[blue]Exporting coverage for {ds_id}...[/blue]")
+                coverage_data = ds_gt.export_coverage_map(
+                    output_file=str(json_path), dataset_id=ds_id
+                )
+                ds_gt.generate_coverage_texture(
+                    coverage_data,
+                    output_file=str(texture_path),
+                    tint_color=ds["color"],
+                )
+
+                dataset_index.append(
+                    {
+                        "id": ds_id,
+                        "version": ds["dataset_version_norm"],
+                        "version_path": ds["dataset_version_path"],
+                        "variant": ds["dataset_variant"],
+                        "color": list(ds["color"]),
+                        "years": coverage_data["years"],
+                        "coverage_json": f"coverage_{ds_id}.json",
+                        "texture_png": f"coverage_texture_{ds_id}.png",
+                    }
+                )
+
+            # Top-level coverage.json indexing every dataset.
+            top_index = output_dir / "coverage.json"
+            import json as _json
+
+            with open(top_index, "w", encoding="utf-8") as f:
+                _json.dump(
+                    {"datasets": dataset_index, "schema_version": 2},
+                    f,
+                    separators=(",", ":"),
+                )
 
             # Generate globe.html
             with open(globe_html_path, "w", encoding="utf-8") as f:
                 f.write(_get_globe_html_template())
 
-            # List per-year files that were generated
-            year_files = sorted(output_dir.glob("coverage_*.json"))
             rprint(
-                f"[green]{emoji('✅ ')}Coverage data exported to: {json_path} + {len(year_files)} per-year files[/green]"
+                f"[green]{emoji('✅ ')}Coverage index: {top_index} "
+                f"({len(dataset_index)} dataset(s))[/green]"
             )
-            rprint(
-                f"[green]{emoji('✅ ')}Coverage texture exported to: {texture_path}[/green]"
-            )
-            rprint(
-                f"[green]{emoji('✅ ')}Globe viewer exported to: {globe_html_path}[/green]"
-            )
+            for entry in dataset_index:
+                rprint(
+                    f"   • {entry['id']}: {len(entry['years'])} year(s), "
+                    f"texture {entry['texture_png']}"
+                )
+            rprint(f"[green]{emoji('✅ ')}Globe viewer: {globe_html_path}[/green]")
             rprint(
                 f"[dim]   Open {globe_html_path} in a web browser for interactive visualization[/dim]"
             )
@@ -1019,9 +1257,15 @@ def download(
     dataset_version: Annotated[
         str,
         typer.Option(
-            "--dataset-version", help="Tessera dataset version (e.g., v1, v2)"
+            "--dataset-version", help="Tessera dataset version (e.g., v1, v1.1)"
         ),
     ] = "v1",
+    dataset_variant: Annotated[
+        str,
+        typer.Option(
+            "--dataset-variant", help="Tessera dataset variant (default: vultr)"
+        ),
+    ] = "vultr",
     cache_dir: Annotated[
         Optional[Path], typer.Option("--cache-dir", help="Cache directory")
     ] = None,
@@ -1029,7 +1273,7 @@ def download(
         Optional[Path],
         typer.Option(
             "--registry-dir",
-            help="Directory containing registry.parquet and landmasks.parquet files",
+            help="Directory containing manifest.parquet and landmasks.parquet files",
         ),
     ] = None,
     verbose: Annotated[
@@ -1084,6 +1328,7 @@ def download(
     # Initialize GeoTessera with embeddings_dir set to output directory
     gt = GeoTessera(
         dataset_version=dataset_version,
+        dataset_variant=dataset_variant,
         cache_dir=str(cache_dir) if cache_dir else None,
         registry_dir=str(registry_dir) if registry_dir else None,
         embeddings_dir=str(output)
@@ -1392,7 +1637,11 @@ def download(
                     else:
                         rprint(
                             f"\n[green]{emoji('✅ ')}SUCCESS: Exported {len(files)} GeoTIFF files"
-                            + (f" ({skipped_files} skipped)" if skipped_files > 0 else "")
+                            + (
+                                f" ({skipped_files} skipped)"
+                                if skipped_files > 0
+                                else ""
+                            )
                             + "[/green]"
                         )
                     rprint(
@@ -1579,6 +1828,30 @@ def download(
                         rprint(
                             "   [yellow]Note: Band selection not supported in NPY format (use TIFF format instead)[/yellow]"
                         )
+
+        # Record provenance in a sidecar JSON. Local layout uses the bare
+        # global_0.1_degree_representation/ regardless of variant, so this
+        # file is the source of truth for which (version, variant) produced
+        # the tiles in this directory.
+        if not dry_run:
+            from geotessera.registry import write_tessera_metadata
+
+            try:
+                sidecar = write_tessera_metadata(
+                    output,
+                    dataset_version=dataset_version,
+                    dataset_variant=dataset_variant,
+                    extra={
+                        "format": format,
+                        "year": year,
+                        "tile_count": len(tiles_to_fetch),
+                    },
+                )
+                rprint(f"   Metadata written to: {sidecar}")
+            except Exception as e:
+                rprint(
+                    f"[yellow]   Warning: could not write sidecar metadata: {e}[/yellow]"
+                )
 
         if verbose or list_files:
             rprint(f"\n[blue]{emoji('📁 ')}Created files:[/blue]")
@@ -2384,77 +2657,159 @@ def _get_globe_html_template() -> str:
     <div class="info">
         <div><strong>Coverage Tiles:</strong> <span id="tileCount">0</span></div>
         <div><span id="status">Initializing...</span></div>
-        <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.3); font-size: 11px;">
-            <strong>Legend:</strong><br/>
-            <span style="color: #00c800;">■</span> Full coverage<br/>
-            <span style="color: #00b4ff;">■</span> Multi-year<br/>
-            <span style="color: #ffc800;">■</span> Latest year only<br/>
-            <span style="color: #c86400;">■</span> Older year<br/>
-            <span style="color: #666;">■</span> No tiles yet<br/>
-            <span style="opacity: 0.5;">■</span> Ocean
+        <div id="layerToggle" style="margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.3); font-size: 12px;">
+            <strong>Layers</strong>
+            <div id="layerList" style="margin-top: 6px;">Loading…</div>
+        </div>
+        <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.3); font-size: 11px; opacity: 0.7;">
+            Tiles shown where datasets have land coverage; toggle layers above to compare.
         </div>
     </div>
 
-    <script src="//unpkg.com/three@0.159.0/build/three.min.js"></script>
-    <script src="//unpkg.com/topojson-client@3"></script>
-    <script src="//unpkg.com/globe.gl"></script>
-    <script>
+    <!--
+      Modern ES-module loading via an import map. esm.sh's ?deps= pins the
+      peer-dependency Three version so globe.gl and our code share the same
+      THREE instance (no "Multiple instances of Three.js" warning) and no
+      UMD/Timer breakage. Pinned versions for reproducibility.
+    -->
+    <script type="importmap">
+    {
+      "imports": {
+        "three": "https://esm.sh/three@0.179.0",
+        "globe.gl": "https://esm.sh/globe.gl@2.46.1?deps=three@0.179.0",
+        "topojson-client": "https://esm.sh/topojson-client@3.1.0"
+      }
+    }
+    </script>
+    <script type="module">
+        import Globe from 'globe.gl';
+        import * as THREE from 'three';
+        import * as topojson from 'topojson-client';
+
         // GeoTessera tile configuration
         const TILE_SIZE = 0.1; // 0.1 degree tiles
         const TILE_OFFSET = 0.05; // centered at 0.05-degree offsets
 
         // Configuration
         let currentOpacity = 0.8;
-        let overlayMaterial = null;
-        let overlayMesh = null;
-        let coverageData = null; // Coverage data for tooltips
-        let textureImageData = null; // Pixel data from coverage texture for land/ocean detection
+        // One entry per (version, variant) layer. Populated by initLayers().
+        // Each entry: {id, version, variant, color, years, tilesByYear, mesh, material, visible}
+        let datasets = [];
+        let textureImageData = null; // Pixel data from FIRST loaded texture for ocean detection
         let countriesData = null; // GeoJSON with country boundaries
         let tileCountryCache = new Map(); // Cache tile -> country lookups
         let mouse = { x: 0, y: 0 };
         let raycaster = null;
 
-        // Load coverage data from split JSON files (metadata + per-year tile lists)
-        async function loadCoverageData(url = 'coverage.json') {
+        // Load the coverage index (coverage.json) — schema v2 lists multiple
+        // datasets; older single-dataset format is auto-promoted into a single
+        // entry so this viewer works against both shapes.
+        async function loadCoverageIndex(url = 'coverage.json') {
             try {
                 const response = await fetch(url);
                 if (!response.ok) {
-                    console.warn(`Coverage data not found at ${url}`);
-                    return null;
+                    console.warn(`Coverage index not found at ${url}`);
+                    return [];
                 }
                 const main = await response.json();
-                console.log(`Loaded coverage metadata: ${main.metadata.total_tiles} tiles, ${main.years.length} years`);
-
-                // Load per-year tile files in parallel
-                const tiles = {};
-                const yearResults = await Promise.allSettled(
-                    main.years.map(async (year) => {
-                        const yearUrl = url.replace('coverage.json', `coverage_${year}.json`);
-                        const resp = await fetch(yearUrl);
-                        if (!resp.ok) return { year, coords: [] };
-                        const coords = await resp.json();
-                        return { year, coords };
-                    })
-                );
-
-                for (const result of yearResults) {
-                    if (result.status === 'fulfilled') {
-                        const { year, coords } = result.value;
-                        for (const key of coords) {
-                            if (!tiles[key]) tiles[key] = [];
-                            tiles[key].push(year);
-                        }
-                    }
+                if (main.schema_version === 2 && Array.isArray(main.datasets)) {
+                    return main.datasets;
                 }
-
-                return {
-                    tiles,
-                    years: main.years,
-                    metadata: main.metadata,
-                };
+                // Legacy single-dataset shape: { years, metadata, year_file_prefix?, dataset_id? }
+                return [{
+                    id: main.dataset_id || 'default',
+                    version: main.metadata?.version || '',
+                    version_path: '',
+                    variant: '',
+                    color: [200, 60, 60],
+                    years: main.years || [],
+                    coverage_json: url.split('/').pop(),
+                    texture_png: 'coverage_texture.png',
+                    year_file_prefix: main.year_file_prefix || 'coverage_',
+                }];
             } catch (e) {
-                console.warn(`Failed to load coverage data: ${e.message}`);
-                return null;
+                console.warn(`Failed to load coverage index: ${e.message}`);
+                return [];
+            }
+        }
+
+        // Fetch per-year tile lists for a single dataset and pivot into a
+        // { "lon,lat": [year, year, …] } map for tooltip lookups.
+        async function loadDatasetTiles(ds) {
+            const tiles = {};
+            const prefix = ds.year_file_prefix || `coverage_${ds.id}_`;
+            const fetches = ds.years.map(async (year) => {
+                const resp = await fetch(`${prefix}${year}.json`);
+                if (!resp.ok) return [];
+                return resp.json();
+            });
+            const results = await Promise.allSettled(fetches);
+            for (let i = 0; i < ds.years.length; i++) {
+                if (results[i].status !== 'fulfilled') continue;
+                const year = ds.years[i];
+                for (const key of results[i].value) {
+                    if (!tiles[key]) tiles[key] = [];
+                    tiles[key].push(year);
+                }
+            }
+            return tiles;
+        }
+
+        // Create one overlay sphere per dataset; renderOrder is staggered so
+        // layers composite predictably when multiple are visible.
+        function createDatasetMesh(ds, img, renderOrder) {
+            const texture = new THREE.Texture(img);
+            texture.needsUpdate = true;
+            const geometry = new THREE.SphereGeometry(102, 64, 64);
+            const material = new THREE.MeshBasicMaterial({
+                map: texture,
+                transparent: true,
+                opacity: currentOpacity,
+                side: THREE.FrontSide,
+                depthTest: true,
+                depthWrite: false,
+            });
+            const mesh = new THREE.Mesh(geometry, material);
+            mesh.name = `tilesOverlay_${ds.id}`;
+            mesh.renderOrder = renderOrder;
+            mesh.rotation.y = 4.71; // 3π/2 to match globe.gl coords
+            globe.scene().add(mesh);
+            ds.material = material;
+            return mesh;
+        }
+
+        function renderLayerToggles() {
+            const root = document.getElementById('layerList');
+            root.innerHTML = '';
+            for (const ds of datasets) {
+                const id = `ds_${ds.id}`;
+                const [r, g, b] = ds.color;
+                const colorRgb = `rgb(${r},${g},${b})`;
+                // Shade scale mirrors the server-side rendering: tiles with
+                // 1/N years are blended 50% toward white; tiles with N/N
+                // years stay at full tint. Show the gradient inline so the
+                // legend self-documents what the on-globe shades mean.
+                const palest = `rgb(${Math.round(r*0.5+255*0.5)},${Math.round(g*0.5+255*0.5)},${Math.round(b*0.5+255*0.5)})`;
+                const gradient = `linear-gradient(90deg, ${palest}, ${colorRgb})`;
+                const totalYears = ds.years.length;
+                const wrap = document.createElement('div');
+                wrap.style.cssText = 'margin:8px 0;';
+                wrap.innerHTML = `
+                    <label style="display:flex;align-items:center;gap:6px;">
+                        <input type="checkbox" id="${id}" checked>
+                        <span style="color:${colorRgb};font-size:14px;">■</span>
+                        <span>v${ds.version}${ds.variant ? ' / ' + ds.variant : ''}</span>
+                    </label>
+                    <div style="display:flex;align-items:center;gap:6px;margin:3px 0 0 24px;font-size:10px;opacity:0.85;">
+                        <span>1 yr</span>
+                        <span style="flex:1;height:8px;background:${gradient};border:1px solid rgba(255,255,255,0.3);border-radius:2px;"></span>
+                        <span>${totalYears} yr</span>
+                    </div>`;
+                root.appendChild(wrap);
+                wrap.querySelector('input').addEventListener('change', (e) => {
+                    ds.visible = e.target.checked;
+                    if (ds.mesh) ds.mesh.visible = ds.visible;
+                });
             }
         }
 
@@ -2583,26 +2938,34 @@ def _get_globe_html_template() -> str:
             }
         }
 
-        // Get tile info for tooltip
+        // Get tile info for tooltip — aggregates across every visible dataset
+        // so hovering shows v1.0/vultr AND v1.1/cambridge years for the same tile.
         function getTileInfo(lon, lat) {
             const key = `${lon.toFixed(2)},${lat.toFixed(2)}`;
             const tileName = `${lon.toFixed(2)}, ${lat.toFixed(2)}`;
 
-            if (!coverageData) {
+            if (!datasets.length) {
                 return { tileName, message: 'Coverage data not loaded' };
             }
 
-            const years = coverageData.tiles[key];
+            const perDataset = [];
+            for (const ds of datasets) {
+                if (!ds.visible) continue;
+                const years = ds.tilesByYear ? ds.tilesByYear[key] : null;
+                if (years && years.length) {
+                    perDataset.push({
+                        id: ds.id,
+                        version: ds.version,
+                        variant: ds.variant,
+                        color: ds.color,
+                        years: years.slice().sort((a, b) => a - b),
+                        totalYears: ds.years.length,
+                    });
+                }
+            }
 
-            // Check if it has coverage data first
-            if (years) {
-                return {
-                    tileName,
-                    type: 'coverage',
-                    years: years.sort((a, b) => a - b),
-                    yearCount: years.length,
-                    totalYears: coverageData.years.length
-                };
+            if (perDataset.length) {
+                return { tileName, type: 'coverage', datasets: perDataset };
             }
 
             // Use coverage texture to detect land vs ocean (O(1) pixel lookup)
@@ -2632,10 +2995,18 @@ def _get_globe_html_template() -> str:
             } else if (info.type === 'no-coverage') {
                 html += `<span class="no-data">${info.message}</span>`;
             } else if (info.type === 'coverage') {
-                html += `<strong>Coverage:</strong> ${info.yearCount} of ${info.totalYears} years<br/>`;
-                html += `<strong>Years:</strong> `;
-                info.years.forEach(year => {
-                    html += `<span class="year-badge">${year}</span>`;
+                // One block per dataset that has data at this tile.
+                info.datasets.forEach((ds, idx) => {
+                    const colorRgb = `rgb(${ds.color.join(',')})`;
+                    if (idx > 0) html += `<div style="margin-top:6px;"></div>`;
+                    html += `<div><span style="color:${colorRgb};">■</span> `
+                          + `<strong>v${ds.version}${ds.variant ? '/' + ds.variant : ''}</strong> `
+                          + `&middot; ${ds.years.length}/${ds.totalYears} yrs</div>`;
+                    html += `<div>`;
+                    ds.years.forEach(year => {
+                        html += `<span class="year-badge">${year}</span>`;
+                    });
+                    html += `</div>`;
                 });
             } else {
                 html += info.message;
@@ -2658,9 +3029,6 @@ def _get_globe_html_template() -> str:
         function screenToLatLon(screenX, screenY) {
             if (!raycaster) return null;
 
-            const THREE = window.THREE;
-            if (!THREE) return null;
-
             // Convert screen coordinates to normalized device coordinates (-1 to +1)
             const rect = document.getElementById('globeViz').getBoundingClientRect();
             mouse.x = ((screenX - rect.left) / rect.width) * 2 - 1;
@@ -2668,10 +3036,14 @@ def _get_globe_html_template() -> str:
 
             raycaster.setFromCamera(mouse, globe.camera());
 
-            // Check intersection with overlay sphere
-            if (!overlayMesh) return null;
+            // Ray-cast against any dataset overlay sphere — they're all the
+            // same radius, so it doesn't matter which one we hit.
+            const targets = datasets
+                .map(d => d.mesh)
+                .filter(m => m);
+            if (!targets.length) return null;
 
-            const intersects = raycaster.intersectObject(overlayMesh);
+            const intersects = raycaster.intersectObjects(targets);
             if (intersects.length === 0) return null;
 
             const point = intersects[0].point;
@@ -2708,10 +3080,7 @@ def _get_globe_html_template() -> str:
 
         // Initialize raycaster for mouse picking
         setTimeout(() => {
-            const THREE = window.THREE;
-            if (THREE) {
-                raycaster = new THREE.Raycaster();
-            }
+            raycaster = new THREE.Raycaster();
         }, 100);
 
         // Mouse move handler for tooltip
@@ -2741,112 +3110,67 @@ def _get_globe_html_template() -> str:
             hideTooltip();
         });
 
-        function updateTilesLayer() {
-            document.getElementById('status').textContent = 'Loading coverage texture...';
+        // Load every dataset's texture + per-year tile data and add one
+        // overlay mesh per dataset.
+        async function initLayers() {
+            document.getElementById('status').textContent = 'Loading dataset textures...';
+            let totalTiles = 0;
+            let order = 1;
+            for (const ds of datasets) {
+                // Per-year tile-coverage map (used for hover tooltips).
+                ds.tilesByYear = await loadDatasetTiles(ds);
+                totalTiles += Object.keys(ds.tilesByYear).length;
 
-            // Wait for globe to be ready
-            setTimeout(() => {
-                // Load pre-generated texture instead of generating client-side
-                const textureUrl = 'coverage_texture.png';
+                // Texture image -> overlay sphere.
+                await new Promise((resolve) => {
+                    const img = new Image();
+                    img.onload = () => {
+                        // First loaded texture seeds the ocean-detection pixel
+                        // buffer used by the hover tooltip.
+                        if (!textureImageData) {
+                            const offscreen = document.createElement('canvas');
+                            offscreen.width = img.width;
+                            offscreen.height = img.height;
+                            const ctx2d = offscreen.getContext('2d');
+                            ctx2d.drawImage(img, 0, 0);
+                            textureImageData = ctx2d.getImageData(0, 0, img.width, img.height);
+                        }
+                        ds.mesh = createDatasetMesh(ds, img, order++);
+                        ds.visible = true;
+                        resolve();
+                    };
+                    img.onerror = () => {
+                        console.warn(`Could not load texture for ${ds.id}: ${ds.texture_png}`);
+                        resolve();
+                    };
+                    img.src = ds.texture_png;
+                });
+            }
 
-                // Create image element to load texture
-                const img = new Image();
-                img.onload = () => {
-                    // Extract pixel data for land/ocean detection in tooltips
-                    const offscreen = document.createElement('canvas');
-                    offscreen.width = img.width;
-                    offscreen.height = img.height;
-                    const ctx2d = offscreen.getContext('2d');
-                    ctx2d.drawImage(img, 0, 0);
-                    textureImageData = ctx2d.getImageData(0, 0, img.width, img.height);
-                    console.log(`Texture pixel data loaded: ${img.width}x${img.height}`);
-
-                    // Access THREE from window (bundled with globe.gl)
-                    const THREE = window.THREE;
-
-                    if (!THREE) {
-                        console.error('THREE.js not available');
-                        document.getElementById('status').textContent = 'Error: THREE.js not loaded';
-                        return;
-                    }
-
-                    const texture = new THREE.Texture(img);
-                    texture.needsUpdate = true;
-
-                    // Find or create overlay mesh
-                    if (!overlayMesh) {
-                        // Create a slightly larger sphere for the overlay (close to globe surface)
-                        const geometry = new THREE.SphereGeometry(
-                            102, // Just above globe (100) to avoid z-fighting but not stick out
-                            64,
-                            64
-                        );
-
-                        overlayMaterial = new THREE.MeshBasicMaterial({
-                            map: texture,
-                            transparent: true,
-                            opacity: currentOpacity,
-                            side: THREE.FrontSide,
-                            depthTest: true,
-                            depthWrite: false
-                        });
-
-                        overlayMesh = new THREE.Mesh(geometry, overlayMaterial);
-                        overlayMesh.name = 'tilesOverlay';
-                        overlayMesh.renderOrder = 1; // Render after globe
-
-                        // Rotate to align with globe.gl coordinate system (270 degrees)
-                        overlayMesh.rotation.y = 4.71; // 3π/2
-
-                        // Add to globe scene
-                        globe.scene().add(overlayMesh);
-                        console.log('Overlay mesh added to scene');
-                    } else {
-                        // Update existing material
-                        overlayMaterial.map = texture;
-                        overlayMaterial.opacity = currentOpacity;
-                        overlayMaterial.needsUpdate = true;
-                        console.log('Overlay texture updated');
-                    }
-
-                    document.getElementById('status').textContent = 'Ready';
-                };
-                img.src = textureUrl;
-            }, 50);
+            document.getElementById('tileCount').textContent = totalTiles.toLocaleString();
+            renderLayerToggles();
+            document.getElementById('status').textContent = 'Ready';
         }
 
-        // Initialize and load coverage data
+        // Initialize: country borders first, then the coverage index + layers.
         async function initialize() {
-            // First, load and show country boundaries (fast)
             document.getElementById('status').textContent = 'Loading country boundaries...';
             countriesData = await loadCountriesData();
-
             if (countriesData) {
-                // Add country polygons to globe immediately
                 globe.polygonsData(countriesData.features);
-                console.log('Country boundaries added to globe');
-                document.getElementById('status').textContent = 'Globe ready - Loading coverage data...';
+                document.getElementById('status').textContent = 'Globe ready - Loading coverage index...';
             }
 
-            // Then load coverage data (faster now - just for tooltips)
-            coverageData = await loadCoverageData('coverage.json');
-
-            if (coverageData) {
-                document.getElementById('status').textContent = 'Loading coverage texture...';
-                // Update tile count from metadata
-                document.getElementById('tileCount').textContent = coverageData.metadata.total_tiles.toLocaleString();
-            } else {
+            datasets = await loadCoverageIndex('coverage.json');
+            if (!datasets.length) {
                 document.getElementById('status').textContent = 'Coverage data not available';
+                return;
             }
 
-            // Check THREE availability
-            console.log('Checking THREE.js availability...');
-            console.log('window.THREE:', window.THREE);
-            console.log('Globe scene:', globe.scene());
-            console.log('Scene children:', globe.scene().children);
+            console.log('THREE:', THREE.REVISION);
+            console.log(`Datasets: ${datasets.map(d => d.id).join(', ')}`);
 
-            // Finally, load and render pre-generated texture (fast!)
-            updateTilesLayer();
+            await initLayers();
         }
 
         // Start initialization
@@ -2858,10 +3182,11 @@ def _get_globe_html_template() -> str:
         document.getElementById('opacity').addEventListener('input', (e) => {
             currentOpacity = parseFloat(e.target.value);
             document.getElementById('opacityValue').textContent = currentOpacity.toFixed(2);
-
-            if (overlayMaterial) {
-                overlayMaterial.opacity = currentOpacity;
-                overlayMaterial.needsUpdate = true;
+            for (const ds of datasets) {
+                if (ds.material) {
+                    ds.material.opacity = currentOpacity;
+                    ds.material.needsUpdate = true;
+                }
             }
         });
 

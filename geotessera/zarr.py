@@ -220,7 +220,7 @@ def gather_tile_infos(
     try:
         year_slice = gdf.loc[year]
         # Filter to tiles that have actual embedding data in the registry
-        valid = year_slice["file_size"] > 0
+        valid = year_slice["grid_size"] > 0
         if "scales_size" in year_slice.columns:
             valid = valid & (year_slice["scales_size"] > 0)
         year_slice = year_slice[valid]
@@ -254,8 +254,27 @@ def gather_tile_infos(
     # Build TileInfos using computed grid (no file I/O)
     from pyproj import Transformer as ProjTransformer
 
-    base_emb = str(registry._embeddings_dir / EMBEDDINGS_DIR_NAME)
-    base_lm = str(registry._embeddings_dir / LANDMASKS_DIR_NAME)
+    # The local mirror can be in two shapes:
+    #   * flat: <base_dir>/global_0.1_degree_representation/<year>/... (what
+    #     the geotessera-download CLI writes — variant info in sidecar)
+    #   * S3-mirror: <base_dir>/<version_path>/global_0.1_degree_representation/
+    #     <year>/... (what `aws s3 cp --recursive` produces)
+    # Prefer the S3-mirror layout when it exists so users who keep a
+    # multi-version mirror under one root can point zarr-fill at the top.
+    emb_candidate = (
+        registry._embeddings_dir / registry._version_path / EMBEDDINGS_DIR_NAME
+    )
+    lm_candidate = (
+        registry._embeddings_dir / registry._version_path / LANDMASKS_DIR_NAME
+    )
+    if emb_candidate.exists():
+        base_emb = str(emb_candidate)
+        base_lm = str(lm_candidate) if lm_candidate.exists() else str(
+            registry._embeddings_dir / LANDMASKS_DIR_NAME
+        )
+    else:
+        base_emb = str(registry._embeddings_dir / EMBEDDINGS_DIR_NAME)
+        base_lm = str(registry._embeddings_dir / LANDMASKS_DIR_NAME)
     zones_dict: Dict[int, List[TileInfo]] = {}
     transformer_cache: Dict[int, ProjTransformer] = {}
     pixel_size = 10.0

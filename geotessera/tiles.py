@@ -271,6 +271,9 @@ def discover_tiles(directory: Path) -> List[Tile]:
     """Auto-detect format and discover all tiles.
 
     Prefers NPY format when both NPY and GeoTIFF formats are present.
+    The local layout always uses ``global_0.1_degree_representation/`` as the
+    embeddings subdir regardless of the dataset variant — variant info is
+    recorded in the ``tessera_metadata.json`` sidecar file.
 
     Args:
         directory: Directory containing tiles
@@ -305,7 +308,10 @@ def discover_npy_tiles(base_dir: Path) -> List[Tile]:
     """Discover NPY format tiles.
 
     Args:
-        base_dir: Directory containing embeddings and landmasks subdirectories
+        base_dir: Directory containing embeddings and landmasks subdirectories.
+            Tiles are expected under ``base_dir/global_0.1_degree_representation/``
+            regardless of dataset variant (variant info lives in
+            ``tessera_metadata.json``).
 
     Returns:
         List of Tile objects with spatial metadata loaded
@@ -376,7 +382,8 @@ def discover_formats(directory: Path) -> Dict[str, List[Tile]]:
     """Discover tiles in all available formats.
 
     Args:
-        directory: Directory containing tiles
+        directory: Directory containing tiles. NPY tiles are scanned under
+            ``directory/global_0.1_degree_representation/``.
 
     Returns:
         Dictionary mapping format names to lists of tiles:

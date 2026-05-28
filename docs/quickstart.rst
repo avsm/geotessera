@@ -3,6 +3,16 @@ Quick Start Guide
 
 This guide will get you up and running with GeoTessera quickly.
 
+.. tip::
+
+   **Pick your Tessera version first.** GeoTessera publishes two model
+   versions on S3: the legacy ``1.0`` (frozen) and the newer ``1.1`` (active
+   development, ``cambridge`` variant). Prefer ``1.1 / cambridge`` for new
+   work. Add ``--dataset-version v1.1 --dataset-variant cambridge`` to every
+   command in this guide if that's the line you want. Never mix versions or
+   variants within the same downstream task — they are independently learned
+   feature spaces. See the main :ref:`dataset-versions` section for details.
+
 Installation
 ------------
 

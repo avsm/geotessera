@@ -6,35 +6,47 @@ GeoTessera provides a comprehensive command-line interface for downloading, visu
 Global Options
 --------------
 
-All commands support these global options::
+Data-fetching commands (``download``, ``coverage``, ``info``) share these options::
 
-    --dataset-version TEXT    Tessera dataset version (default: v1)
-    --cache-dir PATH         Custom cache directory for registry
-    --registry-path PATH     Path to registry.parquet file
-    --registry-dir PATH      Directory containing registry.parquet
-    --registry-url URL       URL to download registry from
-    --verbose, -v            Enable verbose output
-    --help                   Show help message
+    --dataset-version TEXT    Tessera dataset version (default: v1).
+                              Accepts v1, 1.0, v1.0, v1.1, 1.1 etc.
+    --dataset-variant TEXT    Tessera dataset variant (default: vultr).
+                              Known variants: vultr (1.0 default), cambridge (1.1).
+    --cache-dir PATH          Custom cache directory for the manifest
+    --registry-path PATH      Path to a local manifest.parquet file
+    --registry-dir PATH       Directory containing manifest.parquet + landmasks.parquet
+    --verbose, -v             Enable verbose output
+    --help                    Show help message
+
+.. note::
+
+   **Dataset versions and variants**: there are now two Tessera versions
+   on S3 (``1.0`` and ``1.1``). Prefer ``1.1`` / ``cambridge`` for new work
+   — the legacy 1.0 line is frozen. **Never mix versions or variants within
+   the same downstream task** — they are independently learned feature
+   spaces and not interchangeable. See :ref:`dataset-versions` in the main
+   index for the full picture.
 
 Cache Configuration
 -------------------
 
-Control where the Parquet registry is cached:
+Control where the Parquet manifest is cached:
 
 .. code-block:: bash
 
-    # Use custom cache directory for registry
+    # Use custom cache directory for the per-version manifest
     geotessera download --cache-dir /path/to/cache ...
 
-    # Use local registry file
-    geotessera download --registry-path /path/to/registry.parquet ...
+    # Use a locally-supplied manifest (e.g. a checked-in offline copy)
+    geotessera download --registry-path /path/to/manifest.parquet ...
 
     # Default cache locations (if not specified):
-    # - Linux/macOS: ~/.cache/geotessera/
-    # - Windows: %LOCALAPPDATA%/geotessera/
+    # - Linux/macOS: ~/.cache/geotessera/{v1,v1.1}/manifest.parquet
+    # - Windows:     %LOCALAPPDATA%/geotessera/{v1,v1.1}/manifest.parquet
 
-Note: Embedding tiles are downloaded to temporary files and immediately cleaned up.
-Only the registry file (~few MB) is cached.
+Note: Embedding tiles land in the user-supplied ``--output`` directory and
+persist there for reuse. Only the per-version manifest + landmasks parquet
+(~hundreds of MB combined) is kept in the cache directory.
 
 Commands
 --------
@@ -67,11 +79,23 @@ Download embeddings for a region in numpy or GeoTIFF format.
 **Data Selection**:
 
 * ``--year INT`` - Year of embeddings (default: 2024)
+* ``--dataset-version TEXT`` - Tessera dataset version (``v1`` / ``1.0`` /
+  ``v1.1`` / ``1.1``; default ``v1``). Pick **once per project**.
+* ``--dataset-variant TEXT`` - Tessera dataset variant (default: ``vultr``).
+  Pass ``cambridge`` for v1.1 test embeddings.
 
 **Other Options**:
 
 * ``--list-files`` - List all created files with details
 * ``-v, --verbose`` - Verbose output
+
+.. warning::
+
+   Re-running ``download`` into a directory that already contains a different
+   ``(version, variant)`` will silently mix tiles — the local layout is the
+   same regardless of variant. Always use a fresh ``--output`` dir per
+   ``(version, variant)`` and check the ``tessera_metadata.json`` sidecar
+   if you're unsure which run produced the contents.
 
 **Resume Behaviour**:
 
@@ -117,6 +141,16 @@ The progress bar reflects only remaining work.
         --year 2024 \
         --output ./cambridge_tiles
     # Next step: geotessera visualize ./cambridge_tiles pca_mosaic.tif
+
+    # Download v1.1 / cambridge embeddings (recommended for new work)
+    geotessera download \
+        --dataset-version v1.1 \
+        --dataset-variant cambridge \
+        --region-file cambridge.geojson \
+        --year 2024 \
+        --output ./cambridge_v11
+    # Note the tessera_metadata.json sidecar dropped alongside the tiles —
+    # it records the (version, variant) provenance for this output dir.
 
 **Output Formats**:
 
@@ -302,6 +336,19 @@ Generate a world map showing Tessera embedding coverage.
 * ``--year INT`` - Specific year to visualize (default: all years)
 * ``--region-file PATH`` - GeoJSON/Shapefile to focus coverage map on specific region (supports local files or URLs)
 * ``--country TEXT`` - Country name to focus coverage map on with precise boundary outline (e.g., 'United Kingdom', 'UK', 'GB')
+* ``--dataset-version TEXT`` - Tessera dataset version. Pass ``all`` with
+  ``--by-source`` to render every known version.
+* ``--dataset-variant TEXT`` - Tessera dataset variant. Pass ``all`` with
+  ``--by-source`` to render every variant.
+
+**Multi-source rendering**:
+
+* ``--by-source`` - Render each ``(version, variant)`` in a distinct hue with
+  per-dataset checkboxes in the generated ``globe.html``. Each tile's shade
+  encodes how many years of coverage it has (pale = 1 year, saturated =
+  all years for that dataset). Without ``--dataset-version`` /
+  ``--dataset-variant`` overrides, defaults to ``all`` on both axes —
+  downloads every known version's manifest and renders them side-by-side.
 
 **Visualization Options**:
 
@@ -337,6 +384,20 @@ Generate a world map showing Tessera embedding coverage.
     geotessera coverage --region-file area.geojson --tile-alpha 0.3
     geotessera coverage --country "Germany" --tile-alpha 0.3
 
+    # Show every dataset version on one map, with a layer-toggle UI in
+    # globe.html. Each (version, variant) gets a distinct hue family;
+    # within each hue, shade indicates how many years are covered.
+    geotessera coverage --by-source --output ./multi
+    # Output: multi/{tessera_coverage.png, coverage.json,
+    #              coverage_texture_v1_vultr.png, coverage_v1_vultr_*.json,
+    #              coverage_texture_v1.1_cambridge.png, coverage_v1.1_cambridge_*.json,
+    #              globe.html}
+
+    # Focus on a single (version, variant) but still get the per-dataset
+    # legend / by-source coverage.json schema:
+    geotessera coverage --by-source --dataset-version v1.1 \
+        --dataset-variant cambridge --output ./v11_only
+
 **Multi-Year Color Coding** (default when no specific year requested):
     - **Green**: All available years present for this tile
     - **Blue**: Only the latest year available for this tile  
@@ -364,13 +425,17 @@ Display information about GeoTIFF files or the library.
 
 * ``--tiles PATH`` - Analyze tile files/directory (GeoTIFF or NPY format)
 * ``--geotiffs PATH`` - Alias for --tiles (deprecated)
-* ``--dataset-version TEXT`` - Tessera dataset version (default: v1)
+* ``--dataset-version TEXT`` - Tessera dataset version (default: ``v1``)
+* ``--dataset-variant TEXT`` - Tessera dataset variant (default: ``vultr``)
 * ``-v, --verbose`` - Verbose output
 
 **Examples**::
 
-    # Show library information
+    # Show library information for the legacy 1.0/vultr line (frozen)
     geotessera info
+
+    # Inspect v1.1/cambridge — same 2017–2025 year range, newer model
+    geotessera info --dataset-version v1.1 --dataset-variant cambridge
 
     # Analyze downloaded tiles (GeoTIFF or NPY)
     geotessera info --tiles ./london_tiffs
