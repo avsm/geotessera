@@ -261,20 +261,43 @@ def gather_tile_infos(
     #     <year>/... (what `aws s3 cp --recursive` produces)
     # Prefer the S3-mirror layout when it exists so users who keep a
     # multi-version mirror under one root can point zarr-fill at the top.
+    # Landmasks are STRICTLY per-version — no cross-version fallback. Each
+    # Tessera version has its own landmask grid and mixing them silently
+    # would corrupt water masking.
     emb_candidate = (
         registry._embeddings_dir / registry._version_path / EMBEDDINGS_DIR_NAME
     )
-    lm_candidate = (
+    lm_s3_mirror = (
         registry._embeddings_dir / registry._version_path / LANDMASKS_DIR_NAME
     )
+    lm_flat = registry._embeddings_dir / LANDMASKS_DIR_NAME
+
     if emb_candidate.exists():
         base_emb = str(emb_candidate)
-        base_lm = str(lm_candidate) if lm_candidate.exists() else str(
-            registry._embeddings_dir / LANDMASKS_DIR_NAME
-        )
+        # When embeddings are in S3-mirror layout, landmasks must match.
+        # Don't fall back to the flat layout — that would silently pick up
+        # the wrong version's landmasks.
+        if lm_s3_mirror.exists():
+            base_lm = str(lm_s3_mirror)
+        else:
+            raise FileNotFoundError(
+                f"Landmask directory not found for {registry._version_path}: "
+                f"expected {lm_s3_mirror}. Landmasks are per-version and "
+                f"cannot be reused across versions. Fetch them with:\n"
+                f"  aws s3 sync s3://tessera-embeddings/"
+                f"{registry._version_path}/{LANDMASKS_DIR_NAME}/ {lm_s3_mirror}/"
+            )
     else:
         base_emb = str(registry._embeddings_dir / EMBEDDINGS_DIR_NAME)
-        base_lm = str(registry._embeddings_dir / LANDMASKS_DIR_NAME)
+        if lm_flat.exists():
+            base_lm = str(lm_flat)
+        else:
+            raise FileNotFoundError(
+                f"Landmask directory not found: expected {lm_flat}. "
+                f"Fetch them with:\n"
+                f"  aws s3 sync s3://tessera-embeddings/"
+                f"{registry._version_path}/{LANDMASKS_DIR_NAME}/ {lm_flat}/"
+            )
     zones_dict: Dict[int, List[TileInfo]] = {}
     transformer_cache: Dict[int, ProjTransformer] = {}
     pixel_size = 10.0
@@ -1429,12 +1452,36 @@ def _compute_rgb_chunk(
     band_indices: tuple,
     stretch_min: List[float],
     stretch_max: List[float],
+    cdf: Optional[List[List[float]]] = None,
+    gamma: float = 1.0,
+    saturation: float = 1.0,
+    pca_components: Optional[List[List[float]]] = None,
+    pca_mean: Optional[List[float]] = None,
 ) -> np.ndarray:
     """Compute RGBA preview from NCHW-layout embedding + scales.
 
     Args:
-        emb_bhw: int8 (B, H, W)
+        emb_bhw: int8 (B, H, W). When ``pca_components`` is provided this is
+            the full 128-band slice; otherwise it's the bands referenced by
+            ``band_indices`` (typically 3).
         scales_hw: float32 (H, W)
+        cdf: Optional per-channel CDF breakpoints — when present, pixels are
+            mapped through ``searchsorted`` to uniformly cover [0, 255]
+            instead of the linear ``(x - lo) / (hi - lo)`` stretch. In PCA
+            mode the CDF is in *PC space*, not band space.
+        gamma: Power-law applied to the [0, 1] channel value before
+            quantisation to uint8. ``< 1.0`` brightens midtones.
+        saturation: Final chroma multiplier (default 1.0). Each pixel is
+            decomposed into ``grey + chroma`` where ``grey`` is its Rec.601
+            luminance; ``chroma`` is then scaled by this factor before
+            re-quantising. ``1.5`` is a noticeable pop, ``2.0`` is vivid,
+            beyond ~3 most pixels start clipping.
+        pca_components: Optional ``(K, n_bands)`` projection matrix learned
+            in :func:`compute_global_stretch` with ``mode='pca'``. When
+            present, all ``n_bands`` channels of ``emb_bhw`` are projected
+            into ``K`` orthogonal directions before stretching — eliminates
+            the channel-correlation-driven "washed out" look.
+        pca_mean: Companion ``(n_bands,)`` centring vector for the PCA.
 
     Returns:
         uint8 (4, H, W) — RGBA in channels-first layout.
@@ -1444,11 +1491,64 @@ def _compute_rgb_chunk(
     valid = np.isfinite(scales_hw)
     scales_safe = np.where(valid, scales_hw, 0.0)
 
-    for i, band_idx in enumerate(band_indices):
-        raw = emb_bhw[band_idx].astype(np.float32)
-        dequant = raw * scales_safe
-        lo, hi = stretch_min[i], stretch_max[i]
-        normalised = np.clip((dequant - lo) / max(hi - lo, 1e-10), 0.0, 1.0)
+    # Build the per-channel float arrays. Two paths:
+    #   - PCA: dequantise all bands, centre, project (K, n_bands) @ (n_bands, H*W)
+    #   - bands: dequantise per RGB band as before
+    if pca_components is not None and pca_mean is not None:
+        components = np.asarray(pca_components, dtype=np.float32)
+        mean = np.asarray(pca_mean, dtype=np.float32)
+        n_bands_in = emb_bhw.shape[0]
+        if components.shape[1] != n_bands_in:
+            raise ValueError(
+                f"PCA components have {components.shape[1]} bands but "
+                f"input has {n_bands_in}"
+            )
+        # Dequantise the whole stack at once. Memory: n_bands × h × w × 4 B.
+        dequant_full = emb_bhw.astype(np.float32) * scales_safe[np.newaxis, ...]
+        flat = dequant_full.reshape(n_bands_in, -1)  # (n_bands, H*W)
+        flat -= mean[:, np.newaxis]
+        pcs_flat = components @ flat  # (K, H*W)
+        pcs = pcs_flat.reshape(components.shape[0], h, w)
+        per_channel_input = list(pcs)
+        n_iter = components.shape[0]
+    else:
+        per_channel_input = [emb_bhw[i].astype(np.float32) * scales_safe
+                              for i in band_indices]
+        n_iter = len(band_indices)
+
+    # Keep float channels until after the saturation step to avoid two
+    # quantise-then-dequantise rounds.
+    float_channels: List[np.ndarray] = []
+    for i in range(n_iter):
+        dequant = per_channel_input[i]
+        if cdf is not None:
+            breaks = np.asarray(cdf[i], dtype=np.float32)
+            n_break = len(breaks)
+            # searchsorted → bin index 0..n_break; renormalise to [0, 1].
+            idx = np.searchsorted(breaks, dequant.ravel()).astype(np.float32)
+            normalised = (idx / max(n_break - 1, 1)).clip(0.0, 1.0).reshape(
+                dequant.shape
+            )
+        else:
+            lo, hi = stretch_min[i], stretch_max[i]
+            normalised = np.clip(
+                (dequant - lo) / max(hi - lo, 1e-10), 0.0, 1.0
+            )
+        if gamma != 1.0:
+            normalised = np.power(normalised, gamma, dtype=np.float32)
+        float_channels.append(normalised)
+
+    if saturation != 1.0 and len(float_channels) >= 3:
+        # Rec.601 luma; chroma is (channel − luma). Scaling chroma and
+        # re-adding to the original luma preserves brightness while
+        # spreading colours away from the grey diagonal.
+        r, g, b = float_channels[0], float_channels[1], float_channels[2]
+        luma = 0.299 * r + 0.587 * g + 0.114 * b
+        float_channels[0] = np.clip(luma + (r - luma) * saturation, 0.0, 1.0)
+        float_channels[1] = np.clip(luma + (g - luma) * saturation, 0.0, 1.0)
+        float_channels[2] = np.clip(luma + (b - luma) * saturation, 0.0, 1.0)
+
+    for i, normalised in enumerate(float_channels):
         rgba[i] = (normalised * 255).astype(np.uint8)
 
     rgba[:3, ~valid] = 0
@@ -1557,6 +1657,408 @@ def compute_stretch(
             stretch_max[i] = stretch_min[i] + 1.0
 
     return {"min": stretch_min, "max": stretch_max}
+
+
+# ---------------------------------------------------------------------------
+# Global cross-zone stretch (sparsity-aware sampler)
+# ---------------------------------------------------------------------------
+# Independently of `compute_stretch` (which works per-zone), this gives us
+# ONE set of (min, max) percentile bounds derived from a random sample of
+# valid pixels drawn from every UTM zone. Storing the result on the store's
+# root attrs lets `build_global_preview` reuse it across zones and produce
+# a seamless mosaic instead of one stretch per zone.
+
+_GLOBAL_STRETCH_ATTR = "geoemb:stretch"
+
+
+def _sample_shard_task(
+    store_path_str: str,
+    zone_group: str,
+    time_index: int,
+    ci: int,
+    cj: int,
+    band_indices: tuple,
+    max_per_chunk: int,
+) -> Optional[np.ndarray]:
+    """Worker-side: open the zone arrays and return a valid-pixel sample.
+
+    Lives at module level so ProcessPoolExecutor can pickle it.
+    """
+    import zarr
+
+    root = zarr.open_group(store_path_str, mode="r", use_consolidated=False)
+    zone_store = root[zone_group]
+    emb_arr = zone_store["embeddings"]
+    scales_arr = zone_store["scales"]
+    _, _, H, W = emb_arr.shape
+    return _sample_chunk_stats(
+        emb_arr,
+        scales_arr,
+        time_index,
+        ci,
+        cj,
+        SHARD_SIZE,
+        (H, W),
+        band_indices=band_indices,
+        max_per_chunk=max_per_chunk,
+    )
+
+
+def compute_global_stretch(
+    store_path: Path,
+    year: int,
+    target_samples: int = 2_000_000,
+    max_shards: Optional[int] = None,
+    p_low: float = 2.0,
+    p_high: float = 98.0,
+    workers: int = 8,
+    zones: Optional[List[int]] = None,
+    band_indices: Tuple[int, ...] = RGB_PREVIEW_BANDS,
+    max_per_chunk: int = 50_000,
+    equalise: bool = True,
+    equalise_breakpoints: int = 257,
+    mode: str = "bands",
+    pca_components: int = 3,
+    pca_total_bands: int = 128,
+    pca_rgb_order: str = "123",
+    console: Optional["rich.console.Console"] = None,
+) -> dict:
+    """Sample valid pixels across every UTM zone until ``target_samples`` are
+    collected, then derive one ``(min, max)`` percentile stretch shared by
+    the whole world.
+
+    Sparsity-aware: the per-shard sampler (``_sample_chunk_stats``) already
+    filters out non-finite scales — both NaN (water) and +inf (land tile
+    with no embedding written yet) — so we count only real, dequantisable
+    pixels toward the target. Shards are visited in a deterministic shuffled
+    order with bounded-batch parallelism; once the target is reached we stop
+    draining the queue. The resulting stretch is persisted to the store
+    root's ``geoemb:stretch`` attribute under the requested year so
+    :func:`build_global_preview` can pick it up.
+
+    Args:
+        store_path: Path to the tessera Zarr store.
+        year: Time slice the stretch applies to.
+        target_samples: Stop after this many valid pixels are collected.
+        max_shards: Optional hard cap on shards visited (default: unbounded,
+            but the shuffled order means we usually hit ``target_samples``
+            in a few hundred shards even on sparse stores).
+        p_low/p_high: Percentile bounds for the stretch (default 2/98).
+        workers: Parallel I/O threads. Sampling is I/O-bound.
+        zones: Optional zone-number filter (e.g. ``[30, 31]``); defaults to
+            every UTM zone present in the store.
+        band_indices: Bands to compute stretch for (default: RGB triple).
+        max_per_chunk: Per-shard cap on sampled pixels.
+        console: Optional Rich console for progress prints.
+
+    Returns:
+        ``{"min": [..], "max": [..], "samples": int}`` — also written to
+        ``<store>/zarr.json``'s ``geoemb:stretch.{year}`` attribute.
+    """
+    import re
+    import zarr
+    from concurrent.futures import ThreadPoolExecutor
+
+    store_path = Path(store_path)
+    root = zarr.open_group(str(store_path), mode="r", use_consolidated=False)
+
+    if mode not in ("bands", "pca"):
+        raise ValueError(f"mode must be 'bands' or 'pca', got {mode!r}")
+    # PCA mode samples all 128 bands and learns 3 orthogonal axes by
+    # diagonalising the covariance. The output channels are mathematically
+    # uncorrelated — fixes the "everything along the grey diagonal" look
+    # that hits when the chosen RGB bands are statistically dependent.
+    if mode == "pca":
+        band_indices = tuple(range(pca_total_bands))
+
+    # Parse the pca_rgb_order permutation now so we fail fast on bad input.
+    pca_perm: Optional[List[int]] = None
+    if mode == "pca":
+        if len(pca_rgb_order) != pca_components or set(pca_rgb_order) != {
+            str(i + 1) for i in range(pca_components)
+        }:
+            raise ValueError(
+                f"pca_rgb_order must be a permutation of the digits "
+                f"1..{pca_components} (e.g. '123' or '213'), got "
+                f"{pca_rgb_order!r}"
+            )
+        # 0-indexed permutation: pca_perm[k] = which PC ends up in output channel k.
+        # "123" -> [0, 1, 2] = identity; "213" -> [1, 0, 2] = swap R/G.
+        pca_perm = [int(c) - 1 for c in pca_rgb_order]
+
+    # Find time_index for the requested year via the first zone's time coord.
+    time_index = None
+    for member_name in sorted(root.keys()):
+        if member_name.startswith("utm"):
+            try:
+                time_arr = root[member_name]["time"][:]
+                years_list = [int(v) for v in time_arr]
+                if year in years_list:
+                    time_index = years_list.index(year)
+                    break
+            except Exception:
+                continue
+    if time_index is None:
+        raise ValueError(f"Year {year} not present in store {store_path}")
+
+    # Enumerate every (zone, ci, cj) shard.
+    zone_pattern = re.compile(r"^utm(\d{2})$")
+    all_shards: List[Tuple[str, int, int]] = []
+    zones_visited = set()
+    for name in sorted(root.keys()):
+        m = zone_pattern.match(name)
+        if not m:
+            continue
+        zone_num = int(m.group(1))
+        if zones is not None and zone_num not in zones:
+            continue
+        try:
+            emb_arr = root[name]["embeddings"]
+            _, _, H, W = emb_arr.shape
+        except (KeyError, ValueError):
+            continue
+        n_rows = math.ceil(H / SHARD_SIZE)
+        n_cols = math.ceil(W / SHARD_SIZE)
+        zones_visited.add(zone_num)
+        for ci in range(n_rows):
+            for cj in range(n_cols):
+                all_shards.append((name, ci, cj))
+
+    if not all_shards:
+        raise RuntimeError(
+            f"No UTM zones with embedding data found in {store_path}"
+        )
+
+    # Deterministic shuffle seeded by year so reruns reproduce.
+    rng = np.random.default_rng(year)
+    rng.shuffle(all_shards)
+    if max_shards is not None:
+        all_shards = all_shards[:max_shards]
+
+    if console:
+        console.print(
+            f"Sampling stretch from {len(zones_visited)} zones, "
+            f"{len(all_shards):,} shards available, target {target_samples:,} "
+            f"valid pixels, workers={workers}"
+        )
+
+    # Process in batches so we can stop early once the target is reached.
+    batch_size = max(workers * 4, 32)
+    collected: List[np.ndarray] = []
+    total_valid = 0
+    shards_visited = 0
+    shards_with_data = 0
+    band_tuple = tuple(band_indices)
+    store_path_str = str(store_path)
+
+    i = 0
+    while total_valid < target_samples and i < len(all_shards):
+        batch = all_shards[i : i + batch_size]
+        i += batch_size
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(
+                    _sample_shard_task,
+                    store_path_str,
+                    zone_group,
+                    time_index,
+                    ci,
+                    cj,
+                    band_tuple,
+                    max_per_chunk,
+                )
+                for (zone_group, ci, cj) in batch
+            ]
+            for fut in futures:
+                vals = fut.result()
+                shards_visited += 1
+                if vals is None or len(vals) == 0:
+                    continue
+                collected.append(vals)
+                shards_with_data += 1
+                total_valid += len(vals)
+        if console:
+            console.print(
+                f"  …{total_valid:,}/{target_samples:,} pixels "
+                f"({shards_with_data}/{shards_visited} shards had data)"
+            )
+
+    if not collected:
+        raise RuntimeError(
+            "No valid pixels found across any shard — is this store filled?"
+        )
+
+    all_vals = np.concatenate(collected, axis=0)
+    if all_vals.shape[0] > target_samples * 2:
+        # Trim oversize (last batch overshot) for a clean percentile.
+        rng2 = np.random.default_rng(year + 1)
+        idx = rng2.choice(all_vals.shape[0], target_samples, replace=False)
+        all_vals = all_vals[idx]
+
+    # PCA: diagonalise the (128, 128) covariance and keep the top-K
+    # eigenvectors. The projected samples (n_samples, K) are mathematically
+    # decorrelated, so the K output channels paint orthogonal colour axes
+    # rather than redundantly tracking the same model feature.
+    pca_proj_components: Optional[List[List[float]]] = None
+    pca_proj_mean: Optional[List[float]] = None
+    pca_explained_variance_ratio: Optional[List[float]] = None
+    if mode == "pca":
+        from sklearn.decomposition import PCA
+
+        k = max(1, int(pca_components))
+        if all_vals.shape[1] < k:
+            raise ValueError(
+                f"PCA needs at least {k} bands but the sample has only "
+                f"{all_vals.shape[1]}. Set --pca-total-bands lower or use "
+                f"--mode bands."
+            )
+        if console:
+            console.print(
+                f"Fitting PCA on {all_vals.shape[0]:,} × {all_vals.shape[1]} "
+                f"sample matrix (n_components={k})..."
+            )
+        pca = PCA(n_components=k, svd_solver="full")
+        pca.fit(all_vals.astype(np.float32, copy=False))
+
+        # Reorder the components by pca_perm so the stored matrix already
+        # bakes in the user's preferred PC→RGB mapping. After this, row 0
+        # of components_ projects onto the R channel, row 1 onto G, row 2
+        # onto B — regardless of which PC originally lived there. The
+        # render path doesn't need any extra swapping.
+        components_ordered = pca.components_[pca_perm]
+        evr_ordered = pca.explained_variance_ratio_[pca_perm]
+
+        # Project all samples through the reordered PCA so the downstream
+        # percentile + CDF math is computed in the same channel ordering
+        # used at render time.
+        centred = all_vals.astype(np.float32, copy=False) - pca.mean_
+        all_vals = centred @ components_ordered.T
+        pca_proj_components = [
+            [float(v) for v in row] for row in components_ordered
+        ]
+        pca_proj_mean = [float(v) for v in pca.mean_]
+        pca_explained_variance_ratio = [float(v) for v in evr_ordered]
+        if console:
+            evr_str = ", ".join(
+                f"{v * 100:.1f}%" for v in pca_explained_variance_ratio
+            )
+            label = "->".join(
+                ["R", "G", "B"][:k]
+            )  # channels R, G, B (in store order)
+            pc_label = "->".join(
+                [f"PC{p + 1}" for p in pca_perm]
+            )  # which PCs ended up there
+            console.print(
+                f"PCA fitted: {pc_label} -> {label}; "
+                f"explained variance ratio = [{evr_str}]"
+            )
+
+    n_bands = all_vals.shape[1]
+    stretch_min = [float(np.percentile(all_vals[:, k], p_low)) for k in range(n_bands)]
+    stretch_max = [float(np.percentile(all_vals[:, k], p_high)) for k in range(n_bands)]
+    for k in range(n_bands):
+        if stretch_max[k] <= stretch_min[k]:
+            stretch_max[k] = stretch_min[k] + 1.0
+
+    if console:
+        space = "PC" if mode == "pca" else "band"
+        console.print(
+            f"Stretch in {space} space: "
+            f"min={[f'{v:.3f}' for v in stretch_min]}, "
+            f"max={[f'{v:.3f}' for v in stretch_max]} "
+            f"(from {all_vals.shape[0]:,} pixels)"
+        )
+
+    # Optional CDF for histogram equalisation. Each channel's breakpoints
+    # are the values at evenly-spaced quantiles 0%, q, 2q, …, 100% with
+    # ``equalise_breakpoints`` points total. At render time
+    # ``np.searchsorted(breaks, pixel)`` maps a pixel value into a bin
+    # index 0..(n_breaks-1), which scales linearly to uint8 — guaranteeing
+    # output bytes are uniformly distributed across 0..255.
+    cdf_breaks: Optional[List[List[float]]] = None
+    if equalise:
+        n_break = max(64, int(equalise_breakpoints))
+        quantiles = np.linspace(0.0, 100.0, n_break)
+        cdf_breaks = []
+        for k in range(n_bands):
+            bks = np.percentile(all_vals[:, k], quantiles)
+            # Ensure strictly increasing so searchsorted is well-defined.
+            for j in range(1, len(bks)):
+                if bks[j] <= bks[j - 1]:
+                    bks[j] = bks[j - 1] + 1e-9
+            cdf_breaks.append([float(v) for v in bks])
+        if console:
+            console.print(
+                f"Computed {n_break}-point CDF per channel for histogram "
+                "equalisation."
+            )
+
+    # Persist to root attrs under year-keyed subdict.
+    root_rw = zarr.open_group(str(store_path), mode="r+", use_consolidated=False)
+    stretch_map = dict(root_rw.attrs.get(_GLOBAL_STRETCH_ATTR, {}))
+    method_suffix = "_equalised" if equalise else ""
+    method_prefix = "global_pca" if mode == "pca" else "global_percentile"
+    entry = {
+        "min": stretch_min,
+        "max": stretch_max,
+        "p_low": p_low,
+        "p_high": p_high,
+        "samples": int(all_vals.shape[0]),
+        "shards_visited": int(shards_visited),
+        "shards_with_data": int(shards_with_data),
+        "bands": list(band_indices),
+        "method": f"{method_prefix}{method_suffix}",
+        "mode": mode,
+    }
+    if cdf_breaks is not None:
+        entry["cdf"] = cdf_breaks
+    if pca_proj_components is not None:
+        entry["pca_components"] = pca_proj_components
+        entry["pca_mean"] = pca_proj_mean
+        entry["pca_explained_variance_ratio"] = pca_explained_variance_ratio
+    stretch_map[str(year)] = entry
+    root_rw.attrs[_GLOBAL_STRETCH_ATTR] = stretch_map
+
+    if console:
+        console.print(
+            f"[green]Saved to {_GLOBAL_STRETCH_ATTR}.{year} on store root.[/green]"
+        )
+
+    return {
+        "min": stretch_min,
+        "max": stretch_max,
+        "samples": int(all_vals.shape[0]),
+        "cdf": cdf_breaks,
+    }
+
+
+def _load_global_stretch(
+    store_path: Path, year: int
+) -> Optional[dict]:
+    """Look up a previously-computed global stretch for ``year``.
+
+    Returns ``{"min": [..], "max": [..], "cdf": [[..], ..],
+    "pca_components": [[..], ...], "pca_mean": [..]}`` — the PCA fields are
+    only populated when the stretch was computed in ``mode='pca'``.
+    Returns ``None`` if no stretch is stored for the year.
+    """
+    import zarr
+
+    root = zarr.open_group(str(store_path), mode="r", use_consolidated=False)
+    stretch_map = root.attrs.get(_GLOBAL_STRETCH_ATTR, {})
+    if not isinstance(stretch_map, dict):
+        return None
+    entry = stretch_map.get(str(year))
+    if not entry:
+        return None
+    out = {"min": list(entry["min"]), "max": list(entry["max"])}
+    if "cdf" in entry and entry["cdf"] is not None:
+        out["cdf"] = [list(c) for c in entry["cdf"]]
+    if "pca_components" in entry and entry["pca_components"] is not None:
+        out["pca_components"] = [list(r) for r in entry["pca_components"]]
+        out["pca_mean"] = list(entry["pca_mean"])
+    out["mode"] = entry.get("mode", "bands")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1827,14 +2329,33 @@ def _reproject_chunk(
     if not np.any(valid):
         return False
 
-    b0, b1 = RGB_PREVIEW_BANDS[0], RGB_PREVIEW_BANDS[-1] + 1
-    emb_chunk = np.asarray(emb_arr[time_index, b0:b1, r_min:r_max, c_min:c_max])
+    # In PCA mode we need every band the projection matrix expects (usually
+    # all 128); in linear/bands mode we only need the contiguous RGB slice.
+    pca_components = stretch.get("pca_components")
+    pca_mean = stretch.get("pca_mean")
+    if pca_components is not None:
+        n_pca_bands = len(pca_components[0])
+        emb_chunk = np.asarray(
+            emb_arr[time_index, 0:n_pca_bands, r_min:r_max, c_min:c_max]
+        )
+        band_tuple: Tuple[int, ...] = tuple(range(n_pca_bands))
+    else:
+        b0, b1 = RGB_PREVIEW_BANDS[0], RGB_PREVIEW_BANDS[-1] + 1
+        emb_chunk = np.asarray(
+            emb_arr[time_index, b0:b1, r_min:r_max, c_min:c_max]
+        )
+        band_tuple = tuple(range(b1 - b0))
     rgba = _compute_rgb_chunk(
         emb_chunk,
         scales_chunk,
-        tuple(range(b1 - b0)),
+        band_tuple,
         stretch["min"],
         stretch["max"],
+        cdf=stretch.get("cdf"),
+        gamma=stretch.get("gamma", 1.0),
+        saturation=stretch.get("saturation", 1.0),
+        pca_components=pca_components,
+        pca_mean=pca_mean,
     )  # (4, h, w) uint8
 
     src_data = rgba.astype(np.float32)
@@ -2043,6 +2564,8 @@ def build_global_preview(
     zones: Optional[List[int]] = None,
     num_levels: int = GLOBAL_DEFAULT_LEVELS,
     workers: int = 4,
+    gamma: float = 1.0,
+    saturation: float = 1.0,
     console: Optional["rich.console.Console"] = None,
     force: bool = False,
 ) -> None:
@@ -2051,6 +2574,15 @@ def build_global_preview(
     Computes RGB from embeddings+scales (bands 0-2) for the specified year,
     reprojects from UTM to geographic coordinates and composites into the
     pyramid. No pre-computed rgb array needed.
+
+    Args:
+        gamma: Per-channel gamma applied after normalisation. ``< 1.0``
+            brightens midtones (standard EO preview is 0.6–0.8); ``1.0``
+            (default) leaves the linear/equalised mapping alone.
+        saturation: Multiplier on the chroma component (distance from
+            per-pixel luma). ``> 1.0`` makes colours pop, ``2.0`` is vivid,
+            ``1.0`` (default) is unchanged. Useful when bands 0-2 are
+            correlated and the RGB clusters along the grey diagonal.
     """
     import re
     import warnings
@@ -2129,32 +2661,59 @@ def build_global_preview(
     # Ensure global pyramid structure exists
     _ensure_global_store(store_path, num_levels)
 
+    # Prefer a pre-computed cross-zone stretch (written by `zarr-stretch`).
+    # Using one shared stretch eliminates inter-zone colour discontinuities.
+    global_stretch = _load_global_stretch(store_path, year)
+    if global_stretch is not None:
+        global_stretch["gamma"] = gamma
+        global_stretch["saturation"] = saturation
+        if console:
+            has_cdf = "cdf" in global_stretch
+            console.print(
+                f"[cyan]Using global stretch from store attrs "
+                f"(mode={'CDF-equalised' if has_cdf else 'linear'}, "
+                f"gamma={gamma}, saturation={saturation})[/cyan]"
+            )
+    elif console:
+        console.print(
+            "[yellow]No global stretch attribute found. Falling back to "
+            "per-zone stretch — the mosaic may show colour seams. "
+            "Run `geotessera-registry zarr-stretch <store> --year "
+            f"{year}` first for seamless colours.[/yellow]"
+        )
+
     # Reproject each zone and build pyramid
     for zone_num, info in sorted(zone_infos.items()):
         if console:
             console.print(f"\n  Zone {zone_num:02d}:")
 
-        # Compute stretch for this zone+time
-        zone_store = zarr.open_group(
-            str(store_path),
-            mode="r",
-            path=info["zone_group"],
-            zarr_format=3,
-            use_consolidated=False,
-        )
-        if console:
-            console.print("    Sampling stretch...")
-        stretch = compute_stretch(
-            zone_store,
-            time_index,
-            workers=workers,
-            console=console,
-        )
-        if console:
-            console.print(
-                f"    Stretch: min={[f'{v:.3f}' for v in stretch['min']]}, "
-                f"max={[f'{v:.3f}' for v in stretch['max']]}"
+        if global_stretch is not None:
+            stretch = global_stretch
+        else:
+            # Fallback: per-zone stretch (produces seams at zone boundaries).
+            zone_store = zarr.open_group(
+                str(store_path),
+                mode="r",
+                path=info["zone_group"],
+                zarr_format=3,
+                use_consolidated=False,
             )
+            if console:
+                console.print("    Sampling stretch...")
+            stretch = compute_stretch(
+                zone_store,
+                time_index,
+                workers=workers,
+                console=console,
+            )
+            stretch["gamma"] = gamma
+            stretch["saturation"] = saturation
+            if console:
+                console.print(
+                    f"    Stretch: min={[f'{v:.3f}' for v in stretch['min']]}, "
+                    f"max={[f'{v:.3f}' for v in stretch['max']]}, "
+                    f"gamma={gamma}, saturation={saturation}"
+                )
 
         row_start, row_end, col_start, col_end, did_work = _reproject_zone(
             store_path=store_path,
