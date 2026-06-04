@@ -14,12 +14,14 @@ import math
 import re
 import logging
 import numpy as np
-import hashlib
-from urllib.request import urlopen, Request
-from urllib.error import HTTPError
 import time
+from datetime import datetime, timezone
+from urllib.parse import urlparse
 
-from botocore.httpchecksum import CrtCrc64NvmeChecksum
+import botocore.session
+from botocore import UNSIGNED
+from botocore.config import Config
+from botocore.exceptions import ClientError
 
 try:
     import pandas as pd
@@ -436,127 +438,126 @@ LANDMASKS_DIR_NAME = "global_0.1_degree_tiff_all"  # Landmask TIFFs
 # Format: {TESSERA_BASE_URL}/{version}/manifest.parquet
 
 
+# Anonymous (unsigned) S3 clients, one per region, built lazily and reused.
+# The Tessera bucket is public-read, so requests are not signed. botocore's
+# "standard" retry mode replaces the old hand-rolled exponential backoff.
+_S3_CLIENTS: Dict[str, object] = {}
+
+
+def _s3_client(region: str):
+    """Return a cached anonymous S3 client for *region*."""
+    client = _S3_CLIENTS.get(region)
+    if client is None:
+        client = botocore.session.get_session().create_client(
+            "s3",
+            region_name=region,
+            config=Config(
+                signature_version=UNSIGNED,
+                retries={"mode": "standard", "total_max_attempts": 5},
+            ),
+        )
+        _S3_CLIENTS[region] = client
+    return client
+
+
+def _parse_s3_url(url: str) -> Tuple[str, str, str]:
+    """Parse an S3 HTTPS URL into ``(region, bucket, key)``.
+
+    Handles both path-style (``s3.<region>.amazonaws.com/<bucket>/<key>``) and
+    virtual-hosted (``<bucket>.s3.<region>.amazonaws.com/<key>``) URLs — all
+    geotessera ever builds from :data:`TESSERA_BASE_URL`. Raises ``ValueError``
+    for anything that is not a regional S3 endpoint; the data path is S3-only,
+    so use ``registry_path`` for local files.
+    """
+    parsed = urlparse(url)
+    host = parsed.netloc
+    path = parsed.path.lstrip("/")
+    m = re.match(
+        r"^(?:(?P<bucket>[^.]+)\.)?s3[.-](?P<region>[a-z0-9-]+)\.amazonaws\.com$",
+        host,
+    )
+    if not m:
+        raise ValueError(f"Not a recognized regional S3 URL: {url!r}")
+    region = m.group("region")
+    bucket = m.group("bucket")
+    if bucket:
+        key = path  # virtual-hosted: the whole path is the key
+    else:
+        bucket, _, key = path.partition("/")  # path-style: first segment is bucket
+    if not bucket or not key:
+        raise ValueError(f"Could not extract bucket/key from S3 URL: {url!r}")
+    return region, bucket, key
+
+
 def download_file_to_temp(
     url: str,
-    expected_hash: Optional[str] = None,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     cache_path: Optional[Path] = None,
-    max_retries: int = 3,
-    timeout: int = 60,
 ) -> str:
-    """Download a file from URL with retry logic, optional caching and If-Modified-Since support.
+    """Download an object from the public Tessera S3 bucket, with caching.
+
+    Fetches via an anonymous botocore S3 client. Integrity is verified
+    end-to-end against the object's CRC64NVMe checksum: ``ChecksumMode=ENABLED``
+    makes botocore validate it as the body is streamed and raise on a mismatch.
+    When *cache_path* already exists, an ``If-Modified-Since`` conditional GET
+    (keyed on the cached file's mtime, which was set from the previous
+    ``Last-Modified``) short-circuits to the cached copy on a 304.
 
     Args:
-        url: URL to download from
-        expected_hash: Optional SHA256 hash to verify
-        progress_callback: Optional callback(bytes_downloaded, total_bytes, status)
-        cache_path: Optional path for caching. If provided, uses If-Modified-Since to avoid redownloading unchanged files.
-        max_retries: Maximum number of retry attempts (default: 3)
-        timeout: Timeout in seconds for each request (default: 60)
+        url: HTTPS S3 URL (path-style or virtual-hosted).
+        progress_callback: Optional callback(bytes_downloaded, total_bytes, status).
+        cache_path: Optional destination. When given, the file is written here
+            atomically and reused on later calls; when omitted it goes to a
+            temporary path the caller must clean up.
 
     Returns:
-        Path to downloaded file (temporary if cache_path=None, otherwise cache_path)
-        Caller is responsible for cleanup of temporary files (cache_path=None case)
+        Path to the file: ``str(cache_path)`` on both a fresh download and a 304
+        cache hit, or a temporary path when ``cache_path`` is None.
 
     Raises:
-        URLError: If download fails after all retries
-        HTTPError: If server returns error (except 304 Not Modified when using cache, and transient 5xx errors)
-        ValueError: If hash verification fails
+        botocore.exceptions.ClientError: On non-304 S3 errors (after retries).
+        botocore.exceptions.FlexibleChecksumError: On CRC64NVMe mismatch.
+        ValueError: If the URL is not S3 or the object has no CRC64NVMe checksum.
     """
     import tempfile
-    from email.utils import formatdate, parsedate_to_datetime
-    from urllib.error import URLError
 
-    # Helper function to execute request with retry logic
-    def execute_request_with_retry(request, max_retries, timeout):
-        """Execute HTTP request with exponential backoff retry logic."""
-        last_exception = None
+    region, bucket, key = _parse_s3_url(url)
+    client = _s3_client(region)
 
-        for attempt in range(max_retries):
-            try:
-                return urlopen(request, timeout=timeout)
-            except HTTPError as e:
-                # Don't retry client errors (4xx) except 429 (rate limit)
-                if 400 <= e.code < 500 and e.code != 429:
-                    raise
-                # Retry on server errors (5xx) and rate limiting (429)
-                last_exception = e
-                if attempt < max_retries - 1:
-                    # Exponential backoff: 1s, 2s, 4s
-                    backoff_time = 2**attempt
-                    logging.getLogger(__name__).debug(
-                        f"HTTP {e.code} error, retrying in {backoff_time}s (attempt {attempt + 1}/{max_retries})"
-                    )
-                    time.sleep(backoff_time)
-            except URLError as e:
-                # Retry on network errors
-                last_exception = e
-                if attempt < max_retries - 1:
-                    backoff_time = 2**attempt
-                    logging.getLogger(__name__).debug(
-                        f"Network error, retrying in {backoff_time}s (attempt {attempt + 1}/{max_retries})"
-                    )
-                    time.sleep(backoff_time)
+    get_kwargs = {"Bucket": bucket, "Key": key, "ChecksumMode": "ENABLED"}
 
-        # All retries exhausted, raise the last exception
-        raise last_exception
-
-    # Handle conditional requests for cached files. We prefer ETag-based
-    # validation (If-None-Match) over time-based (If-Modified-Since) because
-    # the ETag changes deterministically whenever the S3 object is replaced,
-    # whereas Last-Modified can match if the local file's mtime was set from
-    # the prior Last-Modified header. The x-amz-checksum-mode opt-in asks S3
-    # to return the per-object x-amz-checksum-crc64nvme response header so
-    # the downloader can verify content integrity end-to-end.
-    headers = {
-        "User-Agent": "geotessera",
-        "x-amz-checksum-mode": "ENABLED",
-    }
-
-    # The ETag sidecar lives next to the cached file. Tiny (~50 bytes) so
-    # we don't bother with xattrs or a central manifest.
-    etag_sidecar = None
-    if cache_path:
-        etag_sidecar = cache_path.with_suffix(cache_path.suffix + ".etag")
-
+    # Conditional GET: the cached file's mtime was set from the object's prior
+    # Last-Modified, so If-Modified-Since lets S3 answer 304 when it is
+    # unchanged. (This replaces the old ETag ``.etag`` sidecar, which predated
+    # the move to S3 and is no longer needed.)
     if cache_path and cache_path.exists():
-        # Prefer If-None-Match (ETag) over If-Modified-Since when we have a
-        # stored ETag — it's clock- and mtime-agnostic.
-        if etag_sidecar and etag_sidecar.exists():
-            try:
-                stored_etag = etag_sidecar.read_text().strip()
-                if stored_etag:
-                    headers["If-None-Match"] = stored_etag
-            except OSError:
-                pass
+        get_kwargs["IfModifiedSince"] = datetime.fromtimestamp(
+            cache_path.stat().st_mtime, tz=timezone.utc
+        )
 
-        # Belt-and-braces: also send If-Modified-Since so the server can use
-        # whichever validator it has indexed.
-        cache_mtime = cache_path.stat().st_mtime
-        if_modified_since = formatdate(cache_mtime, usegmt=True)
-        headers["If-Modified-Since"] = if_modified_since
+    try:
+        response = client.get_object(**get_kwargs)
+    except ClientError as e:
+        meta = e.response.get("ResponseMetadata", {})
+        code = e.response.get("Error", {}).get("Code")
+        if code == "304" or meta.get("HTTPStatusCode") == 304:
+            # 304 Not Modified — the cached copy is current.
+            if progress_callback:
+                progress_callback(0, 0, "Cache is current")
+            return str(cache_path)
+        raise
 
-        # Make conditional request
-        request = Request(url, headers=headers)
+    # botocore silently returns an *unvalidated* body when the object carries no
+    # CRC64NVMe checksum header, so require it explicitly rather than trust an
+    # unverified download.
+    if not response.get("ChecksumCRC64NVME"):
+        raise ValueError(
+            f"S3 object {key!r} returned no CRC64NVMe checksum; "
+            "refusing to use an unverified download"
+        )
 
-        try:
-            response = execute_request_with_retry(request, max_retries, timeout)
-            # 200 OK means file was modified, proceed with download
-        except HTTPError as e:
-            if e.code == 304:
-                # 304 Not Modified - use cached version
-                if progress_callback:
-                    progress_callback(0, 0, "Cache is current")
-                return str(cache_path)
-            else:
-                # Other HTTP errors should be raised
-                raise
-    else:
-        # No cache or cache_path not provided - regular download
-        request = Request(url, headers=headers)
-        response = execute_request_with_retry(request, max_retries, timeout)
+    total_size = response.get("ContentLength", 0)
 
-    # Determine output path
     if cache_path:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         temp_file = tempfile.NamedTemporaryFile(
@@ -571,132 +572,73 @@ def download_file_to_temp(
 
     temp_path = Path(temp_file.name)
 
+    def format_bytes(bytes_val):
+        """Format bytes as a human-readable string."""
+        for unit in ["B", "KB", "MB", "GB"]:
+            if bytes_val < 1024.0:
+                return f"{bytes_val:.1f}{unit}"
+            bytes_val /= 1024.0
+        return f"{bytes_val:.1f}TB"
+
+    body = response["Body"]
     try:
-        with response:
-            total_size = int(response.headers.get("Content-Length", 0))
-            downloaded = 0
-            start_time = time.time()
-            last_update_time = start_time
+        downloaded = 0
+        start_time = time.time()
+        last_update_time = start_time
 
-            # Compute CRC64NVMe incrementally for server-side checksum verification.
-            # S3 returns x-amz-checksum-crc64nvme as a FULL_OBJECT base64-encoded CRC
-            # on every GET/HEAD when the object was uploaded with that algorithm.
-            expected_crc64nvme_b64 = response.headers.get("x-amz-checksum-crc64nvme")
-            crc64nvme = CrtCrc64NvmeChecksum() if expected_crc64nvme_b64 else None
+        if progress_callback:
+            size_str = format_bytes(total_size) if total_size > 0 else "unknown size"
+            progress_callback(0, total_size, f"Starting ({size_str})")
 
-            # Format file size for display
-            def format_bytes(bytes_val):
-                """Format bytes as human-readable string."""
-                for unit in ["B", "KB", "MB", "GB"]:
-                    if bytes_val < 1024.0:
-                        return f"{bytes_val:.1f}{unit}"
-                    bytes_val /= 1024.0
-                return f"{bytes_val:.1f}TB"
+        # Reading to end-of-stream triggers botocore's CRC64NVMe validation,
+        # which raises FlexibleChecksumError on a mismatch.
+        for chunk in body.iter_chunks(8192):
+            temp_file.write(chunk)
+            downloaded += len(chunk)
 
-            if progress_callback:
-                size_str = (
-                    format_bytes(total_size) if total_size > 0 else "unknown size"
-                )
-                progress_callback(0, total_size, f"Starting ({size_str})")
-
-            while True:
-                chunk = response.read(8192)
-                if not chunk:
-                    break
-                temp_file.write(chunk)
-                if crc64nvme is not None:
-                    crc64nvme.update(chunk)
-                downloaded += len(chunk)
-
-                if progress_callback and total_size > 0:
-                    current_time = time.time()
-                    # Update progress with speed info every ~100ms or on significant progress
-                    if (
-                        current_time - last_update_time > 0.1
-                        or downloaded == total_size
-                    ):
-                        elapsed = current_time - start_time
-                        if elapsed > 0:
-                            speed = downloaded / elapsed
-                            speed_str = format_bytes(speed) + "/s"
-                            downloaded_str = format_bytes(downloaded)
-                            total_str = format_bytes(total_size)
-                            status = f"{downloaded_str}/{total_str} @ {speed_str}"
-                        else:
-                            downloaded_str = format_bytes(downloaded)
-                            total_str = format_bytes(total_size)
-                            status = f"{downloaded_str}/{total_str}"
-
-                        progress_callback(downloaded, total_size, status)
-                        last_update_time = current_time
+            if progress_callback and total_size > 0:
+                current_time = time.time()
+                # Update with speed info every ~100ms or on completion.
+                if current_time - last_update_time > 0.1 or downloaded == total_size:
+                    elapsed = current_time - start_time
+                    if elapsed > 0:
+                        speed_str = format_bytes(downloaded / elapsed) + "/s"
+                        status = (
+                            f"{format_bytes(downloaded)}/"
+                            f"{format_bytes(total_size)} @ {speed_str}"
+                        )
+                    else:
+                        status = (
+                            f"{format_bytes(downloaded)}/{format_bytes(total_size)}"
+                        )
+                    progress_callback(downloaded, total_size, status)
+                    last_update_time = current_time
 
         temp_file.close()
 
-        # Verify S3 server-side CRC64NVMe checksum if the server advertised one.
-        if crc64nvme is not None:
-            if progress_callback:
-                progress_callback(downloaded, downloaded, "Verifying CRC64NVMe...")
-            import base64
-
-            actual_crc64nvme_b64 = base64.b64encode(crc64nvme.digest()).decode()
-            if actual_crc64nvme_b64 != expected_crc64nvme_b64:
-                temp_path.unlink()
-                raise ValueError(
-                    f"CRC64NVMe mismatch: expected {expected_crc64nvme_b64}, "
-                    f"got {actual_crc64nvme_b64}"
-                )
-
-        # Verify hash if provided
-        if expected_hash:
-            if progress_callback:
-                progress_callback(downloaded, downloaded, "Verifying hash...")
-            actual_hash = calculate_file_hash(temp_path)
-            if actual_hash != expected_hash:
-                temp_path.unlink()
-                raise ValueError(
-                    f"Hash mismatch: expected {expected_hash}, got {actual_hash}"
-                )
-
-        # Set file mtime from Last-Modified header if available
-        last_modified_str = response.headers.get("Last-Modified")
-        if last_modified_str:
+        # Set file mtime from Last-Modified so the next If-Modified-Since works.
+        # boto hands LastModified back as a datetime, so there's no parsing.
+        last_modified = response.get("LastModified")
+        if last_modified is not None:
             try:
-                last_modified_dt = parsedate_to_datetime(last_modified_str)
-                last_modified_timestamp = last_modified_dt.timestamp()
-                os.utime(temp_path, (last_modified_timestamp, last_modified_timestamp))
-            except (ValueError, TypeError) as e:
-                # Parsing errors - invalid date format
-                logging.getLogger(__name__).debug(
-                    f"Could not parse Last-Modified header: {e}"
-                )
+                ts = last_modified.timestamp()
+                os.utime(temp_path, (ts, ts))
             except OSError as e:
-                # Filesystem errors - permissions, disk full, etc.
                 logging.getLogger(__name__).warning(f"Could not set file mtime: {e}")
 
-        # If caching, atomically move to cache location and record the new
-        # ETag alongside it so the next request can use If-None-Match.
+        # If caching, move into place atomically. Use replace() (not rename()):
+        # it overwrites an existing destination on both POSIX and Windows,
+        # whereas rename() raises FileExistsError on Windows.
         if cache_path:
-            temp_path.rename(cache_path)
+            temp_path.replace(cache_path)
             final_path = cache_path
-            if etag_sidecar is not None:
-                new_etag = response.headers.get("ETag")
-                try:
-                    if new_etag:
-                        etag_sidecar.write_text(new_etag)
-                    elif etag_sidecar.exists():
-                        # Server didn't return an ETag this time — drop the
-                        # stale sidecar rather than reusing a wrong validator.
-                        etag_sidecar.unlink()
-                except OSError as e:
-                    logging.getLogger(__name__).debug(
-                        f"Could not persist ETag sidecar {etag_sidecar}: {e}"
-                    )
         else:
             final_path = temp_path
 
         if progress_callback:
-            total_str = format_bytes(downloaded)
-            progress_callback(downloaded, downloaded, f"Complete ({total_str})")
+            progress_callback(
+                downloaded, downloaded, f"Complete ({format_bytes(downloaded)})"
+            )
 
         return str(final_path)
 
@@ -705,15 +647,8 @@ def download_file_to_temp(
         if temp_path.exists():
             temp_path.unlink()
         raise
-
-
-def calculate_file_hash(file_path: Path) -> str:
-    """Calculate SHA256 hash of a file."""
-    sha256_hash = hashlib.sha256()
-    with open(file_path, "rb") as f:
-        for byte_block in iter(lambda: f.read(4096), b""):
-            sha256_hash.update(byte_block)
-    return sha256_hash.hexdigest()
+    finally:
+        body.close()
 
 
 class Registry:
@@ -882,27 +817,19 @@ class Registry:
 
             if registry_cache_path.exists():
                 self.logger.info(f"Using cached manifest: {registry_cache_path}")
-                # The downloader returns str(cache_path) on both 304 (cached)
-                # and 200 (fresh download with atomic rename), so we can't
-                # tell which happened from the return value. The ETag sidecar
-                # IS rewritten only on a real refresh, so a content change
-                # there is the canonical "was refreshed" signal.
-                etag_sidecar = registry_cache_path.with_suffix(
-                    registry_cache_path.suffix + ".etag"
-                )
-                pre_etag = (
-                    etag_sidecar.read_text() if etag_sidecar.exists() else None
-                )
+                # download_file_to_temp returns str(cache_path) on both a 304
+                # (unchanged) and a 200 (fresh download), so compare the file
+                # mtime pre/post to tell which happened: a fresh download
+                # rewrites it (mtime set from the new Last-Modified), a 304
+                # leaves it untouched.
+                pre_mtime = registry_cache_path.stat().st_mtime
                 try:
                     self.logger.info("Checking for manifest updates...")
                     result_path = download_file_to_temp(
                         self._registry_url, cache_path=registry_cache_path
                     )
                     registry_path = Path(result_path)
-                    post_etag = (
-                        etag_sidecar.read_text() if etag_sidecar.exists() else None
-                    )
-                    if pre_etag is not None and pre_etag == post_etag:
+                    if registry_cache_path.stat().st_mtime == pre_mtime:
                         self.logger.info(
                             "Verified with server - manifest is current (no download needed)"
                         )
@@ -1019,14 +946,10 @@ class Registry:
                 self.logger.info(
                     f"Using cached landmasks registry: {landmasks_cache_path}"
                 )
-                # Compare the ETag sidecar pre/post: only a 200 (real
-                # refresh) rewrites it; a 304 leaves it untouched.
-                etag_sidecar = landmasks_cache_path.with_suffix(
-                    landmasks_cache_path.suffix + ".etag"
-                )
-                pre_etag = (
-                    etag_sidecar.read_text() if etag_sidecar.exists() else None
-                )
+                # Compare the file mtime pre/post to tell a 304 (unchanged,
+                # file untouched) from a 200 (fresh download, mtime updated
+                # from the new Last-Modified).
+                pre_mtime = landmasks_cache_path.stat().st_mtime
                 try:
                     self.logger.info("Checking for landmasks registry updates...")
                     result_path = download_file_to_temp(
@@ -1034,10 +957,7 @@ class Registry:
                     )
                     landmasks_path = Path(result_path)
                     self._landmasks_df = pd.read_parquet(landmasks_path)
-                    post_etag = (
-                        etag_sidecar.read_text() if etag_sidecar.exists() else None
-                    )
-                    if pre_etag is not None and pre_etag == post_etag:
+                    if landmasks_cache_path.stat().st_mtime == pre_mtime:
                         self.logger.info(
                             "Verified with server - landmasks registry is current (no download needed)"
                         )
