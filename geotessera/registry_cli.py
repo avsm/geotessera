@@ -43,37 +43,43 @@ from .registry import (
     block_to_landmasks_registry_filename,
     parse_grid_name,
 )
+from ._terminal import console, emoji
 
 # Module-level logger
 logger = logging.getLogger(__name__)
 
-# Create console with automatic terminal detection
-console = Console()
 
+def _atomic_write_parquet(df, dest, *, compression=None):
+    """Write ``df`` to ``dest`` atomically via a temp file + rename (cron-safe).
 
-def emoji(text):
-    """Return emoji text for smart terminals, empty string for dumb/piped output.
-
-    Uses Rich Console's built-in terminal detection plus additional checks
-    for dumb terminals and Windows legacy console encoding issues.
+    The temp file is created in ``dest``'s directory so the rename stays on a
+    single filesystem, and it is removed if the write fails (including on
+    KeyboardInterrupt). Works for both DataFrames (regular parquet) and
+    GeoDataFrames (GeoParquet, chosen automatically by ``to_parquet``).
     """
-    import os
-    import sys
+    import tempfile
 
-    # Check for dumb terminal
-    if os.environ.get("TERM", "").lower() == "dumb":
-        return ""
-
-    # Check for Windows legacy console with cp1252 encoding
-    if sys.platform == "win32":
-        try:
-            encoding = sys.stdout.encoding or ""
-            if encoding.lower() in ("cp1252", "ascii", ""):
-                return ""
-        except Exception:
-            return ""
-
-    return text if console.is_terminal else ""
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        dir=dest.parent,
+        prefix=f".{dest.name}_tmp_",
+        suffix=".parquet",
+        delete=False,
+    ) as temp_file:
+        temp_path = temp_file.name
+    try:
+        os.chmod(temp_path, 0o644)
+        if compression:
+            df.to_parquet(temp_path, compression=compression, index=False)
+        else:
+            df.to_parquet(temp_path, index=False)
+        os.rename(temp_path, str(dest))
+    except BaseException:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise
 
 
 @dataclass
@@ -104,7 +110,7 @@ def process_grid_directory(args):
     Returns:
         TileInfo object or None if directory should be skipped
     """
-    year, year_path, grid_item, base_dir = args
+    year, year_path, grid_item, _base_dir = args
     grid_path = os.path.join(year_path, grid_item)
 
     try:
@@ -346,88 +352,6 @@ def calculate_sha256(file_path):
     return sha256_hash.hexdigest()
 
 
-def process_file(args):
-    """Process a single file and return its relative path and hash."""
-    file_path, base_dir, skip_checksum = args
-    try:
-        rel_path = os.path.relpath(file_path, base_dir)
-        if skip_checksum:
-            file_hash = ""
-        else:
-            file_hash = calculate_sha256(file_path)
-        return rel_path, file_hash
-    except Exception as e:
-        logger.error(f"Error processing {file_path}: {e}")
-        return None, None
-
-
-def load_existing_registry(registry_path):
-    """Load existing registry file into a dictionary."""
-    registry = {}
-    if os.path.exists(registry_path):
-        with open(registry_path, "r") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    parts = line.split(" ", 1)
-                    if len(parts) == 2:
-                        registry[parts[0]] = parts[1]
-    return registry
-
-
-def find_npy_files_by_blocks(base_dir):
-    """Find all .npy files and organize them by year and block."""
-    files_by_year_and_block = defaultdict(lambda: defaultdict(list))
-
-    for root, _, files in os.walk(base_dir):
-        for file in files:
-            if file.endswith(".npy"):
-                file_path = os.path.join(root, file)
-                rel_path = os.path.relpath(file_path, base_dir)
-
-                # Extract year from path (assuming format ./YYYY/...)
-                path_parts = rel_path.split(os.sep)
-                if (
-                    len(path_parts) > 0
-                    and path_parts[0].isdigit()
-                    and len(path_parts[0]) == 4
-                ):
-                    year = path_parts[0]
-
-                    # Extract coordinates from the grid directory name
-                    grid_dir = os.path.basename(os.path.dirname(file_path))
-                    lon, lat = parse_grid_name(grid_dir)
-
-                    if lon is not None and lat is not None:
-                        block_lon, block_lat = block_from_world(lon, lat)
-                        block_key = (block_lon, block_lat)
-                        files_by_year_and_block[year][block_key].append(file_path)
-
-    return files_by_year_and_block
-
-
-def find_tiff_files_by_blocks(base_dir):
-    """Find all .tiff files and organize them by block."""
-    files_by_block = defaultdict(list)
-
-    for root, _, files in os.walk(base_dir):
-        for file in files:
-            if file.endswith(".tiff"):
-                file_path = os.path.join(root, file)
-
-                # Extract coordinates from the tiff filename (e.g., grid_-120.55_53.45.tiff)
-                filename = os.path.basename(file_path)
-                tiff_name = filename.replace(".tiff", "")
-                lon, lat = parse_grid_name(tiff_name)
-
-                if lon is not None and lat is not None:
-                    block_lon, block_lat = block_from_world(lon, lat)
-                    block_key = (block_lon, block_lat)
-                    files_by_block[block_key].append(file_path)
-
-    return files_by_block
-
-
 def _check_tiff_has_land(file_path):
     """Check if a landmask TIFF contains any land pixels (non-zero data).
 
@@ -637,28 +561,7 @@ def create_landmasks_parquet_database(base_dir, output_path, console):
         progress.update(parquet_task, completed=75, status="Writing GeoParquet file...")
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
-        # Write to temporary file first for atomic operation
-        import tempfile
-
-        temp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="wb",
-                dir=Path(output_path).parent,
-                prefix=f".{Path(output_path).name}_tmp_",
-                suffix=".parquet",
-                delete=False,
-            ) as temp_file:
-                temp_path = temp_file.name
-
-            os.chmod(temp_path, 0o644)
-            gdf.to_parquet(temp_path, compression="zstd", index=False)
-            os.rename(temp_path, output_path)
-
-        except Exception:
-            if temp_path and os.path.exists(temp_path):
-                os.remove(temp_path)
-            raise
+        _atomic_write_parquet(gdf, output_path, compression="zstd")
 
         progress.update(parquet_task, completed=100, status="Complete")
 
@@ -792,29 +695,7 @@ def create_parquet_database_from_filesystem(base_dir, output_path, console):
         progress.update(parquet_task, completed=75, status="Writing GeoParquet file...")
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
-        # Write to temporary file first for atomic operation (cron-safe)
-        import tempfile
-
-        temp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="wb",
-                dir=Path(output_path).parent,
-                prefix=f".{Path(output_path).name}_tmp_",
-                suffix=".parquet",
-                delete=False,
-            ) as temp_file:
-                temp_path = temp_file.name
-
-            os.chmod(temp_path, 0o644)
-            gdf.to_parquet(temp_path, compression="zstd", index=False)
-            os.rename(temp_path, output_path)
-
-        except Exception:
-            # Clean up temporary file on error
-            if temp_path and os.path.exists(temp_path):
-                os.remove(temp_path)
-            raise
+        _atomic_write_parquet(gdf, output_path, compression="zstd")
 
         progress.update(parquet_task, completed=100, status="Complete")
 
@@ -922,7 +803,7 @@ def check_command(args):
             # Read numpy header to get dtype and shape without mmap
             with open(path, "rb") as f:
                 version = np.lib.format.read_magic(f)
-                shape, fortran, dtype = np.lib.format._read_array_header(f, version)
+                shape, _fortran, dtype = np.lib.format._read_array_header(f, version)
                 header_size = f.tell()
             expected_data = int(np.prod(shape)) * dtype.itemsize
             expected_total = header_size + expected_data
@@ -1553,8 +1434,9 @@ def generate_tiff_checksums(base_dir, force=False):
 
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
-        # Clean up any temporary files
-        for _, _, _, _, temp_file in chunks:
+        # Clean up any temporary files created so far (chunks holds 3-tuples, not
+        # paths; temp_files is the list of actual temp paths, as used above).
+        for temp_file in temp_files:
             if os.path.exists(temp_file):
                 os.remove(temp_file)
         return 1
@@ -1841,7 +1723,7 @@ def count_file_diff_entries(file_path):
         return 0, 0
 
 
-def create_commit_message(changes_by_year, registry_files_changed):
+def create_commit_message(changes_by_year):
     """Create a concise commit message from the changes analysis."""
 
     # Calculate totals
@@ -2034,7 +1916,7 @@ def commit_command(args):
         return 1
 
     # Create commit message
-    commit_message = create_commit_message(changes_by_year, registry_files_changed)
+    commit_message = create_commit_message(changes_by_year)
 
     console.print("\n[blue]Commit message:[/blue]")
     console.print(Panel(commit_message, style="dim"))
@@ -2476,6 +2358,7 @@ def file_scan_command(args):
     # Save to parquet (atomic write via temp file + rename)
     import tempfile
 
+    temp_path = None
     try:
         output_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -2956,8 +2839,6 @@ def s3scan_command(args):
 
     # One parquet per dataset version. Layout mirrors S3 so the whole tree
     # can be uploaded with ``aws s3 cp --recursive <output_dir>/ s3://<bucket>/``.
-    import tempfile
-
     written_files: List[Path] = []
     try:
         for version_norm, group_df in df.groupby("version", sort=True):
@@ -2979,17 +2860,7 @@ def s3scan_command(args):
             console.print(
                 f"[cyan]Writing {len(group_df):,} tiles to {out_file}...[/cyan]"
             )
-            with tempfile.NamedTemporaryFile(
-                mode="wb",
-                dir=out_file.parent,
-                prefix=f".{out_file.name}_tmp_",
-                suffix=".parquet",
-                delete=False,
-            ) as temp_file:
-                temp_path = temp_file.name
-            os.chmod(temp_path, 0o644)
-            group_df.to_parquet(temp_path, index=False)
-            os.rename(temp_path, str(out_file))
+            _atomic_write_parquet(group_df, out_file)
             written_files.append(out_file)
 
         # Landmask scan: one parquet per version that has a landmasks dir.
@@ -3005,7 +2876,7 @@ def s3scan_command(args):
                 console.print(f"[yellow]Could not list landmasks: {e}[/yellow]")
                 lm_units = []
 
-            for version_norm, version_path, lm_prefix in lm_units:
+            for _version_norm, version_path, lm_prefix in lm_units:
                 console.print(
                     f"\n[cyan]Scanning landmasks for {version_path} "
                     f"({len(shard_prefixes)} shards)...[/cyan]"
@@ -3086,17 +2957,7 @@ def s3scan_command(args):
                 console.print(
                     f"[cyan]Writing {len(lm_df):,} landmasks to {lm_out_file}...[/cyan]"
                 )
-                with tempfile.NamedTemporaryFile(
-                    mode="wb",
-                    dir=lm_out_file.parent,
-                    prefix=f".{lm_out_file.name}_tmp_",
-                    suffix=".parquet",
-                    delete=False,
-                ) as tf:
-                    tp = tf.name
-                os.chmod(tp, 0o644)
-                lm_df.to_parquet(tp, index=False)
-                os.rename(tp, str(lm_out_file))
+                _atomic_write_parquet(lm_df, lm_out_file)
                 written_files.append(lm_out_file)
                 landmask_files_by_version[version_path] = lm_out_file
 
@@ -3690,7 +3551,7 @@ def verify_tile_command(args):
             all_match = False
             continue
 
-        h, w, n_bands = npy_emb.shape
+        h, w, _ = npy_emb.shape
         tile_transform = tile.transform
         tile_crs = tile.crs
 

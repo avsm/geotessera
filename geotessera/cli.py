@@ -20,13 +20,13 @@ from typing import Optional, Callable
 from typing_extensions import Annotated
 
 import typer
-from rich.console import Console
 from rich.logging import RichHandler
 from rich.box import ROUNDED
 from geotessera import __version__
 from geotessera.registry import (
     EMBEDDINGS_DIR_NAME,
     LANDMASKS_DIR_NAME,
+    format_bytes,
     tile_from_world,
     tile_to_landmask_filename,
     tile_to_embedding_paths,
@@ -47,6 +47,7 @@ from .web import (
     create_simple_web_viewer,
     prepare_mosaic_for_web,
 )
+from ._terminal import console, emoji
 
 
 def is_url(string: str) -> bool:
@@ -70,6 +71,7 @@ def download_region_file(url: str) -> str:
     Raises:
         Exception: If download fails
     """
+    temp_path = None
     try:
         # Create a temporary file with appropriate extension
         parsed_url = urllib.parse.urlparse(url)
@@ -96,6 +98,9 @@ def download_region_file(url: str) -> str:
         return temp_path
 
     except Exception as e:
+        # Don't leave the empty temp file behind if the download failed.
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
         raise Exception(f"Failed to download region file from {url}: {e}")
 
 
@@ -147,60 +152,6 @@ app = typer.Typer(
     add_completion=False,
     rich_markup_mode="rich",
 )
-
-# Create console with automatic terminal detection
-# Rich Console handles terminal capability detection automatically
-console = Console()
-
-
-# Helper to conditionally add emoji based on terminal type
-def emoji(text):
-    """Return emoji text for smart terminals, empty string for dumb/piped output.
-
-    Uses Rich Console's built-in terminal detection plus additional checks
-    for dumb terminals and Windows legacy console encoding issues.
-
-    Args:
-        text: Emoji character(s) to display
-
-    Returns:
-        The emoji text if capable terminal, empty string otherwise
-    """
-    import sys
-
-    # Check for dumb terminal
-    if os.environ.get("TERM", "").lower() == "dumb":
-        return ""
-
-    # Check for Windows legacy console with cp1252 encoding
-    if sys.platform == "win32":
-        try:
-            encoding = sys.stdout.encoding or ""
-            if encoding.lower() in ("cp1252", "ascii", ""):
-                return ""
-        except Exception:
-            return ""
-
-    # Rich Console automatically detects terminal capabilities
-    # is_terminal is True if stdout is a TTY and not disabled
-    return text if console.is_terminal else ""
-
-
-# Helper to print content with proper formatting for terminal type
-def smart_print(content):
-    """Print content appropriately for terminal capabilities.
-
-    Uses Rich Console's built-in detection.
-
-    Args:
-        content: Content to print (can be Table, string, etc.)
-    """
-    if console.is_terminal:
-        # Smart terminal: use rprint for full rich formatting
-        rprint(content)
-    else:
-        # Dumb terminal or piped: use console.print (still renders tables but no rich markup)
-        console.print(content)
 
 
 # Helper to create tables with appropriate settings for dumb terminals
@@ -292,23 +243,6 @@ def create_progress_callback(progress: Progress, task_id: TaskID) -> Callable:
         if status:
             progress.update(task_id, completed=current, total=total, status=status)
         else:
-            progress.update(task_id, completed=current, total=total)
-
-    return progress_callback
-
-
-def create_download_progress_callback(progress: Progress, task_id: TaskID) -> Callable:
-    """Create a progress callback specifically for download operations.
-
-    This callback handles both high-level tile progress and individual file downloads.
-    """
-
-    def progress_callback(current: int, total: int, status: str = None):
-        if status:
-            # Update with status message
-            progress.update(task_id, completed=current, total=total, status=status)
-        else:
-            # Simple numeric progress update
             progress.update(task_id, completed=current, total=total)
 
     return progress_callback
@@ -733,8 +667,6 @@ def coverage(
             raise typer.Exit(1)
     elif region_file:
         try:
-            from .visualization import calculate_bbox_from_file
-
             # Check if region_file is a URL
             if is_url(region_file):
                 rprint(f"[blue]Downloading region file from URL: {region_file}[/blue]")
@@ -803,7 +735,7 @@ def coverage(
             except ValueError as e:
                 rprint(f"[red]Error: {e}[/red]")
                 rprint(
-                    "[blue]Use 'geotessera countries list' to see available countries[/blue]"
+                    "[blue]Check the country name spelling (uses Natural Earth admin-0 names)[/blue]"
                 )
                 raise typer.Exit(1)
             except Exception as e:
@@ -1278,12 +1210,6 @@ def download(
             "--dry-run", help="Calculate total download size without downloading"
         ),
     ] = False,
-    skip_hash: Annotated[
-        bool,
-        typer.Option(
-            "--skip-hash", help="Skip SHA256 hash verification of downloaded files"
-        ),
-    ] = False,
 ):
     """Download embeddings as numpy arrays or GeoTIFF files.
 
@@ -1327,7 +1253,6 @@ def download(
         embeddings_dir=str(output)
         if not dry_run
         else None,  # Only set for actual downloads
-        verify_hashes=not skip_hash,
     )
 
     # Check mutual exclusivity of region options
@@ -1450,7 +1375,7 @@ def download(
             except ValueError as e:
                 rprint(f"[red]Error: {e}[/red]")
                 rprint(
-                    "[blue]Use 'geotessera countries list' to see available countries[/blue]"
+                    "[blue]Check the country name spelling (uses Natural Earth admin-0 names)[/blue]"
                 )
                 raise typer.Exit(1)
             except Exception as e:
@@ -1518,14 +1443,6 @@ def download(
             border_style="blue",
         )
     )
-
-    # Helper function to format bytes
-    def format_bytes(b):
-        for unit in ["B", "KB", "MB", "GB"]:
-            if b < 1024.0:
-                return f"{b:.1f} {unit}"
-            b /= 1024.0
-        return f"{b:.1f} TB"
 
     try:
         # Load tiles for the region first (before Progress context)
@@ -1618,9 +1535,7 @@ def download(
                             output_dir=output,
                             bands=bands_list,
                             compress=compress,
-                            progress_callback=create_download_progress_callback(
-                                progress, task
-                            ),
+                            progress_callback=create_progress_callback(progress, task),
                         )
 
                     if not filtered_tiles:
@@ -1736,7 +1651,6 @@ def download(
                                     lon=tile_lon,
                                     lat=tile_lat,
                                     is_scales=False,
-                                    progressbar=False,
                                     progress_callback=create_download_callback(
                                         embedding_key
                                     ),
@@ -1761,7 +1675,6 @@ def download(
                                     lon=tile_lon,
                                     lat=tile_lat,
                                     is_scales=True,
-                                    progressbar=False,
                                     progress_callback=create_download_callback(
                                         scales_key
                                     ),
@@ -1783,7 +1696,6 @@ def download(
                                 gt.registry.fetch_landmask(
                                     lon=tile_lon,
                                     lat=tile_lat,
-                                    progressbar=False,
                                     progress_callback=create_download_callback(
                                         landmask_key
                                     ),
@@ -2227,7 +2139,6 @@ def webmap(
 
             # If no reprojection was needed, use original file
             if actual_mosaic_path == str(rgb_mosaic):
-                actual_mosaic_path = str(rgb_mosaic)
                 mosaic_status = "Using original mosaic (already in correct CRS)"
             else:
                 # Force line break before filename to avoid wrapping issues
@@ -2407,8 +2318,9 @@ def serve(
 
     class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         def log_message(self, format, *args):
-            # Only log errors, not every request
-            if args[1] != "200":
+            # Only log errors, not every request. Some SimpleHTTPRequestHandler
+            # log paths call this with fewer args, so guard the index access.
+            if len(args) > 1 and args[1] != "200":
                 super().log_message(format, *args)
 
     try:

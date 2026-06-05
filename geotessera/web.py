@@ -279,7 +279,6 @@ def create_simple_web_viewer(
     if region_file:
         try:
             import geopandas as gpd
-            import json
 
             # Read the region file and convert to GeoJSON
             gdf = gpd.read_file(region_file)

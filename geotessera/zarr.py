@@ -124,15 +124,6 @@ class ShardSpec:
 # ---------------------------------------------------------------------------
 
 
-def epsg_to_utm_zone(epsg: int) -> int:
-    """Extract UTM zone number from an EPSG code (326xx north, 327xx south)."""
-    if 32601 <= epsg <= 32660:
-        return epsg - 32600
-    if 32701 <= epsg <= 32760:
-        return epsg - 32700
-    raise ValueError(f"EPSG {epsg} is not a UTM zone (expected 326xx or 327xx)")
-
-
 def epsg_is_south(epsg: int) -> bool:
     """Check if an EPSG code is a southern hemisphere UTM zone."""
     return 32701 <= epsg <= 32760
@@ -1071,8 +1062,6 @@ def _init_tile_registry(store_path: Path) -> None:
         {
             "year": pd.array([], dtype="int32"),
             "zone": pd.array([], dtype="int32"),
-            "shard_row": pd.array([], dtype="int32"),
-            "shard_col": pd.array([], dtype="int32"),
             "tile_lon": pd.array([], dtype="float64"),
             "tile_lat": pd.array([], dtype="float64"),
             "written_at": pd.array([], dtype="datetime64[ns, UTC]"),
@@ -1420,8 +1409,6 @@ def _record_written_tiles(
             {
                 "year": np.int32(year),
                 "zone": np.int32(zone),
-                "shard_row": np.int32(0),  # TODO: compute from tile offset
-                "shard_col": np.int32(0),
                 "tile_lon": ti.lon,
                 "tile_lat": ti.lat,
                 "written_at": now,
@@ -2256,7 +2243,7 @@ def _reproject_chunk(
 
     warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
 
-    west, south, east, north_ = GLOBAL_BOUNDS
+    west, _south, _east, north_ = GLOBAL_BOUNDS
     row0 = chunk_row * GLOBAL_CHUNK
     col0 = chunk_col * GLOBAL_CHUNK
     tile_h = min(GLOBAL_CHUNK, GLOBAL_LEVEL0_H - row0)
@@ -2534,8 +2521,8 @@ def _reproject_zone(
                 try:
                     if future.result():
                         chunks_written += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Reproject chunk failed: {e}")
 
     marker.write_text(
         f"zone={zone_num} chunks={chunks_total} written={chunks_written}\n"

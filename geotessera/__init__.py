@@ -42,8 +42,7 @@ The exported GeoTIFF files contain:
 
 For visualization and analysis, use the separate visualization module:
     >>> from geotessera.visualization import create_rgb_mosaic
-    >>> gt = GeoTessera()
-    >>> create_rgb_mosaic(gt, files, "mosaic.tif")
+    >>> create_rgb_mosaic(files, "mosaic.tif")
 
 This design enables the use of standard GIS tools and libraries for all
 downstream processing, keeping GeoTessera focused on reliable data access.
@@ -61,9 +60,9 @@ def __getattr__(name):
 
         return GeoTesseraZarr
     if name == "store":
-        from . import store
+        import importlib
 
-        return store
+        return importlib.import_module("geotessera.store")
     raise AttributeError(f"module 'geotessera' has no attribute {name!r}")
 
 

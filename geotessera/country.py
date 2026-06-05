@@ -57,13 +57,10 @@ class CountryLookup:
         if self._progress_callback:
             self._progress_callback(0, 100, "Downloading country boundaries...")
 
-        # Import the Rich downloader from progress module
-        from .progress import RichHTTPDownloader
-
-        # Create a wrapper around RichHTTPDownloader that adapts the progress reporting
-        class CountryDataDownloader(RichHTTPDownloader):
+        # A small streaming downloader that adapts progress reporting to the
+        # outer progress callback.
+        class CountryDataDownloader:
             def __init__(self, progress_callback):
-                # Don't call parent init, we'll handle progress ourselves
                 self.outer_progress_callback = progress_callback
 
             def __call__(self, url, output_file):

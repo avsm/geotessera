@@ -218,63 +218,6 @@ def block_to_landmasks_registry_filename(block_lon: int, block_lat: int) -> str:
     return f"landmasks_{lon_str}_{lat_str}.txt"
 
 
-def blocks_in_bounds(
-    min_lon: float, max_lon: float, min_lat: float, max_lat: float
-) -> list:
-    """Get all registry blocks that intersect with given bounds.
-
-    Args:
-        min_lon: Minimum longitude
-        max_lon: Maximum longitude
-        min_lat: Minimum latitude
-        max_lat: Maximum latitude
-
-    Returns:
-        list: List of (block_lon, block_lat) tuples
-
-    Raises:
-        ValueError: If coordinates are out of bounds, not finite, or min > max
-    """
-    # Validate longitude bounds
-    if not (-180 <= min_lon <= 180):
-        raise ValueError(f"Minimum longitude {min_lon} out of bounds [-180, 180]")
-    if not (-180 <= max_lon <= 180):
-        raise ValueError(f"Maximum longitude {max_lon} out of bounds [-180, 180]")
-    if min_lon > max_lon:
-        raise ValueError(f"Minimum longitude {min_lon} greater than maximum {max_lon}")
-
-    # Validate latitude bounds
-    if not (-90 <= min_lat <= 90):
-        raise ValueError(f"Minimum latitude {min_lat} out of bounds [-90, 90]")
-    if not (-90 <= max_lat <= 90):
-        raise ValueError(f"Maximum latitude {max_lat} out of bounds [-90, 90]")
-    if min_lat > max_lat:
-        raise ValueError(f"Minimum latitude {min_lat} greater than maximum {max_lat}")
-
-    # Validate all coordinates are finite
-    if not all(math.isfinite(x) for x in [min_lon, max_lon, min_lat, max_lat]):
-        raise ValueError("All coordinates must be finite numbers")
-
-    blocks = []
-
-    # Get block coordinates for corners
-    min_block_lon = math.floor(min_lon / BLOCK_SIZE) * BLOCK_SIZE
-    max_block_lon = math.floor(max_lon / BLOCK_SIZE) * BLOCK_SIZE
-    min_block_lat = math.floor(min_lat / BLOCK_SIZE) * BLOCK_SIZE
-    max_block_lat = math.floor(max_lat / BLOCK_SIZE) * BLOCK_SIZE
-
-    # Iterate through all blocks in range
-    lon = min_block_lon
-    while lon <= max_block_lon:
-        lat = min_block_lat
-        while lat <= max_block_lat:
-            blocks.append((int(lon), int(lat)))
-            lat += BLOCK_SIZE
-        lon += BLOCK_SIZE
-
-    return blocks
-
-
 # Tile-level functions (0.1-degree data tiles)
 def tile_from_world(lon: float, lat: float) -> Tuple[float, float]:
     """Convert world coordinates to containing tile center coordinates.
@@ -411,22 +354,6 @@ def tile_to_bounds(lon: float, lat: float) -> Tuple[float, float, float, float]:
     return (lon - 0.05, lat - 0.05, lon + 0.05, lat + 0.05)
 
 
-def tile_to_box(lon: float, lat: float):
-    """Create a Shapely box geometry for a tile.
-
-    Args:
-        lon: Tile center longitude
-        lat: Tile center latitude
-
-    Returns:
-        Shapely box geometry representing the tile bounds
-    """
-    from shapely.geometry import box
-
-    west, south, east, north = tile_to_bounds(lon, lat)
-    return box(west, south, east, north)
-
-
 # Base URL for Tessera data downloads
 TESSERA_BASE_URL = "https://s3.us-west-2.amazonaws.com/tessera-embeddings"
 
@@ -487,6 +414,15 @@ def _parse_s3_url(url: str) -> Tuple[str, str, str]:
     if not bucket or not key:
         raise ValueError(f"Could not extract bucket/key from S3 URL: {url!r}")
     return region, bucket, key
+
+
+def format_bytes(num_bytes: float) -> str:
+    """Format a byte count as a human-readable string (e.g. ``"1.5 GB"``)."""
+    for unit in ["B", "KB", "MB", "GB"]:
+        if num_bytes < 1024.0:
+            return f"{num_bytes:.1f} {unit}"
+        num_bytes /= 1024.0
+    return f"{num_bytes:.1f} TB"
 
 
 def download_file_to_temp(
@@ -572,15 +508,8 @@ def download_file_to_temp(
 
     temp_path = Path(temp_file.name)
 
-    def format_bytes(bytes_val):
-        """Format bytes as a human-readable string."""
-        for unit in ["B", "KB", "MB", "GB"]:
-            if bytes_val < 1024.0:
-                return f"{bytes_val:.1f}{unit}"
-            bytes_val /= 1024.0
-        return f"{bytes_val:.1f}TB"
-
     body = response["Body"]
+    success = False
     try:
         downloaded = 0
         start_time = time.time()
@@ -635,20 +564,27 @@ def download_file_to_temp(
         else:
             final_path = temp_path
 
+        success = True
+
         if progress_callback:
             progress_callback(
-                downloaded, downloaded, f"Complete ({format_bytes(downloaded)})"
+                downloaded,
+                total_size or downloaded,
+                f"Complete ({format_bytes(downloaded)})",
             )
 
         return str(final_path)
 
-    except Exception:
-        temp_file.close()
-        if temp_path.exists():
-            temp_path.unlink()
-        raise
     finally:
         body.close()
+        # Remove the partial temp file on any failure, including
+        # KeyboardInterrupt/SystemExit (a BaseException, which a plain
+        # `except Exception` misses) — this is what left stray
+        # ``.<name>_tmp_*`` files behind on interrupted downloads.
+        if not success:
+            temp_file.close()
+            if temp_path.exists():
+                temp_path.unlink()
 
 
 class Registry:
@@ -674,7 +610,6 @@ class Registry:
         registry_dir: Optional[Union[str, Path]] = None,
         landmasks_registry_url: Optional[str] = None,
         landmasks_registry_path: Optional[Union[str, Path]] = None,
-        verify_hashes: bool = True,
         logger: Optional[logging.Logger] = None,
     ):
         """Initialize Registry manager with optimized Parquet registries.
@@ -695,9 +630,6 @@ class Registry:
             registry_dir: Directory containing manifest.parquet and landmasks.parquet files (alternative to individual paths)
             landmasks_registry_url: URL to download landmasks Parquet registry from (default: remote)
             landmasks_registry_path: Local path to existing landmasks Parquet registry file
-            verify_hashes: If True (default), verify SHA256 hashes of downloaded files.
-                Set to False to skip hash verification. Can also be disabled via
-                GEOTESSERA_SKIP_HASH=1 environment variable.
             logger: Optional logger instance. If not provided, creates a new one
         """
         # Resolve version into S3 path component and normalised numeric form.
@@ -715,23 +647,6 @@ class Registry:
         # the raw unfiltered manifest (e.g. multi-source coverage rendering).
         self.manifest_path: Optional[Path] = None
         self.logger = logger or logging.getLogger(__name__)
-
-        # Check environment variable for hash verification override
-        env_skip_hash = os.environ.get("GEOTESSERA_SKIP_HASH", "").lower() in (
-            "1",
-            "true",
-            "yes",
-        )
-        self.verify_hashes = verify_hashes and not env_skip_hash
-
-        if env_skip_hash:
-            self.logger.warning(
-                "Hash verification disabled via GEOTESSERA_SKIP_HASH environment variable"
-            )
-        elif not verify_hashes:
-            self.logger.warning(
-                "Hash verification disabled via verify_hashes parameter"
-            )
 
         # Set up cache directory for Parquet registries only
         if cache_dir:
@@ -1192,7 +1107,6 @@ class Registry:
     def fetch(
         self,
         path: Optional[str] = None,
-        progressbar: bool = True,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
         refresh: bool = False,
         year: Optional[int] = None,
@@ -1205,7 +1119,6 @@ class Registry:
         Args:
             path: Optional path to the file (relative to base URL or embeddings_dir).
                   If not provided, will be calculated from year/lon/lat.
-            progressbar: Whether to show download progress
             progress_callback: Optional callback for progress updates
             refresh: If True, force re-download even if local file exists
             year: Year of the tile (required if path not provided)
@@ -1255,7 +1168,6 @@ class Registry:
     def fetch_landmask(
         self,
         filename: Optional[str] = None,
-        progressbar: bool = True,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
         refresh: bool = False,
         lon: Optional[float] = None,
@@ -1266,7 +1178,6 @@ class Registry:
         Args:
             filename: Optional name of the landmask file. If not provided, will be
                       calculated from lon/lat.
-            progressbar: Whether to show download progress
             progress_callback: Optional callback for progress updates
             refresh: If True, force re-download even if local file exists
             lon: Longitude of the tile (required if filename not provided)

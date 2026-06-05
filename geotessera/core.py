@@ -97,7 +97,6 @@ class GeoTessera:
         registry_url: Optional[str] = None,
         registry_path: Optional[Union[str, Path]] = None,
         registry_dir: Optional[Union[str, Path]] = None,
-        verify_hashes: bool = True,
     ):
         """Initialize GeoTessera with Parquet registry.
 
@@ -134,9 +133,6 @@ class GeoTessera:
             registry_url: URL to download Parquet registry from (default: remote)
             registry_path: Local path to existing Parquet registry file
             registry_dir: Directory containing registry.parquet and landmasks.parquet files
-            verify_hashes: If True (default), verify SHA256 hashes of downloaded files.
-                Set to False to skip hash verification. Can also be disabled via
-                GEOTESSERA_SKIP_HASH=1 environment variable.
         """
         self.dataset_version = dataset_version
         self.dataset_variant = dataset_variant
@@ -158,7 +154,6 @@ class GeoTessera:
             registry_url=registry_url,
             registry_path=registry_path,
             registry_dir=registry_dir,
-            verify_hashes=verify_hashes,
             logger=self.logger,
         )
 
@@ -543,8 +538,6 @@ class GeoTessera:
                         f"Failed tile {i + 1}/{total_tiles}",
                     )
                 continue
-
-        return None
 
     def _ensure_tiles_available(
         self,
@@ -1102,11 +1095,8 @@ class GeoTessera:
         Returns:
             List of (lon, lat) tuples
         """
-        # Handle list of tuples (most common case)
-        if isinstance(points, Iterable):
-            return list(points)
-
-        # Handle GeoJSON FeatureCollection
+        # Handle GeoJSON FeatureCollection (a dict is also Iterable, so this must
+        # be checked before the generic list/array fallback below).
         if isinstance(points, dict):
             if points.get("type") == "FeatureCollection":
                 result = []
@@ -1117,14 +1107,11 @@ class GeoTessera:
                         if len(coords) >= 2:
                             result.append((coords[0], coords[1]))
                 return result
-            else:
-                raise ValueError(
-                    "Dict input must be a GeoJSON FeatureCollection with Point geometries"
-                )
+            raise ValueError(
+                "Dict input must be a GeoJSON FeatureCollection with Point geometries"
+            )
 
-        # Handle GeoDataFrame
-        import geopandas as gpd
-
+        # Handle GeoDataFrame (also Iterable, so check before the generic fallback).
         if isinstance(points, gpd.GeoDataFrame):
             result = []
             for geom in points.geometry:
@@ -1133,6 +1120,10 @@ class GeoTessera:
                 else:
                     raise ValueError("GeoDataFrame must contain only Point geometries")
             return result
+
+        # Handle a plain list/tuple/array of (lon, lat) pairs (most common case).
+        if isinstance(points, Iterable):
+            return list(points)
 
         raise ValueError(
             "points must be a list of (lon, lat) tuples, GeoJSON FeatureCollection, "
@@ -1151,8 +1142,6 @@ class GeoTessera:
         Returns:
             Dictionary mapping (tile_lon, tile_lat) -> list of point indices
         """
-        from .registry import tile_from_world
-
         # Group points by tile
         points_by_tile = {}
         for idx, (lon, lat) in enumerate(points):
@@ -1229,7 +1218,6 @@ class GeoTessera:
             lon=lon,
             lat=lat,
             is_scales=False,
-            progressbar=False,
             progress_callback=progress_callback,
             refresh=refresh,
         )
@@ -1238,7 +1226,6 @@ class GeoTessera:
             lon=lon,
             lat=lat,
             is_scales=True,
-            progressbar=False,
             progress_callback=progress_callback,
             refresh=refresh,
         )
@@ -1302,7 +1289,6 @@ class GeoTessera:
                 lon=lon,
                 lat=lat,
                 is_scales=False,
-                progressbar=False,
                 progress_callback=progress_callback,
                 refresh=refresh,
             )
@@ -1312,14 +1298,11 @@ class GeoTessera:
                 lon=lon,
                 lat=lat,
                 is_scales=True,
-                progressbar=False,
                 progress_callback=progress_callback,
                 refresh=refresh,
             )
 
-            self.registry.fetch_landmask(
-                lon=lon, lat=lat, progressbar=False, refresh=refresh
-            )
+            self.registry.fetch_landmask(lon=lon, lat=lat, refresh=refresh)
 
             return True
 
@@ -1523,7 +1506,7 @@ class GeoTessera:
         try:
             # Fetch landmask file using coordinates
             landmask_path = self.registry.fetch_landmask(
-                lon=lon, lat=lat, progressbar=False, refresh=refresh
+                lon=lon, lat=lat, refresh=refresh
             )
 
             # Extract CRS and transform
@@ -1544,6 +1527,69 @@ class GeoTessera:
             raise RuntimeError(
                 f"Failed to get UTM projection from landmask for ({lon:.2f}, {lat:.2f}): {e}"
             ) from e
+
+    def _write_embedding_tiff(
+        self, output_path, embedding, bands, crs, transform, year, lat, lon, compress
+    ):
+        """Write an embedding array to a GeoTIFF with standard Tessera metadata.
+
+        Shared by :meth:`export_embedding_geotiff` (single tile) and
+        :meth:`export_embedding_geotiffs` (region). ``bands`` selects a subset
+        of the 128 channels, or ``None`` for all of them.
+        """
+        try:
+            import rasterio
+        except ImportError:
+            raise ImportError(
+                "rasterio required for GeoTIFF export: pip install rasterio"
+            )
+
+        if bands is not None:
+            data = embedding[:, :, bands].copy()
+            band_count = len(bands)
+        else:
+            data = embedding.copy()
+            band_count = 128
+
+        height, width = data.shape[:2]
+        with rasterio.open(
+            output_path,
+            "w",
+            driver="GTiff",
+            height=height,
+            width=width,
+            count=band_count,
+            dtype="float32",
+            crs=crs,
+            transform=transform,
+            compress=compress,
+            tiled=True,
+            blockxsize=256,
+            blockysize=256,
+        ) as dst:
+            for i in range(band_count):
+                dst.write(data[:, :, i], i + 1)
+
+            if bands is not None:
+                for i, band_idx in enumerate(bands):
+                    dst.set_band_description(i + 1, f"Tessera_Band_{band_idx}")
+            else:
+                for i in range(128):
+                    dst.set_band_description(i + 1, f"Tessera_Band_{i}")
+
+            # Record the resolved version path (v1, v1.1, …) and variant so the
+            # dataset provenance is recoverable from the TIFF alone, even if
+            # separated from the tessera_metadata.json sidecar.
+            dst.update_tags(
+                TESSERA_DATASET_VERSION=self.registry._version_norm,
+                TESSERA_DATASET_VERSION_PATH=self.registry._version_path,
+                TESSERA_DATASET_VARIANT=self.dataset_variant,
+                TESSERA_YEAR=str(year),
+                TESSERA_TILE_LAT=f"{lat:.2f}",
+                TESSERA_TILE_LON=f"{lon:.2f}",
+                TESSERA_DESCRIPTION="GeoTessera satellite embedding tile",
+                GEOTESSERA_VERSION=__version__,
+            )
 
     def export_embedding_geotiff(
         self,
@@ -1572,70 +1618,15 @@ class GeoTessera:
             RuntimeError: If landmask tile or embedding data cannot be fetched
             FileNotFoundError: If registry files are missing
         """
-        try:
-            import rasterio
-        except ImportError:
-            raise ImportError(
-                "rasterio required for GeoTIFF export: pip install rasterio"
-            )
-
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Fetch single tile with CRS info
         embedding, crs, transform = self.fetch_embedding(lon, lat, year)
 
-        # Select bands
-        if bands is not None:
-            data = embedding[:, :, bands].copy()
-            band_count = len(bands)
-        else:
-            data = embedding.copy()
-            band_count = 128
-
-        # Get dimensions for GeoTIFF
-        height, width = data.shape[:2]
-
-        # Write GeoTIFF
-        with rasterio.open(
-            output_path,
-            "w",
-            driver="GTiff",
-            height=height,
-            width=width,
-            count=band_count,
-            dtype="float32",
-            crs=crs,
-            transform=transform,
-            compress=compress,
-            tiled=True,
-            blockxsize=256,
-            blockysize=256,
-        ) as dst:
-            # Write bands
-            for i in range(band_count):
-                dst.write(data[:, :, i], i + 1)
-
-            # Add band descriptions
-            if bands is not None:
-                for i, band_idx in enumerate(bands):
-                    dst.set_band_description(i + 1, f"Tessera_Band_{band_idx}")
-            else:
-                for i in range(128):
-                    dst.set_band_description(i + 1, f"Tessera_Band_{i}")
-
-            # Add metadata
-            dst.update_tags(
-                TESSERA_DATASET_VERSION=self.registry._version_norm,
-                TESSERA_DATASET_VERSION_PATH=self.registry._version_path,
-                TESSERA_DATASET_VARIANT=self.dataset_variant,
-                TESSERA_YEAR=str(year),
-                TESSERA_TILE_LAT=f"{lat:.2f}",
-                TESSERA_TILE_LON=f"{lon:.2f}",
-                TESSERA_DESCRIPTION="GeoTessera satellite embedding tile",
-                GEOTESSERA_VERSION=__version__,
-            )
-
+        self._write_embedding_tiff(
+            output_path, embedding, bands, crs, transform, year, lat, lon, compress
+        )
         return str(output_path)
 
     def export_embedding_geotiffs(
@@ -1664,13 +1655,6 @@ class GeoTessera:
             RuntimeError: If landmask tiles or embedding data cannot be fetched
             FileNotFoundError: If registry files are missing
         """
-        try:
-            import rasterio
-        except ImportError:
-            raise ImportError(
-                "rasterio required for GeoTIFF export: pip install rasterio"
-            )
-
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1700,59 +1684,17 @@ class GeoTessera:
             output_path = output_dir / EMBEDDINGS_DIR_NAME / geotiff_rel_path
             output_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # Select bands
-            if bands is not None:
-                data = embedding[:, :, bands].copy()
-                band_count = len(bands)
-            else:
-                data = embedding.copy()
-                band_count = 128
-
-            # Get dimensions for GeoTIFF
-            height, width = data.shape[:2]
-
-            # Write GeoTIFF
-            with rasterio.open(
+            self._write_embedding_tiff(
                 output_path,
-                "w",
-                driver="GTiff",
-                height=height,
-                width=width,
-                count=band_count,
-                dtype="float32",
-                crs=crs,
-                transform=transform,
-                compress=compress,
-                tiled=True,
-                blockxsize=256,
-                blockysize=256,
-            ) as dst:
-                # Write bands
-                for j in range(band_count):
-                    dst.write(data[:, :, j], j + 1)
-
-                # Add band descriptions
-                if bands is not None:
-                    for j, band_idx in enumerate(bands):
-                        dst.set_band_description(j + 1, f"Tessera_Band_{band_idx}")
-                else:
-                    for j in range(128):
-                        dst.set_band_description(j + 1, f"Tessera_Band_{j}")
-
-                # Add metadata. Record the resolved version path (v1, v1.1, …)
-                # and variant so the dataset provenance is fully recoverable
-                # from a single TIFF even if it's separated from the
-                # tessera_metadata.json sidecar.
-                dst.update_tags(
-                    TESSERA_DATASET_VERSION=self.registry._version_norm,
-                    TESSERA_DATASET_VERSION_PATH=self.registry._version_path,
-                    TESSERA_DATASET_VARIANT=self.dataset_variant,
-                    TESSERA_YEAR=str(year),
-                    TESSERA_TILE_LAT=f"{tile_lat:.2f}",
-                    TESSERA_TILE_LON=f"{tile_lon:.2f}",
-                    TESSERA_DESCRIPTION="GeoTessera satellite embedding tile",
-                    GEOTESSERA_VERSION=__version__,
-                )
+                embedding,
+                bands,
+                crs,
+                transform,
+                year,
+                tile_lat,
+                tile_lon,
+                compress,
+            )
 
             created_files.append(str(output_path))
 
@@ -2086,8 +2028,12 @@ class GeoTessera:
         if progress_callback:
             progress_callback(0, 100, "Fetching embedding tiles...")
 
-        embeddings = self.fetch_embeddings(
-            tiles_to_fetch, fetch_progress if progress_callback else None
+        # Materialise the generator: apply_pca_to_embeddings needs len() and the
+        # results are iterated twice below, so a one-shot generator won't do.
+        embeddings = list(
+            self.fetch_embeddings(
+                tiles_to_fetch, fetch_progress if progress_callback else None
+            )
         )
 
         if not embeddings:
@@ -2122,7 +2068,7 @@ class GeoTessera:
             global_min = [float("inf")] * n_components
             global_max = [float("-inf")] * n_components
 
-            for _, _, pca_img, _, _, _ in pca_results:
+            for _, _, _, pca_img, _, _, _ in pca_results:
                 for j in range(n_components):
                     comp = pca_img[:, :, j]
                     global_min[j] = min(global_min[j], np.nanmin(comp))

@@ -364,7 +364,6 @@ Options:
   --bands TEXT             Comma-separated band indices (default: all 128)
   --compress TEXT          Compression for TIFF format (default: lzw)
   --dry-run                Calculate total download size without downloading
-  --skip-hash              Skip CRC64NVMe checksum verification of downloaded files
   --list-files             List all created files with details
   -v, --verbose            Verbose output
 ```
@@ -482,8 +481,7 @@ GeoTessera uses a Parquet-based registry system to efficiently manage and access
 - **Minimal storage**: Manifest files are ~few MB each and cached locally
 - **Integrity checking**: End-to-end CRC64NVMe checksums verified against S3's
   `x-amz-checksum-crc64nvme` response header during each download
-  - **Enabled by default** for data integrity
-  - Can be disabled with `verify_hashes=False`, `--skip-hash` CLI flag, or `GEOTESSERA_SKIP_HASH=1` environment variable
+  - **Always enforced** for data integrity — a checksum mismatch (or a missing checksum header) rejects the download
 
 ### Dataset Versions and Variants
 
@@ -617,33 +615,7 @@ When `cache_dir` is not specified, the registry is cached in platform-appropriat
 
 ## Hash Verification
 
-GeoTessera verifies end-to-end CRC64NVMe checksums for all downloaded files (embeddings, scales, and landmasks) against S3's `x-amz-checksum-crc64nvme` response header by default to ensure data integrity. You can disable this verification if needed:
-
-### Python API
-
-```python
-from geotessera import GeoTessera
-
-# Disable hash verification via parameter
-gt = GeoTessera(verify_hashes=False)
-
-# Or use environment variable
-import os
-os.environ['GEOTESSERA_SKIP_HASH'] = '1'
-gt = GeoTessera()
-```
-
-### CLI
-
-```bash
-# Disable hash verification with flag
-geotessera download --bbox "0,52,0.2,52.2" --year 2024 -o ./data --skip-hash
-
-# Or use environment variable
-GEOTESSERA_SKIP_HASH=1 geotessera download --bbox "0,52,0.2,52.2" --year 2024 -o ./data
-```
-
-**Note**: Hash verification is enabled by default for security. Only disable it in trusted environments or for testing purposes.
+GeoTessera verifies end-to-end CRC64NVMe checksums for all downloaded files (embeddings, scales, and landmasks) against S3's `x-amz-checksum-crc64nvme` response header to ensure data integrity. This check is always enforced: a download whose checksum does not match — or whose S3 object is missing the checksum header — is rejected rather than used, so corrupt or truncated files never reach the cache.
 
 ## Contributing
 
