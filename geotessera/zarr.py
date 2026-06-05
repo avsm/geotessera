@@ -1512,8 +1512,9 @@ def _compute_rgb_chunk(
         per_channel_input = list(pcs)
         n_iter = components.shape[0]
     else:
-        per_channel_input = [emb_bhw[i].astype(np.float32) * scales_safe
-                              for i in band_indices]
+        per_channel_input = [
+            emb_bhw[i].astype(np.float32) * scales_safe for i in band_indices
+        ]
         n_iter = len(band_indices)
 
     # Keep float channels until after the saturation step to avoid two
@@ -1526,14 +1527,12 @@ def _compute_rgb_chunk(
             n_break = len(breaks)
             # searchsorted → bin index 0..n_break; renormalise to [0, 1].
             idx = np.searchsorted(breaks, dequant.ravel()).astype(np.float32)
-            normalised = (idx / max(n_break - 1, 1)).clip(0.0, 1.0).reshape(
-                dequant.shape
+            normalised = (
+                (idx / max(n_break - 1, 1)).clip(0.0, 1.0).reshape(dequant.shape)
             )
         else:
             lo, hi = stretch_min[i], stretch_max[i]
-            normalised = np.clip(
-                (dequant - lo) / max(hi - lo, 1e-10), 0.0, 1.0
-            )
+            normalised = np.clip((dequant - lo) / max(hi - lo, 1e-10), 0.0, 1.0)
         if gamma != 1.0:
             normalised = np.power(normalised, gamma, dtype=np.float32)
         float_channels.append(normalised)
@@ -1825,9 +1824,7 @@ def compute_global_stretch(
                 all_shards.append((name, ci, cj))
 
     if not all_shards:
-        raise RuntimeError(
-            f"No UTM zones with embedding data found in {store_path}"
-        )
+        raise RuntimeError(f"No UTM zones with embedding data found in {store_path}")
 
     # Deterministic shuffle seeded by year so reruns reproduce.
     rng = np.random.default_rng(year)
@@ -1933,18 +1930,12 @@ def compute_global_stretch(
         # used at render time.
         centred = all_vals.astype(np.float32, copy=False) - pca.mean_
         all_vals = centred @ components_ordered.T
-        pca_proj_components = [
-            [float(v) for v in row] for row in components_ordered
-        ]
+        pca_proj_components = [[float(v) for v in row] for row in components_ordered]
         pca_proj_mean = [float(v) for v in pca.mean_]
         pca_explained_variance_ratio = [float(v) for v in evr_ordered]
         if console:
-            evr_str = ", ".join(
-                f"{v * 100:.1f}%" for v in pca_explained_variance_ratio
-            )
-            label = "->".join(
-                ["R", "G", "B"][:k]
-            )  # channels R, G, B (in store order)
+            evr_str = ", ".join(f"{v * 100:.1f}%" for v in pca_explained_variance_ratio)
+            label = "->".join(["R", "G", "B"][:k])  # channels R, G, B (in store order)
             pc_label = "->".join(
                 [f"PC{p + 1}" for p in pca_perm]
             )  # which PCs ended up there
@@ -1989,8 +1980,7 @@ def compute_global_stretch(
             cdf_breaks.append([float(v) for v in bks])
         if console:
             console.print(
-                f"Computed {n_break}-point CDF per channel for histogram "
-                "equalisation."
+                f"Computed {n_break}-point CDF per channel for histogram equalisation."
             )
 
     # Persist to root attrs under year-keyed subdict.
@@ -2032,9 +2022,7 @@ def compute_global_stretch(
     }
 
 
-def _load_global_stretch(
-    store_path: Path, year: int
-) -> Optional[dict]:
+def _load_global_stretch(store_path: Path, year: int) -> Optional[dict]:
     """Look up a previously-computed global stretch for ``year``.
 
     Returns ``{"min": [..], "max": [..], "cdf": [[..], ..],
@@ -2341,9 +2329,7 @@ def _reproject_chunk(
         band_tuple: Tuple[int, ...] = tuple(range(n_pca_bands))
     else:
         b0, b1 = RGB_PREVIEW_BANDS[0], RGB_PREVIEW_BANDS[-1] + 1
-        emb_chunk = np.asarray(
-            emb_arr[time_index, b0:b1, r_min:r_max, c_min:c_max]
-        )
+        emb_chunk = np.asarray(emb_arr[time_index, b0:b1, r_min:r_max, c_min:c_max])
         band_tuple = tuple(range(b1 - b0))
     rgba = _compute_rgb_chunk(
         emb_chunk,

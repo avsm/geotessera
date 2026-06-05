@@ -146,7 +146,9 @@ The Tessera embeddings use a **0.1-degree grid system**:
 File Structure and Downloads
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-When you request embeddings, GeoTessera downloads files directly via HTTP to temporary locations:
+When you request embeddings, GeoTessera downloads files from the public S3
+bucket (using anonymous, unsigned requests) into your chosen output directory,
+where they persist for re-use:
 
 **Embedding Files** (via ``fetch_embedding``):
 
@@ -164,7 +166,7 @@ When you request embeddings, GeoTessera downloads files directly via HTTP to tem
 
 3. **Dequantization**: ``final_embedding = quantized_embedding * scales``
 
-4. **Temporary Storage**: Files are downloaded to temp locations and automatically cleaned up after processing
+4. **Persistent Storage**: Files are downloaded into your output directory and skipped on rerun, so interrupted downloads resume cleanly
 
 **Landmask Files** (with CRS and masks for GeoTIFF export):
 
@@ -173,7 +175,7 @@ When you request embeddings, GeoTessera downloads files directly via HTTP to tem
   * Provide UTM projection information
   * Define precise geospatial transforms
   * Contain land/water masks
-  * Also downloaded to temp locations and cleaned up after use
+  * Cached alongside the embedding tiles for re-use
 
 The geotessera CLI can also export these into GeoTIFF format with each band
 dequantised into 128-bands and with the GeoTIFF CRS metadata intact.
@@ -187,7 +189,7 @@ Data Flow
         ↓
     Per-version Manifest Lookup (filter manifest.parquet by year/lon/lat/variant)
         ↓
-    HTTP Downloads (with CRC64NVMe verification on the wire)
+    Anonymous S3 Downloads (with CRC64NVMe verification on the wire)
         ├── embedding.npy (int8 quantized) → output_dir
         └── embedding_scales.npy (float32 scale factors) → output_dir
         ↓

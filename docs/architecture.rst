@@ -31,7 +31,7 @@ The library follows a layered architecture:
     └── Visualization (rendering and web maps)
             ↓
     Data Access Layer
-    ├── Direct HTTP downloads (urllib)
+    ├── Anonymous S3 downloads (botocore)
     ├── Zarr v3 store (cloud-native streaming)
     ├── Rasterio (GeoTIFF I/O)
     └── GeoPandas (geospatial operations)
@@ -284,10 +284,11 @@ The manifest can be loaded from multiple sources:
 Data Access Layer
 -----------------
 
-Direct HTTP Downloads
-~~~~~~~~~~~~~~~~~~~~~
+S3 Downloads
+~~~~~~~~~~~~
 
-GeoTessera streams tiles directly from S3 over HTTPS:
+GeoTessera streams tiles directly from the public S3 bucket using anonymous
+(unsigned) ``botocore`` requests:
 
 **Features**:
 
@@ -319,49 +320,35 @@ GeoTessera streams tiles directly from S3 over HTTPS:
 
 **Download Process**::
 
-    import tempfile
-    from urllib.request import urlopen
+    import numpy as np
     from geotessera import dequantize_embedding
 
     def fetch_embedding(lon, lat, year):
-        # 1. Query registry for tile metadata
-        tile_info = registry.query_tile(lon, lat, year)
+        # 1. Fetch the quantized embedding and scales tiles. ``fetch`` returns
+        #    a path under embeddings_dir, downloading from S3 if not present.
+        embedding_file = registry.fetch(year=year, lon=lon, lat=lat, is_scales=False)
+        scales_file = registry.fetch(year=year, lon=lon, lat=lat, is_scales=True)
 
-        # 2. Download to temporary files (or use local if exists in embeddings_dir)
-        embedding_file, cleanup_embedding = registry.fetch(
-            year=year, lon=lon, lat=lat, is_scales=False
-        )
-        scales_file, cleanup_scales = registry.fetch(
-            year=year, lon=lon, lat=lat, is_scales=True
-        )
+        # 2. Load and dequantize
+        quantized = np.load(embedding_file)
+        scales = np.load(scales_file)
+        embedding = dequantize_embedding(quantized, scales)
 
-        try:
-            # 3. Load and dequantize
-            quantized = np.load(embedding_file)
-            scales = np.load(scales_file)
-            embedding = dequantize_embedding(quantized, scales)
+        # 3. Get CRS from the landmask tile
+        crs, transform = get_utm_projection_from_landmask(lon, lat)
 
-            # 4. Get CRS from landmask (also temporary or local)
-            crs, transform = get_utm_projection_from_landmask(lon, lat)
+        return embedding, crs, transform
 
-            return embedding, crs, transform
+Persistent Tile Storage
+~~~~~~~~~~~~~~~~~~~~~~~~
 
-        finally:
-            # 5. Clean up temporary files (if they were temporary)
-            if cleanup_embedding:
-                Path(embedding_file).unlink(missing_ok=True)
-            if cleanup_scales:
-                Path(scales_file).unlink(missing_ok=True)
+**Why persist tiles?**
 
-Temporary File Management
-~~~~~~~~~~~~~~~~~~~~~~~~~
-
-**Why Temporary Files?**
-
-- Embedding tiles can be large (1-64MB per tile)
-- Users typically process and export, not reuse raw tiles
-- Eliminates need for cache management and cleanup
-- Reduces disk space requirements to just the registry
+- Tiles land in the user-supplied ``--output`` (``embeddings_dir``) and are
+  re-used across runs rather than re-downloaded
+- Existing files are skipped on rerun, making interrupted downloads resumable
+- Only the small per-version manifests live in ``~/.cache/geotessera``;
+  the bulk embedding data stays under the output directory the user controls
 
 **Cache Configuration**::
 

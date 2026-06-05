@@ -1,3 +1,63 @@
+## v0.9.0 (2026-06-05)
+
+This release introduces support for multiple model versions (Tessera v1.0 and
+1.1) along with dataset variants so that multiple model runs can be selected
+and compared. All data downloads now go through the an AWS Open Data S3 bucket
+using anonymous requests, with end-to-end checksum verification. This replaces
+the previous direct HTTP mechanism and should hopefully be faster and more
+reliable.
+
+### New Features
+
+- **Dataset variants** (`--dataset-variant`, `dataset_variant=`): The
+  `GeoTessera` class and the `info`, `download`, and `coverage` CLI commands
+  now accept a `--dataset-variant` option (default `vultr`) alongside
+  `--dataset-version`. `--dataset-version` now also accepts the `v1.1` series
+  in addition to `v1`.
+  The resolved version/variant is recorded in a `tessera_metadata.json`
+  provenance sidecar next to downloaded tiles (#250 @avsm)
+- **`coverage --by-source`**: New flag that renders each `(version, variant)`
+  source in a distinct colour on the coverage map and globe viewer. When set
+  without an explicit `--dataset-version`/`--dataset-variant`, it downloads
+  every known version's manifest and renders all sources together.  The
+  `globe.html` viewer gains toggleable per-source layers and multi-dataset
+  tile tooltips (#250 @avsm)
+- **Coordinate lists accept iterables**: Functions taking coordinate lists now
+  accept any iterable or generator (e.g. `zip(lons, lats)`), not just
+  materialised lists (#259 @mdales)
+- **`geotessera-registry s3scan`**: New subcommand that spiders the public S3
+  bucket for embedding tiles across versions and variants and writes per-version
+  `manifest.parquet` and `landmasks.parquet` files in an S3-mirroring layout
+  (#250 @avsm)
+- **`geotessera-registry zarr-stretch`**: New subcommand that computes a global
+  cross-zone RGB stretch and stores it on a Zarr root for consistent colour
+  across UTM zones. Supports `--mode bands` and `--mode pca` (learning three
+  colour axes from the 128 embedding bands), with percentile, sampling, and
+  worker controls (@avsm)
+- **Chroma and gamma controls on `zarr-global-preview`**: The Zarr GeoTIFF
+  preview renderer gains `--gamma` (per-channel power-law adjustment) and
+  `--saturation` (luma/chroma decomposition with chroma scaling) for richer
+  colour output, consuming the global stretch produced by `zarr-stretch` (@avsm)
+
+### Breaking Changes
+
+- **Downloads now use AWS S3 only**: All embedding, manifest, and landmask
+  downloads switched from direct HTTP to anonymous (unsigned) S3 requests via
+  `botocore`. The default base URL is now
+  `https://s3.us-west-2.amazonaws.com/tessera-embeddings`. Custom or
+  self-hosted non-S3 mirror URLs are no longer supported (#276 #278 @avsm)
+- **New dependencies**: `botocore>=1.43.14` and `awscrt>=0.33.0` are now
+  required (the latter for CRC64NVMe checksum validation) (@avsm)
+- **Per-version registry file renamed**: The downloaded registry file is now
+  named `manifest.parquet` (per dataset version) rather than `registry.parquet`.
+  The legacy `registry.parquet` name is still auto-detected for local
+  `--registry-dir` overrides (#250 @avsm)
+
+### Bug Fixes
+
+- **End-to-end download integrity**: Downloads are now verified against the S3
+  CRC64NVMe checksum.  (#261 @mdales, #276 #278 @avsm)
+
 ## v0.8.0 (2026-04-05)
 
 This release adds cloud-native Zarr access, GeoTIFF download improvements,

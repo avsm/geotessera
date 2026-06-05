@@ -6,17 +6,24 @@ GeoTessera provides a comprehensive command-line interface for downloading, visu
 Global Options
 --------------
 
-Data-fetching commands (``download``, ``coverage``, ``info``) share these options::
+Data-fetching commands (``download``, ``coverage``, ``info``) share the
+dataset-selection options::
 
     --dataset-version TEXT    Tessera dataset version (default: v1).
                               Accepts v1, 1.0, v1.0, v1.1, 1.1 etc.
     --dataset-variant TEXT    Tessera dataset variant (default: vultr).
                               Known variants: vultr (1.0 default), cambridge (1.1).
-    --cache-dir PATH          Custom cache directory for the manifest
-    --registry-path PATH      Path to a local manifest.parquet file
-    --registry-dir PATH       Directory containing manifest.parquet + landmasks.parquet
     --verbose, -v             Enable verbose output
     --help                    Show help message
+
+The ``download`` and ``coverage`` commands additionally accept manifest
+location overrides (``info`` does not)::
+
+    --cache-dir PATH          Custom cache directory for the manifest
+    --registry-dir PATH       Directory containing manifest.parquet + landmasks.parquet
+
+To point at a single local manifest file from Python, use the
+``GeoTessera(registry_path=...)`` parameter (there is no equivalent CLI flag).
 
 .. note::
 
@@ -586,7 +593,7 @@ For additional help::
     geotessera visualize --help
 
     # Version information
-    geotessera --version
+    geotessera version
 
     # Library information
     geotessera info --verbose

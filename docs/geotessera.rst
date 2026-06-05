@@ -43,9 +43,9 @@ Registry management for efficient data discovery and access. Handles the block-b
 **Key Features:**
 
 * :class:`~geotessera.registry.Registry` - Main registry class for data discovery
-* :func:`~geotessera.registry.get_tile_bounds` - Get geographic bounds of a tile
-* :func:`~geotessera.registry.world_to_tile_coords` - Convert geographic to tile coordinates
-* :func:`~geotessera.registry.get_block_coordinates` - Get block coordinates for a tile
+* :func:`~geotessera.registry.tile_to_bounds` - Get geographic bounds of a tile
+* :func:`~geotessera.registry.tile_from_world` - Convert geographic to tile coordinates
+* :func:`~geotessera.registry.block_from_world` - Get block coordinates for a tile
 
 .. automodule:: geotessera.registry
    :members:

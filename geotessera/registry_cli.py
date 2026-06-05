@@ -3106,9 +3106,7 @@ def s3scan_command(args):
             embedding_version_paths = {
                 _version_path_from_norm(str(v)) for v, _, _, _ in scan_units
             }
-            missing = sorted(
-                embedding_version_paths - landmask_files_by_version.keys()
-            )
+            missing = sorted(embedding_version_paths - landmask_files_by_version.keys())
             for vpath in missing:
                 console.print(
                     f"[yellow]Warning: {vpath} has embeddings but no "
@@ -3339,12 +3337,15 @@ def _detect_dataset_metadata(
         return explicit_version, explicit_variant
 
     import json
+
     sidecar = Path(base_dir) / "tessera_metadata.json"
     if sidecar.exists():
         try:
             data = json.loads(sidecar.read_text())
-            version = explicit_version or data.get("dataset_version_path") or data.get(
-                "dataset_version"
+            version = (
+                explicit_version
+                or data.get("dataset_version_path")
+                or data.get("dataset_version")
             )
             variant = explicit_variant or data.get("dataset_variant")
             if version and variant:

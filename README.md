@@ -82,7 +82,9 @@ The Tessera embeddings use a **0.1-degree grid system**:
 
 ### File Structure and Downloads
 
-When you request embeddings, GeoTessera downloads files directly via HTTP to temporary locations:
+When you request embeddings, GeoTessera downloads files from the public S3
+bucket (using anonymous, unsigned requests) into the output directory you
+specify, where they persist for re-use:
 
 #### Embedding Files (via `fetch_embedding`)
 1. **Quantized embeddings** (`grid_X.XX_Y.YY.npy`):
@@ -97,7 +99,8 @@ When you request embeddings, GeoTessera downloads files directly via HTTP to tem
 
 3. **Dequantization**: `final_embedding = quantized_embedding * scales`
 
-4. **Temporary Storage**: Files are downloaded to temp locations and automatically cleaned up after processing
+4. **Persistent Storage**: Files are downloaded into your chosen output
+   directory and skipped on rerun, so interrupted downloads resume cleanly
 
 #### Landmask Files (for GeoTIFF export)
 When exporting to GeoTIFF, additional landmask files are fetched:
@@ -105,29 +108,29 @@ When exporting to GeoTIFF, additional landmask files are fetched:
   - Provide UTM projection information
   - Define precise geospatial transforms
   - Contain land/water masks
-  - Also downloaded to temp locations and cleaned up after use
+  - Cached alongside the embedding tiles for re-use
 
 ### Data Flow
 
 ```
 User Request (lat/lon bbox)
     ↓
-Parquet Registry Lookup (find available tiles from registry.parquet)
+Parquet Registry Lookup (find available tiles from manifest.parquet)
     ↓
-Direct HTTP Downloads to Temp Files
-    ├── embedding.npy (quantized) → temp file
-    └── embedding_scales.npy → temp file
+Anonymous S3 Downloads to Output Directory (CRC64NVMe verified)
+    ├── embedding.npy (quantized) → output dir
+    └── embedding_scales.npy → output dir
     ↓
 Dequantization (multiply arrays)
-    ↓
-Automatic Cleanup (delete temp files)
     ↓
 Output Format
     ├── NumPy arrays → Direct analysis
     └── GeoTIFF → GIS integration
 ```
 
-**Storage Note**: Only the Parquet registry (~few MB) is cached locally. All embedding data is downloaded on-demand to temporary files and immediately cleaned up, resulting in zero persistent storage overhead for tile data.
+**Storage Note**: Only the per-version Parquet manifests (~few MB each) are
+cached under `~/.cache/geotessera`. Embedding tiles are downloaded on demand
+into the output directory you specify and persist there for re-use across runs.
 
 ## Quick Start
 
@@ -356,10 +359,12 @@ Options:
   --country TEXT           Country name (e.g., 'United Kingdom', 'UK', 'GB')
   -f, --format TEXT        Output format: 'tiff' or 'npy' (default: tiff)
   --year INT               Year of embeddings (default: 2024)
+  --dataset-version TEXT   Tessera dataset version (e.g. v1, v1.1)
+  --dataset-variant TEXT   Tessera dataset variant (default: vultr)
   --bands TEXT             Comma-separated band indices (default: all 128)
   --compress TEXT          Compression for TIFF format (default: lzw)
   --dry-run                Calculate total download size without downloading
-  --skip-hash              Skip SHA256 hash verification of downloaded files
+  --skip-hash              Skip CRC64NVMe checksum verification of downloaded files
   --list-files             List all created files with details
   -v, --verbose            Verbose output
 ```
@@ -419,10 +424,14 @@ Generate a world map showing data availability:
 geotessera coverage [OPTIONS]
 
 Options:
-  -o, --output PATH        Output PNG file (default: tessera_coverage.png)
+  -o, --output PATH        Output PNG file, or a directory to also receive the
+                           coverage.json/globe.html (default: tessera_coverage.png)
   --year INT               Specific year to visualize
   --bbox TEXT              Bounding box: 'lon,lat' (single tile) or 'min_lon,min_lat,max_lon,max_lat'
   --tile TEXT              Single tile by any point within it: 'lon,lat'
+  --by-source              Render each (version, variant) source in a distinct colour
+  --dataset-version TEXT   Tessera dataset version (e.g. v1, v1.1; or 'all' with --by-source)
+  --dataset-variant TEXT   Tessera dataset variant (default: vultr; or 'all' with --by-source)
   --region-file PATH       GeoJSON/Shapefile to focus on specific region
   --country TEXT           Country name to focus on (e.g., 'United Kingdom')
   --tile-color TEXT        Color for tiles (default: red)
@@ -430,6 +439,7 @@ Options:
   --tile-size FLOAT        Size multiplier (default: 1.0)
   --width INT              Output image width in pixels (default: 2000)
   --no-countries           Don't show country boundaries
+  --no-multi-year-colors   Disable multi-year color coding
 ```
 
 ### serve
@@ -454,7 +464,8 @@ geotessera info [OPTIONS]
 
 Options:
   --tiles PATH             Analyze tile files/directory (GeoTIFF or NPY format)
-  --dataset-version TEXT   Tessera dataset version
+  --dataset-version TEXT   Tessera dataset version (e.g. v1, v1.1)
+  --dataset-variant TEXT   Tessera dataset variant (default: vultr)
   -v, --verbose            Verbose output
 ```
 
@@ -464,65 +475,72 @@ Options:
 
 GeoTessera uses a Parquet-based registry system to efficiently manage and access the large Tessera dataset:
 
-- **Single Parquet file**: All tile metadata stored in one efficient `registry.parquet` file
+- **Per-version manifests**: Each dataset version has its own `manifest.parquet`
+  listing every `(year, lon, lat)` tile available for that version's variants
 - **Fast queries**: Uses pandas DataFrames for efficient spatial and temporal filtering
 - **Block-based organization**: Internal 5×5 degree geographic blocks for efficient queries
-- **Minimal storage**: Registry file is ~few MB and cached locally
-- **Integrity checking**: SHA256 checksums ensure data integrity during downloads
-  - Embedding files verified using `hash` column
-  - Scales files verified using `scales_hash` column
-  - Landmask files verified using landmasks registry `hash` column
-  - **Enabled by default** for data integrity and security
+- **Minimal storage**: Manifest files are ~few MB each and cached locally
+- **Integrity checking**: End-to-end CRC64NVMe checksums verified against S3's
+  `x-amz-checksum-crc64nvme` response header during each download
+  - **Enabled by default** for data integrity
   - Can be disabled with `verify_hashes=False`, `--skip-hash` CLI flag, or `GEOTESSERA_SKIP_HASH=1` environment variable
+
+### Dataset Versions and Variants
+
+Tessera embeddings are published as dataset *versions* (e.g. `v1`, `v1.1`) and,
+within a version, as *variants* produced by different model runs (e.g. the
+default `vultr`, or `cambridge`). Select them on the CLI with `--dataset-version`
+and `--dataset-variant`, or in Python:
+
+```python
+gt = GeoTessera(dataset_version="v1.1", dataset_variant="cambridge")
+```
+
+Use `geotessera coverage --by-source` to render each `(version, variant)` source
+in a distinct colour on the coverage map and globe viewer.
 
 ### Registry Sources
 
 The registry can be loaded from multiple sources (in priority order):
 
-1. **Local file** (via `--registry-path` or `registry_path` parameter)
-2. **Local directory** (via `--registry-dir` or `registry_dir` parameter, looks for `registry.parquet`)
-3. **Remote URL** (via `--registry-url` or `registry_url` parameter)
-4. **Default remote** (from `https://s3.us-west-2.amazonaws.com/tessera-embeddings/{version}/registry.parquet`)
+1. **Local file** (via `registry_path` parameter)
+2. **Local directory** (via `--registry-dir` or `registry_dir` parameter, looks for `manifest.parquet`, falling back to the legacy `registry.parquet`)
+3. **Remote URL** (via `registry_url` parameter)
+4. **Default remote** (from `https://s3.us-west-2.amazonaws.com/tessera-embeddings/{version}/manifest.parquet`)
 
 ```python
-# Use local registry file
-gt = GeoTessera(registry_path="/path/to/registry.parquet")
+# Use local manifest file
+gt = GeoTessera(registry_path="/path/to/manifest.parquet")
 
 # Use local registry directory
 gt = GeoTessera(registry_dir="/path/to/registry-dir")
 
-# Use custom remote registry
-gt = GeoTessera(registry_url="https://example.com/registry.parquet")
-
-# Use default remote registry (downloads and caches automatically)
+# Use default remote manifest (downloads and caches automatically)
 gt = GeoTessera()  # Default behavior
 ```
 
 ### Registry Structure
 
-The Parquet registry contains columns for:
+The Parquet manifest contains columns for:
 - **Coordinates**: `lon`, `lat` (tile center coordinates)
 - **Year**: `year` (data year, 2017-2025)
-- **Hash**: `hash` (SHA256 file integrity checksum), `scales_hash` (for scale files)
 - **Size**: `file_size` (file size in bytes for download planning)
 
 ```python
-# Example registry query
+# Example manifest query
 import pandas as pd
-registry = pd.read_parquet("registry.parquet")
-print(registry.head())
-#    lon    lat  year                                hash  ...
-# 0.15  52.05  2024  abc123...
+manifest = pd.read_parquet("manifest.parquet")
+print(manifest.head())
 ```
 
 ### How Registry Loading Works
 
-1. **Load Parquet registry** → Download and cache registry file (if not local)
+1. **Load Parquet manifest** → Download and cache the version's manifest (if not local)
 2. **Request tiles for bbox** → Query DataFrame for tiles in region
-3. **Filter by year** → Select tiles matching requested year
+3. **Filter by year and variant** → Select tiles matching the requested year/variant
 4. **Find available tiles** → Return list of matching tiles
-5. **Direct HTTP download** → Fetch tiles on-demand to temp files with hash verification
-6. **Automatic cleanup** → Delete temp files after processing
+5. **Anonymous S3 download** → Fetch tiles on demand into the output directory, verified with CRC64NVMe
+6. **Persist** → Downloaded tiles stay in the output directory and are skipped on rerun
 
 ## Data Organization
 
@@ -530,26 +548,33 @@ print(registry.head())
 
 ```
 Remote Server (https://s3.us-west-2.amazonaws.com/tessera-embeddings)
-├── v1/                              # Dataset version
-│   ├── registry.parquet             # Parquet registry with all metadata
-│   ├── 2024/                        # Year
-│   │   ├── grid_0.15_52.05/         # Tile (named by center coords)
-│   │   │   ├── grid_0.15_52.05.npy              # Quantized embeddings
-│   │   │   └── grid_0.15_52.05_scales.npy       # Scale factors
-│   │   └── ...
-│   └── landmasks/
-│       ├── grid_0.15_52.05.tiff     # Landmask with projection info
-│       └── ...
+├── v1/                                        # Dataset version 1.0
+│   ├── manifest.parquet                       # Per-version tile manifest
+│   ├── landmasks.parquet                      # Landmask manifest
+│   ├── global_0.1_degree_representation/      # vultr variant (default)
+│   │   └── 2024/grid_0.15_52.05/grid_0.15_52.05{,_scales}.npy
+│   └── global_0.1_degree_tiff_all/
+│       └── grid_0.15_52.05.tiff               # Landmask with projection info
+└── v1.1/                                      # Dataset version 1.1
+    ├── manifest.parquet
+    ├── landmasks.parquet
+    └── global_0.1_degree_representation.cambridge/
+        └── 2024/grid_0.15_52.05/grid_0.15_52.05{,_scales}.npy
 ```
 
 ### Local Cache Structure
 
 ```
-~/.cache/geotessera/                 # Default cache location
-└── registry.parquet                  # Cached Parquet registry (~few MB)
+~/.cache/geotessera/                 # Default cache location (manifests only)
+├── v1/
+│   ├── manifest.parquet             # Cached per-version manifest (~few MB)
+│   └── landmasks.parquet
+└── v1.1/
+    ├── manifest.parquet
+    └── landmasks.parquet
 
-# Note: Embedding and landmask tiles are NOT cached persistently.
-# They are downloaded to temporary files and immediately cleaned up after use.
+# Note: Embedding and landmask tiles are NOT stored here. They are downloaded
+# into the output directory you specify and persist there for re-use.
 ```
 
 ### Coordinate Reference Systems
@@ -560,7 +585,7 @@ Remote Server (https://s3.us-west-2.amazonaws.com/tessera-embeddings)
 
 ## Cache Configuration
 
-GeoTessera caches only the Parquet registry file (~few MB). Embedding and landmask tiles are downloaded to temporary files and immediately cleaned up after use.
+GeoTessera caches only the per-version Parquet manifests (~few MB each). Embedding and landmask tiles are downloaded into the output directory you specify and persist there for re-use across runs.
 
 ### Python API
 
@@ -592,7 +617,7 @@ When `cache_dir` is not specified, the registry is cached in platform-appropriat
 
 ## Hash Verification
 
-GeoTessera verifies SHA256 checksums for all downloaded files (embeddings, scales, and landmasks) by default to ensure data integrity. You can disable this verification if needed:
+GeoTessera verifies end-to-end CRC64NVMe checksums for all downloaded files (embeddings, scales, and landmasks) against S3's `x-amz-checksum-crc64nvme` response header by default to ensure data integrity. You can disable this verification if needed:
 
 ### Python API
 
