@@ -1001,7 +1001,7 @@ def _create_zone_group(
             shape=data.shape,
             dtype=data.dtype,
             fill_value=0,
-            compressors=None,
+            compressors=BloscCodec(cname="zstd", clevel=3),
             dimension_names=[dim],
         )
         store[name][:] = data
