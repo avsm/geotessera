@@ -1,4 +1,4 @@
-## v0.9.0 (2026-06-05)
+## v0.9.0 (2026-06-09)
 
 This release introduces support for multiple model versions (Tessera v1.0 and
 1.1) along with dataset variants so that multiple model runs can be selected
@@ -43,11 +43,10 @@ reliable.
 
 - **Downloads now use AWS S3 only**: All embedding, manifest, and landmask
   downloads switched from direct HTTP to anonymous (unsigned) S3 requests via
-  `botocore`. The default base URL is now
-  `https://s3.us-west-2.amazonaws.com/tessera-embeddings`. Custom or
-  self-hosted non-S3 mirror URLs are no longer supported (#276 #278 @avsm)
+  The default base URL is now `https://s3.us-west-2.amazonaws.com/tessera-embeddings`.
+  Custom non-S3 mirror URLs are no longer supported (#276 #278 @avsm)
 - **New dependencies**: `botocore>=1.43.14` and `awscrt>=0.33.0` are now
-  required (the latter for CRC64NVMe checksum validation) (@avsm)
+  required (@avsm)
 - **Per-version registry file renamed**: The downloaded registry file is now
   named `manifest.parquet` (per dataset version) rather than `registry.parquet`.
   The legacy `registry.parquet` name is still auto-detected for local
@@ -56,7 +55,7 @@ reliable.
 ### Bug Fixes
 
 - **End-to-end download integrity**: Downloads are now verified against the S3
-  CRC64NVMe checksum.  (#261 @mdales, #276 #278 @avsm)
+  CRC64NVMe checksum. (#261 @mdales, #276 #278 @avsm)
 
 ## v0.8.0 (2026-04-05)
 
