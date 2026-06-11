@@ -1,3 +1,11 @@
+## Unreleased
+
+### New Features
+
+- **`geotessera-registry zarr-consolidate`**: New subcommand that
+  re-consolidates a store's root metadata after in-place changes.
+  Mostly only for repairs and not regular use.
+
 ## v0.9.0 (2026-06-09)
 
 This release introduces support for multiple model versions (Tessera v1.0 and

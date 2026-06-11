@@ -1391,6 +1391,47 @@ def fill_store(
     return total_shards_written
 
 
+def consolidate_store(
+    store_path: str | Path,
+    console: Optional["rich.console.Console"] = None,
+) -> int:
+    """Re-consolidate a store's root metadata after in-place changes.
+
+    ``fill_store`` only re-consolidates when it writes at least one shard,
+    so a metadata-only change to an existing store (e.g. rewriting an
+    array with a different compressor) leaves the consolidated metadata
+    in the root ``zarr.json`` stale.  HTTP readers cannot list a store and
+    trust consolidated metadata exclusively, so a stale root breaks them.
+
+    Accepts a local store path or a remote fsspec URL such as
+    ``s3://bucket/store.zarr``.  Remote URLs need the matching fsspec
+    backend installed (``s3fs`` for S3) and write credentials for the
+    final root ``zarr.json`` upload.
+
+    Returns the number of consolidated nodes.
+    """
+    import warnings
+    import zarr
+
+    store = str(store_path)
+    if "://" not in store and not Path(store).exists():
+        raise FileNotFoundError(f"store not found: {store}")
+
+    if console:
+        console.print(f"Consolidating metadata at [bold]{store}[/bold]")
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Consolidated metadata")
+        # Tessera stores carry non-zarr marker objects (tile registry,
+        # zone-completion flags) that the consolidation walk would warn about.
+        warnings.filterwarnings(
+            "ignore", message="Object at .* is not recognized"
+        )
+        group = zarr.consolidate_metadata(store)
+
+    return len(group.metadata.consolidated_metadata.flattened_metadata)
+
+
 def _record_written_tiles(
     store_path: Path,
     tile_infos: List[TileInfo],

@@ -3319,6 +3319,29 @@ def zarr_fill_command(args):
     return 0
 
 
+def zarr_consolidate_command(args):
+    """Re-consolidate store metadata after in-place changes."""
+    from rich.console import Console
+
+    from .zarr import consolidate_store
+
+    console = Console()
+    try:
+        n = consolidate_store(args.store_path, console=console)
+    except FileNotFoundError as e:
+        console.print(f"[red]{emoji('❌ ')}Error: {e}[/red]")
+        raise SystemExit(1)
+    except ImportError as e:
+        console.print(
+            f"[red]{emoji('❌ ')}Error: {e} "
+            f"(remote store URLs need the matching fsspec backend, "
+            f"e.g. s3fs for s3://)[/red]"
+        )
+        raise SystemExit(1)
+    console.print(f"{emoji('✅ ')}Consolidated metadata for {n} nodes")
+    return 0
+
+
 def zarr_global_preview_command(args):
     """Build global EPSG:4326 RGB pyramid from zone-level embeddings."""
     import warnings
@@ -4206,6 +4229,19 @@ Directory Structure:
         "Default: read from tessera_metadata.json in base_dir, else vultr.",
     )
     zarr_fill_parser.set_defaults(func=zarr_fill_command)
+
+    # Zarr-consolidate command
+    zarr_consolidate_parser = subparsers.add_parser(
+        "zarr-consolidate",
+        help="Re-consolidate store metadata after in-place changes",
+    )
+    zarr_consolidate_parser.add_argument(
+        "store_path",
+        type=str,
+        help="Path or URL of an existing tessera store "
+        "(e.g. tessera.zarr or s3://bucket/store.zarr)",
+    )
+    zarr_consolidate_parser.set_defaults(func=zarr_consolidate_command)
 
     # Zarr-global-preview command
     zarr_gp_parser = subparsers.add_parser(
