@@ -167,14 +167,12 @@ def visualize_sources_coverage(
     try:
         import matplotlib.pyplot as plt
         import matplotlib.patches as mpatches
-        from matplotlib.collections import PatchCollection
+        from matplotlib.collections import PolyCollection
         import geodatasets
     except ImportError:
         raise ImportError(
             "Please install required packages: pip install matplotlib geodatasets"
         )
-
-    from .registry import tile_to_bounds
 
     if progress_callback:
         progress_callback(0, 100, "Loading manifest(s)...")
@@ -182,7 +180,19 @@ def visualize_sources_coverage(
         manifest_paths: List[Union[str, Path]] = [manifest_path]
     else:
         manifest_paths = list(manifest_path)
-    df = pd.concat([pd.read_parquet(p) for p in manifest_paths], ignore_index=True)
+    # Manifests carry per-file columns (paths, hashes, sizes) that a coverage
+    # render never touches; loading them for a multi-million-row global
+    # manifest costs gigabytes, so read only the rendering columns.
+    import pyarrow.parquet as pq
+
+    render_cols = ["lat", "lon", "year", "version", "variant"]
+    frames = []
+    for p in manifest_paths:
+        present = set(pq.read_schema(p).names)
+        frames.append(
+            pd.read_parquet(p, columns=[c for c in render_cols if c in present])
+        )
+    df = pd.concat(frames, ignore_index=True)
     required = {"lat", "lon", "year"}
     if not required.issubset(df.columns):
         raise ValueError(
@@ -219,6 +229,13 @@ def visualize_sources_coverage(
             "/ --dataset-variant / region constraints."
         )
 
+    # The manifest has one row per (year, lon, lat); a multi-year map only
+    # needs one rectangle per tile location per source. Without this the
+    # global view builds ~5M matplotlib patches (one per row), which OOMs
+    # smaller machines such as GitHub Actions runners, and over-paints the
+    # same tile once per year through the alpha channel.
+    df = df.drop_duplicates(subset=["version", "variant", "lon", "lat"])
+
     # Stable colour assignment per (version, variant). matplotlib's tab10 has
     # 10 distinguishable colours; cycle if we have more sources.
     groups = sorted(
@@ -253,43 +270,39 @@ def visualize_sources_coverage(
                 progress_callback(10, 100, "Plotting world map...")
             world.plot(ax=ax, color="lightgray", edgecolor="darkgray", linewidth=0.5)
 
-        rectangles = []
         total = len(df)
         if progress_callback:
             progress_callback(20, 100, f"Building {total:,} tile rectangles...")
-        half = 0.05 * tile_size
-        # Pull arrays directly — orders of magnitude faster than per-row Pandas access.
+        # Build a single PolyCollection from numpy corner arrays. A global
+        # manifest spans >1.5M tiles, and one matplotlib patch object per
+        # tile exceeds the memory of small CI machines.
+        half = 0.05 * tile_size  # tile_to_bounds() is centre ± 0.05
         lons = df["lon"].to_numpy()
         lats = df["lat"].to_numpy()
+        west, east = lons - half, lons + half
+        south, north = lats - half, lats + half
+        verts = np.stack(
+            [
+                np.stack([west, south], axis=1),
+                np.stack([east, south], axis=1),
+                np.stack([east, north], axis=1),
+                np.stack([west, north], axis=1),
+            ],
+            axis=1,
+        )
         versions_arr = df["version"].astype(str).to_numpy()
         variants_arr = df["variant"].astype(str).to_numpy()
-        for i in range(len(df)):
-            if progress_callback and (i % 5000 == 0 or i == total - 1):
-                progress_callback(
-                    20 + int((i / max(total, 1)) * 50),
-                    100,
-                    f"Tile {i + 1}/{total}",
-                )
-            west, south, east, north = tile_to_bounds(lons[i], lats[i])
-            if tile_size != 1.0:
-                cl, cb = lons[i], lats[i]
-                west, east = cl - half, cl + half
-                south, north = cb - half, cb + half
-            color = group_colors[(versions_arr[i], variants_arr[i])]
-            rectangles.append(
-                mpatches.Rectangle(
-                    (west, south),
-                    east - west,
-                    north - south,
-                    linewidth=0,
-                    facecolor=color,
-                    alpha=tile_alpha,
-                )
+        facecolors = np.empty((total, 4))
+        for g in groups:
+            facecolors[(versions_arr == g[0]) & (variants_arr == g[1])] = (
+                group_colors[g]
             )
 
         if progress_callback:
             progress_callback(70, 100, "Adding tiles to map...")
-        ax.add_collection(PatchCollection(rectangles, match_original=True))
+        ax.add_collection(
+            PolyCollection(verts, facecolors=facecolors, alpha=tile_alpha, linewidths=0)
+        )
 
         if region_bbox:
             min_lon, min_lat, max_lon, max_lat = region_bbox
