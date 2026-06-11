@@ -792,9 +792,6 @@ def coverage(
                 country_gdf = country_lookup.get_geometry(country)
 
                 # Create temporary GeoJSON file for the country boundary
-                import tempfile
-                import os
-
                 with tempfile.NamedTemporaryFile(
                     mode="w", suffix=".geojson", delete=False
                 ) as tmp:
@@ -1185,8 +1182,6 @@ def coverage(
             not region_file or country_geojson_file != str(region_file)
         ):
             try:
-                import os
-
                 os.unlink(country_geojson_file)
             except Exception:
                 pass  # Ignore cleanup errors
@@ -1194,8 +1189,6 @@ def coverage(
         # Clean up temporary region file if downloaded from URL
         if region_file_temp:
             try:
-                import os
-
                 os.unlink(region_file_temp)
             except Exception:
                 pass  # Ignore cleanup errors
