@@ -1,0 +1,130 @@
+name: TESSERA v2 Embedding Pre-Request (Early Tester)
+description: Reserve a spot to be an early tester of TESSERA v2 embeddings for a specific region/years (2017–2025). See the notice below before submitting.
+title: "[v2 Pre-Request] ORG / YEARS / ROI summary"
+labels:
+  - v2-embedding-prerequest
+assignees: []  # Optional: fill in default maintainers' GitHub IDs
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## 🚀 TESSERA v2 early-tester pre-request
+
+        Thanks for your interest in **TESSERA v2**! This form reserves your
+        region for the **v2 embedding** rollout as an early tester.
+
+        > [!IMPORTANT]
+        > **Please read before submitting.** We are currently ramping up the
+        > compute, storage, and release infrastructure for TESSERA v2, so v2
+        > embeddings will be produced **slowly** at first and there is **no
+        > guaranteed turnaround time**. This form is a *pre-request* — it puts
+        > your ROI in the v2 queue, not the standard production queue.
+        >
+        > **If you need embeddings soon, request v1.1 instead** — v1.1 is fully
+        > available today with normal turnaround. Open a
+        > [standard Embedding Request](../../issues/new?template=embedding-request.yml&labels=embedding-request)
+        > for v1.1 coverage.
+
+        When you submit this pre-request we will add your ROI to the v2 early-tester
+        list and comment on this issue as v2 coverage for your area becomes available.
+
+        • Coordinates must be in **lon,lat** (WGS84) with **4 decimal places** (e.g., `103.1234,30.5678`).
+        • You can define your Region of Interest (ROI) with either a bounding box or an attached shapefile.
+
+  - type: checkboxes
+    id: acknowledge
+    attributes:
+      label: Acknowledgement
+      description: Please confirm you understand this is a pre-request for v2.
+      options:
+        - label: I understand v2 embeddings are still being rolled out and may take a while, and that I should use v1.1 if I need results soon.
+          required: true
+
+  - type: input
+    id: org
+    attributes:
+      label: 1) Your organization
+      description: e.g., University of Cambridge / UESTC / Company X
+      placeholder: e.g., University of Cambridge
+    validations:
+      required: true
+
+  - type: textarea
+    id: purpose
+    attributes:
+      label: 2) Intended use
+      description: Briefly describe how you plan to use these embeddings (project/paper/course/demo, tasks like retrieval/classification/clustering/visualization, etc.)
+      placeholder: e.g., For downstream evaluation in project XXX (retrieval/classification/…)
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        ### 3) Region of Interest (ROI)
+        Please define your ROI using **either** a bounding box **or** by attaching a shapefile.
+        - **To use a shapefile (recommended for complex shapes):** Zip your `.shp`, `.dbf`, `.prj`, and other necessary files into a single `.zip` file. Attach it to this issue by dragging and dropping it into the text area below. If you provide a shapefile, we will prioritize it and ignore the bounding box coordinates.
+        - **To use a bounding box:** Fill in the four coordinates below. These fields are not required if you are attaching a shapefile.
+
+  - type: input
+    id: roi_left
+    attributes:
+      label: Bounding Box – Left Top (lon,lat)
+      description: Required if not attaching a shapefile.
+      placeholder: "e.g., 103.1234,30.5678"
+    validations:
+      required: false
+
+  - type: input
+    id: roi_right
+    attributes:
+      label: Bounding Box – Right Top (lon,lat)
+      description: Required if not attaching a shapefile.
+      placeholder: "e.g., 104.4321,30.5678"
+    validations:
+      required: false
+
+  - type: input
+    id: roi_top
+    attributes:
+      label: Bounding Box – Left Bottom (lon,lat)
+      description: Required if not attaching a shapefile.
+      placeholder: "e.g., 103.7777,31.0000"
+    validations:
+      required: false
+
+  - type: input
+    id: roi_bottom
+    attributes:
+      label: Bounding Box – Right Bottom (lon,lat)
+      description: Required if not attaching a shapefile.
+      placeholder: "e.g., 103.7777,30.1000"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: years
+    attributes:
+      label: 4) Years (multi-select)
+      description: Choose one or more years between 2017–2025.
+      multiple: true
+      options:
+        - "2017"
+        - "2018"
+        - "2019"
+        - "2020"
+        - "2021"
+        - "2022"
+        - "2023"
+        - "2024"
+        - "2025"
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional info (optional)
+      description: e.g., whether near-year/near-area substitution is acceptable, deadlines, etc.
+      placeholder: Leave blank if not applicable
