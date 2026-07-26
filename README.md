@@ -2,6 +2,25 @@
 
 Python library for accessing and working with Tessera geospatial foundation model embeddings.
 
+> ## 🚀 TESSERA v2 is here
+>
+> **The TESSERA v2 code is now live** — model weights and inference code are
+> available in the [`ucam-eo/tessera`](https://github.com/ucam-eo/tessera)
+> repository. v2 is our next-generation pixel-wise Earth foundation model; see
+> the preprint, [*TESSERA v2: Scaling Pixel-wise Earth Foundation Models*](https://arxiv.org/abs/2607.03949).
+>
+> **Want to try v2 embeddings early?** You can **pre-request** v2 embeddings for
+> your region and become an early tester:
+>
+> - 👉 **[Submit a v2 Embedding Pre-Request](../../issues/new?template=v2-embedding-prerequest.yml&labels=v2-embedding-prerequest)**
+>
+> ⚠️ **Heads-up:** we are still ramping up the compute, storage, and release
+> infrastructure for v2, so v2 embeddings will be produced **slowly** at first
+> and there is **no guaranteed turnaround time**. **If you need embeddings soon,
+> request v1.1 instead** — it is fully available today. Scroll down to
+> [Request missing embeddings](#request-missing-embeddings) to open a standard
+> v1.1 request.
+
 ## Overview
 
 GeoTessera provides access to geospatial embeddings from the [Tessera
