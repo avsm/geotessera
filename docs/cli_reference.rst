@@ -11,8 +11,10 @@ dataset-selection options::
 
     --dataset-version TEXT    Tessera dataset version (default: v1).
                               Accepts v1, 1.0, v1.0, v1.1, 1.1 etc.
-    --dataset-variant TEXT    Tessera dataset variant (default: vultr).
-                              Known variants: vultr (1.0 default), cambridge (1.1).
+    --dataset-variant TEXT    Tessera dataset variant (default: the
+                              version's default variant: vultr for 1.0,
+                              cambridge for 1.1, 2B-L~beta1 for 2.0). Run
+                              'geotessera info' to list all datasets.
     --verbose, -v             Enable verbose output
     --help                    Show help message
 
@@ -27,12 +29,18 @@ To point at a single local manifest file from Python, use the
 
 .. note::
 
-   **Dataset versions and variants**: there are now two Tessera versions
-   on S3 (``1.0`` and ``1.1``). Prefer ``1.1`` / ``cambridge`` for new work
-   — the legacy 1.0 line is frozen. **Never mix versions or variants within
-   the same downstream task** — they are independently learned feature
-   spaces and not interchangeable. See :ref:`dataset-versions` in the main
-   index for the full picture.
+   **Dataset versions and variants**: several Tessera datasets now live on
+   the Source Cooperative repository — ``1.0/vultr`` (default), ``1.1/
+   cambridge``, and the ``2.0/2B-L~beta1`` beta, with a complete-global
+   ``1.1/dclimate`` run reserved as *coming soon*. **To list them, run
+   ``geotessera info``** — its "Known Datasets" table shows every
+   (version, variant) pair, its repository directory, its availability,
+   and which variant is each version's default. Prefer ``1.1`` /
+   ``cambridge`` for new work — the legacy 1.0 line is frozen but remains
+   the default as the only version with full global coverage. **Never mix
+   versions or variants within the same downstream task** — they are
+   independently learned feature spaces and not interchangeable. See
+   :ref:`dataset-versions` in the main index for the full picture.
 
 Cache Configuration
 -------------------
@@ -44,16 +52,17 @@ Control where the Parquet manifest is cached:
     # Use custom cache directory for the per-version manifest
     geotessera download --cache-dir /path/to/cache ...
 
-    # Use a locally-supplied manifest (e.g. a checked-in offline copy)
-    geotessera download --registry-path /path/to/manifest.parquet ...
+    # Use locally-supplied manifests (e.g. a checked-in offline copy);
+    # the directory should hold manifest.parquet and landmasks.parquet
+    geotessera download --registry-dir /path/to/manifest-dir ...
 
     # Default cache locations (if not specified):
-    # - Linux/macOS: ~/.cache/geotessera/{v1,v1.1}/manifest.parquet
-    # - Windows:     %LOCALAPPDATA%/geotessera/{v1,v1.1}/manifest.parquet
+    # - Linux/macOS: ~/.cache/geotessera/{v1,v1.1-cam,...}/manifest.parquet
+    # - Windows:     %LOCALAPPDATA%/geotessera/{v1,v1.1-cam,...}/manifest.parquet
 
 Note: Embedding tiles land in the user-supplied ``--output`` directory and
 persist there for reuse. Only the per-version manifest + landmasks parquet
-(~hundreds of MB combined) is kept in the cache directory.
+(~a few MB each) is kept in the cache directory.
 
 Commands
 --------
@@ -88,8 +97,8 @@ Download embeddings for a region in numpy or GeoTIFF format.
 * ``--year INT`` - Year of embeddings (default: 2024)
 * ``--dataset-version TEXT`` - Tessera dataset version (``v1`` / ``1.0`` /
   ``v1.1`` / ``1.1``; default ``v1``). Pick **once per project**.
-* ``--dataset-variant TEXT`` - Tessera dataset variant (default: ``vultr``).
-  Pass ``cambridge`` for v1.1 test embeddings.
+* ``--dataset-variant TEXT`` - Tessera dataset variant (default: the version's
+  default variant). Run ``geotessera info`` to list all datasets.
 
 **Other Options**:
 
@@ -433,15 +442,16 @@ Display information about GeoTIFF files or the library.
 * ``--tiles PATH`` - Analyze tile files/directory (GeoTIFF or NPY format)
 * ``--geotiffs PATH`` - Alias for --tiles (deprecated)
 * ``--dataset-version TEXT`` - Tessera dataset version (default: ``v1``)
-* ``--dataset-variant TEXT`` - Tessera dataset variant (default: ``vultr``)
+* ``--dataset-variant TEXT`` - Tessera dataset variant (default: the version's default variant)
 * ``-v, --verbose`` - Verbose output
 
 **Examples**::
 
-    # Show library information for the legacy 1.0/vultr line (frozen)
+    # Show library information for the default 1.0/vultr line, plus the
+    # "Known Datasets" table listing every (version, variant) pair
     geotessera info
 
-    # Inspect v1.1/cambridge — same 2017–2025 year range, newer model
+    # Inspect v1.1/cambridge — broader 2015–2025 year range, newer model
     geotessera info --dataset-version v1.1 --dataset-variant cambridge
 
     # Analyze downloaded tiles (GeoTIFF or NPY)
@@ -458,6 +468,12 @@ Display information about GeoTIFF files or the library.
     - Available years in dataset
     - Registry information
     - Loaded blocks count
+    - **Known Datasets table**: every known (version, variant) pair with
+      its repository directory and status — ``available`` or ``coming
+      soon`` (e.g. the reserved ``1.1/dclimate`` complete-global run) —
+      and a ``(default)`` marker on each version's default variant. This
+      is the way to discover valid ``--dataset-version`` /
+      ``--dataset-variant`` combinations.
 
 **Output for GeoTIFF Analysis**:
     - Total files analyzed
@@ -602,3 +618,13 @@ For additional help::
     - GitHub Issues: https://github.com/ucam-eo/geotessera/issues
     - Documentation: https://geotessera.readthedocs.io/
     - Examples: See tutorials section of documentation
+
+Maintainer CLI
+--------------
+
+A second entry point, ``geotessera-registry``, is installed alongside
+``geotessera``. It is used by data maintainers to regenerate the per-version
+``manifest.parquet`` / ``landmasks.parquet`` files (by scanning the Source
+Cooperative repository with ``s3scan``), to checksum and validate local tile
+trees, and to build the Zarr store. End users don't need it — see
+:doc:`maintenance` for the full workflow.

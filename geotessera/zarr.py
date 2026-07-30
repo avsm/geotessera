@@ -202,6 +202,8 @@ def gather_tile_infos(
     from .registry import (
         EMBEDDINGS_DIR_NAME,
         LANDMASKS_DIR_NAME,
+        TESSERA_MIRROR_ENDPOINT,
+        TESSERA_MIRROR_REPO,
         tile_to_embedding_paths,
         tile_to_landmask_filename,
     )
@@ -255,6 +257,14 @@ def gather_tile_infos(
     # Landmasks are STRICTLY per-version — no cross-version fallback. Each
     # Tessera version has its own landmask grid and mixing them silently
     # would corrupt water masking.
+    def landmask_sync_hint(dest: Path) -> str:
+        return (
+            f"  aws s3 sync --no-sign-request "
+            f"--endpoint-url {TESSERA_MIRROR_ENDPOINT} "
+            f"s3://{TESSERA_MIRROR_REPO}/landmasks/"
+            f"{registry._version_path}/ {dest}/"
+        )
+
     emb_candidate = (
         registry._embeddings_dir / registry._version_path / EMBEDDINGS_DIR_NAME
     )
@@ -275,8 +285,7 @@ def gather_tile_infos(
                 f"Landmask directory not found for {registry._version_path}: "
                 f"expected {lm_s3_mirror}. Landmasks are per-version and "
                 f"cannot be reused across versions. Fetch them with:\n"
-                f"  aws s3 sync s3://tessera-embeddings/"
-                f"{registry._version_path}/{LANDMASKS_DIR_NAME}/ {lm_s3_mirror}/"
+                + landmask_sync_hint(lm_s3_mirror)
             )
     else:
         base_emb = str(registry._embeddings_dir / EMBEDDINGS_DIR_NAME)
@@ -285,9 +294,7 @@ def gather_tile_infos(
         else:
             raise FileNotFoundError(
                 f"Landmask directory not found: expected {lm_flat}. "
-                f"Fetch them with:\n"
-                f"  aws s3 sync s3://tessera-embeddings/"
-                f"{registry._version_path}/{LANDMASKS_DIR_NAME}/ {lm_flat}/"
+                f"Fetch them with:\n" + landmask_sync_hint(lm_flat)
             )
     zones_dict: Dict[int, List[TileInfo]] = {}
     transformer_cache: Dict[int, ProjTransformer] = {}

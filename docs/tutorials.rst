@@ -765,4 +765,6 @@ If you would like to now try more advanced classification, go to the
 `Tessera interactive notebook <https://github.com/ucam-eo/tessera-interactive-notebook>`_
 for a Jupyter-based label classifier application.
 
-For cloud-native zarr access to the TESSERA store, see :class:`~geotessera.store.GeoTesseraZarr`.
+For cloud-native zarr access to the TESSERA store (forthcoming in a future
+release — the hosted Zarr store is not yet published), see
+:class:`~geotessera.store.GeoTesseraZarr`.

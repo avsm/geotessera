@@ -41,8 +41,6 @@ dependencies = [
     "aiohttp",
     "geozarr-toolkit",
     "contextily",
-    "botocore>=1.43.14",
-    "awscrt>=0.33.0",
 ]
 
 [project.urls]

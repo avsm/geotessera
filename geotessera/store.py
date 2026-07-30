@@ -32,9 +32,11 @@ import zarr
 from pyproj import Transformer
 from rich.progress import track
 
+from .registry import zarr_store_url
+
 log = logging.getLogger(__name__)
 
-DEFAULT_STORE = "https://s3.us-west-2.amazonaws.com/tessera-embeddings/v1/zarr"
+DEFAULT_STORE = zarr_store_url("v1")
 
 # Shard-aligned chunk sizes so dask tasks match zarr shards
 SHARD_CHUNKS = {"time": 1, "band": 128, "y": 4096, "x": 4096}
@@ -341,7 +343,7 @@ class GeoTesseraZarr:
 
     Args:
         store_url: Zarr store URL or local path.  Defaults to the public
-            TESSERA store at ``s3.us-west-2.amazonaws.com/tessera-embeddings``.
+            TESSERA store at ``data.source.coop/tessera/tessera/zarr``.
 
     Example::
 

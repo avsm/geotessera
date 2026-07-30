@@ -91,7 +91,7 @@ class GeoTessera:
     def __init__(
         self,
         dataset_version: str = "v1",
-        dataset_variant: str = "vultr",
+        dataset_variant: Optional[str] = None,
         cache_dir: Optional[Union[str, Path]] = None,
         embeddings_dir: Optional[Union[str, Path]] = None,
         registry_url: Optional[str] = None,
@@ -102,12 +102,12 @@ class GeoTessera:
 
         Args:
             dataset_version: Tessera dataset version. Accepts ``"v1"`` /
-                ``"1.0"`` or ``"v1.1"`` / ``"1.1"`` (the legacy S3 layout uses
+                ``"1.0"`` or ``"v1.1"`` / ``"1.1"`` (the repository uses
                 ``v1/`` for the 1.0 series).
-            dataset_variant: Variant of the embeddings to load (default
-                ``"vultr"``). Other published variants — e.g. ``"cambridge"``
-                — are produced by different model runs and live in
-                ``global_0.1_degree_representation.<variant>`` dirs on S3.
+            dataset_variant: Variant of the embeddings to load. Defaults to
+                the version's published variant (``"vultr"`` for v1,
+                ``"cambridge"`` for v1.1). Variants are produced by different
+                model runs and are selected by filtering the manifest.
             cache_dir: Directory for caching registry files only (not embedding data)
             embeddings_dir: Directory containing pre-downloaded embedding tiles.
                 Defaults to current working directory if not specified.
@@ -135,7 +135,6 @@ class GeoTessera:
             registry_dir: Directory containing registry.parquet and landmasks.parquet files
         """
         self.dataset_version = dataset_version
-        self.dataset_variant = dataset_variant
 
         # Initialize logger
         self.logger = logging.getLogger(__name__)
@@ -156,6 +155,9 @@ class GeoTessera:
             registry_dir=registry_dir,
             logger=self.logger,
         )
+        # The resolved variant (per-version default applied when the caller
+        # passed None).
+        self.dataset_variant = self.registry.variant
 
     @property
     def version(self) -> str:
@@ -164,11 +166,11 @@ class GeoTessera:
 
     @property
     def embeddings_subdir(self) -> str:
-        """Variant-aware embeddings subdirectory name (mirrors S3 layout).
+        """Variant-aware embeddings subdirectory name.
 
         Equals ``global_0.1_degree_representation`` for the default ``vultr``
         variant and ``global_0.1_degree_representation.<variant>`` otherwise.
-        Used to construct local mirror paths consistent with the bucket.
+        Recorded in the ``tessera_metadata.json`` sidecar.
         """
         return self.registry.embeddings_subdir
 

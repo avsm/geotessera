@@ -12,16 +12,14 @@ from typing import Optional, Union, List, Tuple, Dict, Iterator, Callable
 import os
 import math
 import re
+import hashlib
 import logging
 import numpy as np
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
-from urllib.parse import urlparse
-
-import botocore.session
-from botocore import UNSIGNED
-from botocore.config import Config
-from botocore.exceptions import ClientError
+from email.utils import formatdate, parsedate_to_datetime
 
 try:
     import pandas as pd
@@ -38,18 +36,65 @@ except ImportError:
 # Constants for block-based registry management
 BLOCK_SIZE = 5  # 5x5 degree blocks
 
-# Default dataset variant. The bare ``global_0.1_degree_representation`` dir on
-# S3 corresponds to this variant; named variants get a ``.<name>`` suffix.
+# Default dataset variant. The bare ``global_0.1_degree_representation``
+# subdirectory corresponds to this variant; named variants get a ``.<name>``
+# suffix.
 DEFAULT_VARIANT = "vultr"
+
+# Known (version, variant) datasets and their directory names in the npy/
+# tree, one row per pair: (normalised version, variant, npy/ directory).
+# A ``None`` directory reserves a variant that is not yet published
+# ("coming soon"). The v1 series predates the variant-suffix scheme, so
+# every 1.0 variant shares the bare ``v1/`` directory; later versions get
+# one directory per variant, named ``{version_path}-{suffix}``.
+KNOWN_DATASETS = (
+    ("1.0", "vultr", "v1"),
+    ("1.1", "cambridge", "v1.1-cam"),
+    ("1.1", "dclimate", None),  # complete global v1.1 run — coming soon
+    ("2.0", "2B-L~beta1", "v2-2B-L~beta1"),
+)
+
+# Each version's default variant is the first *published* (non-None)
+# variant listed for it in KNOWN_DATASETS. Reorder the rows to change a
+# default when a newer variant (e.g. the v1.1 ``dclimate`` run) becomes
+# the preferred one.
+VERSION_DEFAULT_VARIANTS: Dict[str, str] = {}
+for _version, _variant, _dir in KNOWN_DATASETS:
+    if _dir is not None:
+        VERSION_DEFAULT_VARIANTS.setdefault(_version, _variant)
+
+
+def default_variant(version_norm: str) -> str:
+    """Default variant for *version_norm* (e.g. ``"1.1"`` → ``"cambridge"``)."""
+    return VERSION_DEFAULT_VARIANTS.get(version_norm, DEFAULT_VARIANT)
+
+
+def known_variants(version_norm: str) -> List[Tuple[str, Optional[str]]]:
+    """Known variants for *version_norm* as ``(variant, npy_directory)`` pairs.
+
+    A ``None`` directory marks a variant that is reserved but not yet
+    published ("coming soon").
+    """
+    return [(var, d) for v, var, d in KNOWN_DATASETS if v == version_norm]
+
+
+def published_datasets() -> List[Tuple[str, str, str]]:
+    """Published ``(version_norm, variant, npy_directory)`` triples.
+
+    Skips reserved coming-soon variants. Multi-dataset operations (e.g.
+    ``coverage --by-source --dataset-version=all``) enumerate manifests
+    from this list rather than issuing a bucket listing call.
+    """
+    return [(v, var, d) for v, var, d in KNOWN_DATASETS if d is not None]
 
 
 def _parse_dataset_version(spec: str) -> Tuple[str, str]:
     """Parse a flexible dataset-version spec.
 
-    Returns ``(s3_path_component, normalized_version)``. Accepts inputs like
+    Returns ``(version_path, normalized_version)``. Accepts inputs like
     ``"v1"``, ``"1"``, ``"1.0"``, ``"v1.0"`` (all → ``("v1", "1.0")``) and
-    ``"v1.1"``, ``"1.1"`` (→ ``("v1.1", "1.1")``). The legacy S3 layout uses
-    ``v1/`` for the 1.0 series — `.0` minors are stripped from the path.
+    ``"v1.1"``, ``"1.1"`` (→ ``("v1.1", "1.1")``). The repository uses
+    ``v1/`` for the 1.0 series, so ``.0`` minors are stripped from the path.
     """
     s = spec.strip()
     if s.startswith("v"):
@@ -63,7 +108,7 @@ def _parse_dataset_version(spec: str) -> Tuple[str, str]:
 
 
 def _variant_subdir(variant: str) -> str:
-    """Map a variant name to its embeddings-dir name on S3."""
+    """Map a variant name to its embeddings subdirectory name."""
     if variant == DEFAULT_VARIANT:
         return EMBEDDINGS_DIR_NAME
     return f"{EMBEDDINGS_DIR_NAME}.{variant}"
@@ -72,7 +117,7 @@ def _variant_subdir(variant: str) -> str:
 def _version_path_from_norm(norm: str) -> str:
     """Inverse of ``_parse_dataset_version`` for the path component.
 
-    ``"1.0"`` → ``"v1"`` (legacy S3 layout uses ``v1/`` for the 1.0 series);
+    ``"1.0"`` → ``"v1"`` (the repository uses ``v1/`` for the 1.0 series);
     ``"1.1"`` → ``"v1.1"``; ``"2.0"`` → ``"v2"``; etc.
     """
     major, _, minor = norm.partition(".")
@@ -81,11 +126,63 @@ def _version_path_from_norm(norm: str) -> str:
     return f"v{major}.{minor}"
 
 
-# Well-known dataset versions on the public bucket. Used by the client when a
-# multi-version operation (e.g. ``coverage --by-source --dataset-version=all``)
-# needs to enumerate manifests without a separate listing call. Extend this as
-# new versions are published.
-KNOWN_VERSIONS = ("v1", "v1.1")
+def dataset_path(version_norm: str, variant: str) -> str:
+    """Directory in the ``npy/`` tree for a (version, variant) pair.
+
+    The v1 series predates the variant-suffix scheme: every 1.0 variant
+    (including the default ``vultr``) maps to the bare ``v1`` directory.
+    Later versions get one directory per variant, e.g.
+    ``("1.1", "cambridge")`` → ``"v1.1-cam"`` and
+    ``("2.0", "2B-L~beta1")`` → ``"v2-2B-L~beta1"``.
+
+    Raises:
+        ValueError: If the variant is reserved but not yet published
+            (e.g. ``("1.1", "dclimate")``).
+    """
+    if version_norm == "1.0":
+        return "v1"
+    for v, var, dirname in KNOWN_DATASETS:
+        if v == version_norm and var == variant:
+            if dirname is None:
+                published = [
+                    var2 for var2, d in known_variants(version_norm) if d is not None
+                ]
+                raise ValueError(
+                    f"Dataset variant {variant!r} for version {version_norm} "
+                    f"is coming soon but not yet published. Currently "
+                    f"available variant(s) for {version_norm}: "
+                    f"{', '.join(published) or 'none'}. Run 'geotessera info' "
+                    f"to list all datasets."
+                )
+            return dirname
+    # Unknown pair: assume the generic ``{version_path}-{variant}`` naming
+    # so freshly published datasets work without a code change.
+    return f"{_version_path_from_norm(version_norm)}-{variant}"
+
+
+# Dataset directory names: a version path with an optional -variant suffix
+# (``v1``, ``v1.1-cam``, ``v2-2B-L~beta1``).
+_DATASET_DIR_RE = re.compile(r"^v(\d+)(?:\.(\d+))?(?:-(.+))?$")
+
+
+def dataset_from_path(dirname: str) -> Optional[Tuple[str, str]]:
+    """Inverse of :func:`dataset_path`: ``"v1.1-cam"`` → ``("1.1", "cambridge")``.
+
+    Bare version directories resolve to the version's default variant
+    (``"v1"`` → ``("1.0", "vultr")``); unknown suffixes are taken verbatim
+    as the variant name. Returns ``None`` if *dirname* does not look like
+    a dataset directory.
+    """
+    for v, var, d in KNOWN_DATASETS:
+        if d == dirname:
+            return v, var
+    m = _DATASET_DIR_RE.match(dirname)
+    if not m:
+        return None
+    version_norm = f"{m.group(1)}.{m.group(2) or '0'}"
+    variant = m.group(3) or default_variant(version_norm)
+    return version_norm, variant
+
 
 # Sidecar filename written into output directories alongside downloaded tiles
 # (NPY format) to record which dataset version/variant produced the files.
@@ -105,18 +202,20 @@ def write_tessera_metadata(
     downstream tools can recover which dataset was downloaded.
     """
     import json
-    from datetime import datetime, timezone
 
     version_path, version_norm = _parse_dataset_version(dataset_version)
     payload: Dict[str, object] = {
         "dataset_version": version_norm,
         "dataset_version_path": version_path,
         "dataset_variant": dataset_variant,
+        # Directory in the npy/ tree this (version, variant) pair was
+        # downloaded from (e.g. "v1", "v1.1-cam", "v2-2B-L~beta1").
+        "dataset_path": dataset_path(version_norm, dataset_variant),
         "embeddings_subdir": EMBEDDINGS_DIR_NAME,
+        # Variant-aware subdirectory name, kept for downstream readers. The
+        # repository layout itself has no variant level.
         "s3_embeddings_subdir": _variant_subdir(dataset_variant),
-        "source_url_prefix": (
-            f"{TESSERA_BASE_URL}/{version_path}/{_variant_subdir(dataset_variant)}/"
-        ),
+        "source_url_prefix": f"{TESSERA_NPY_MIRROR_URL}/{dataset_path(version_norm, dataset_variant)}/",
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
     if extra:
@@ -354,66 +453,57 @@ def tile_to_bounds(lon: float, lat: float) -> Tuple[float, float, float, float]:
     return (lon - 0.05, lat - 0.05, lon + 0.05, lat + 0.05)
 
 
-# Base URL for Tessera data downloads
-TESSERA_BASE_URL = "https://s3.us-west-2.amazonaws.com/tessera-embeddings"
+# All Tessera data is served over plain HTTPS from the public Source
+# Cooperative repository. The npy/ tree has one directory per dataset —
+# a (version, variant) pair (see KNOWN_DATASETS / dataset_path); the
+# landmasks/ and zarr/ trees are keyed by plain version:
+#   npy/{dataset_path}/{year}/grid_.../grid_....npy    embeddings and scales
+#   npy/{dataset_path}/manifest.parquet                per-dataset manifest
+#   landmasks/{version_path}/grid_....tiff             landmask TIFFs
+#   landmasks/{version_path}/landmasks.parquet         landmask registry
+#   zarr/{version_path}/tessera.zarr                   zarr store
+# Each dataset directory holds a complete embedding tree with no variant
+# subdirectory. New datasets appear as they are uploaded. The repository is
+# also reachable as an S3-compatible endpoint at TESSERA_MIRROR_ENDPOINT
+# with bucket path TESSERA_MIRROR_REPO.
+TESSERA_MIRROR_ENDPOINT = "https://data.source.coop"
+TESSERA_MIRROR_REPO = "tessera/tessera"
+TESSERA_MIRROR_URL = f"{TESSERA_MIRROR_ENDPOINT}/{TESSERA_MIRROR_REPO}"
+TESSERA_NPY_MIRROR_URL = f"{TESSERA_MIRROR_URL}/npy"
+TESSERA_LANDMASKS_MIRROR_URL = f"{TESSERA_MIRROR_URL}/landmasks"
 
-# Directory structure constants (mirrors remote structure)
+# Subdirectory names used in the local embeddings_dir layout.
 EMBEDDINGS_DIR_NAME = "global_0.1_degree_representation"  # NPY embeddings and scales
 LANDMASKS_DIR_NAME = "global_0.1_degree_tiff_all"  # Landmask TIFFs
 
-# Note: Default manifest URLs are constructed with version in Registry.__init__
-# Format: {TESSERA_BASE_URL}/{version}/manifest.parquet
 
+def manifest_url(dataset_dir: str) -> str:
+    """Default URL of the embeddings manifest for *dataset_dir*.
 
-# Anonymous (unsigned) S3 clients, one per region, built lazily and reused.
-# The Tessera bucket is public-read, so requests are not signed. botocore's
-# "standard" retry mode replaces the old hand-rolled exponential backoff.
-_S3_CLIENTS: Dict[str, object] = {}
-
-
-def _s3_client(region: str):
-    """Return a cached anonymous S3 client for *region*."""
-    client = _S3_CLIENTS.get(region)
-    if client is None:
-        client = botocore.session.get_session().create_client(
-            "s3",
-            region_name=region,
-            config=Config(
-                signature_version=UNSIGNED,
-                retries={"mode": "standard", "total_max_attempts": 5},
-            ),
-        )
-        _S3_CLIENTS[region] = client
-    return client
-
-
-def _parse_s3_url(url: str) -> Tuple[str, str, str]:
-    """Parse an S3 HTTPS URL into ``(region, bucket, key)``.
-
-    Handles both path-style (``s3.<region>.amazonaws.com/<bucket>/<key>``) and
-    virtual-hosted (``<bucket>.s3.<region>.amazonaws.com/<key>``) URLs — all
-    geotessera ever builds from :data:`TESSERA_BASE_URL`. Raises ``ValueError``
-    for anything that is not a regional S3 endpoint; the data path is S3-only,
-    so use ``registry_path`` for local files.
+    *dataset_dir* is an npy/ tree directory name from :func:`dataset_path`
+    (e.g. ``"v1"``, ``"v1.1-cam"``, ``"v2-2B-L~beta1"``).
     """
-    parsed = urlparse(url)
-    host = parsed.netloc
-    path = parsed.path.lstrip("/")
-    m = re.match(
-        r"^(?:(?P<bucket>[^.]+)\.)?s3[.-](?P<region>[a-z0-9-]+)\.amazonaws\.com$",
-        host,
-    )
-    if not m:
-        raise ValueError(f"Not a recognized regional S3 URL: {url!r}")
-    region = m.group("region")
-    bucket = m.group("bucket")
-    if bucket:
-        key = path  # virtual-hosted: the whole path is the key
-    else:
-        bucket, _, key = path.partition("/")  # path-style: first segment is bucket
-    if not bucket or not key:
-        raise ValueError(f"Could not extract bucket/key from S3 URL: {url!r}")
-    return region, bucket, key
+    return f"{TESSERA_NPY_MIRROR_URL}/{dataset_dir}/manifest.parquet"
+
+
+def landmasks_parquet_url(version_path: str) -> str:
+    """Default URL of the landmasks registry for *version_path* (e.g. ``"v1"``)."""
+    return f"{TESSERA_LANDMASKS_MIRROR_URL}/{version_path}/landmasks.parquet"
+
+
+def embedding_url(dataset_dir: str, path: str) -> str:
+    """URL of the embedding file at *path* within the npy/ *dataset_dir*."""
+    return f"{TESSERA_NPY_MIRROR_URL}/{dataset_dir}/{path}"
+
+
+def landmask_url(version_path: str, filename: str) -> str:
+    """URL of the landmask TIFF *filename* for *version_path*."""
+    return f"{TESSERA_LANDMASKS_MIRROR_URL}/{version_path}/{filename}"
+
+
+def zarr_store_url(version_path: str) -> str:
+    """Default URL of the zarr store for *version_path* (e.g. ``"v1"``)."""
+    return f"{TESSERA_MIRROR_URL}/zarr/{version_path}"
 
 
 def format_bytes(num_bytes: float) -> str:
@@ -430,17 +520,17 @@ def download_file_to_temp(
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     cache_path: Optional[Path] = None,
 ) -> str:
-    """Download an object from the public Tessera S3 bucket, with caching.
+    """Download a file over HTTPS with caching, retries, and integrity checks.
 
-    Fetches via an anonymous botocore S3 client. Integrity is verified
-    end-to-end against the object's CRC64NVMe checksum: ``ChecksumMode=ENABLED``
-    makes botocore validate it as the body is streamed and raise on a mismatch.
-    When *cache_path* already exists, an ``If-Modified-Since`` conditional GET
-    (keyed on the cached file's mtime, which was set from the previous
-    ``Last-Modified``) short-circuits to the cached copy on a 304.
+    Integrity is verified against the response ``Content-Length``, and also
+    against an MD5 of the streamed body when the server's ``ETag`` is a plain
+    32-hex-digit MD5. When *cache_path* already exists, an ``If-Modified-Since``
+    conditional GET keyed on the cached file's mtime returns the cached copy on
+    a 304. Transient failures (429/5xx, connection errors, truncation, checksum
+    mismatch) are retried with exponential backoff.
 
     Args:
-        url: HTTPS S3 URL (path-style or virtual-hosted).
+        url: HTTPS URL.
         progress_callback: Optional callback(bytes_downloaded, total_bytes, status).
         cache_path: Optional destination. When given, the file is written here
             atomically and reused on later calls; when omitted it goes to a
@@ -451,48 +541,88 @@ def download_file_to_temp(
         cache hit, or a temporary path when ``cache_path`` is None.
 
     Raises:
-        botocore.exceptions.ClientError: On non-304 S3 errors (after retries).
-        botocore.exceptions.FlexibleChecksumError: On CRC64NVMe mismatch.
-        ValueError: If the URL is not S3 or the object has no CRC64NVMe checksum.
+        urllib.error.HTTPError: On non-304 HTTP errors (after retries).
+        OSError: On a truncated, corrupted, or failed download (after retries).
     """
-    import tempfile
+    attempts = 4
+    for attempt in range(attempts):
+        try:
+            return _download_once(url, progress_callback, cache_path)
+        except urllib.error.HTTPError as e:
+            if e.code not in (429, 500, 502, 503, 504) or attempt == attempts - 1:
+                raise
+        except (urllib.error.URLError, OSError):
+            if attempt == attempts - 1:
+                raise
+        time.sleep(2**attempt)
 
-    region, bucket, key = _parse_s3_url(url)
-    client = _s3_client(region)
 
-    get_kwargs = {"Bucket": bucket, "Key": key, "ChecksumMode": "ENABLED"}
+def _download_once(
+    url: str,
+    progress_callback: Optional[Callable[[int, int, str], None]],
+    cache_path: Optional[Path],
+) -> str:
+    """Single download attempt (see :func:`download_file_to_temp`)."""
+    from . import __version__
 
-    # Conditional GET: the cached file's mtime was set from the object's prior
-    # Last-Modified, so If-Modified-Since lets S3 answer 304 when it is
-    # unchanged. (This replaces the old ETag ``.etag`` sidecar, which predated
-    # the move to S3 and is no longer needed.)
+    # The Source Cooperative CDN rejects the default Python urllib
+    # User-Agent with a 403, so identify as geotessera.
+    request = urllib.request.Request(
+        url, headers={"User-Agent": f"geotessera/{__version__}"}
+    )
     if cache_path and cache_path.exists():
-        get_kwargs["IfModifiedSince"] = datetime.fromtimestamp(
-            cache_path.stat().st_mtime, tz=timezone.utc
+        request.add_header(
+            "If-Modified-Since",
+            formatdate(cache_path.stat().st_mtime, usegmt=True),
         )
 
     try:
-        response = client.get_object(**get_kwargs)
-    except ClientError as e:
-        meta = e.response.get("ResponseMetadata", {})
-        code = e.response.get("Error", {}).get("Code")
-        if code == "304" or meta.get("HTTPStatusCode") == 304:
-            # 304 Not Modified — the cached copy is current.
+        response = urllib.request.urlopen(request, timeout=60)
+    except urllib.error.HTTPError as e:
+        if e.code == 304:
+            # A 304 response means the cached copy is current.
             if progress_callback:
                 progress_callback(0, 0, "Cache is current")
             return str(cache_path)
         raise
 
-    # botocore silently returns an *unvalidated* body when the object carries no
-    # CRC64NVMe checksum header, so require it explicitly rather than trust an
-    # unverified download.
-    if not response.get("ChecksumCRC64NVME"):
-        raise ValueError(
-            f"S3 object {key!r} returned no CRC64NVMe checksum; "
-            "refusing to use an unverified download"
-        )
+    try:
+        return _stream_to_file(response, url, cache_path, progress_callback)
+    finally:
+        response.close()
 
-    total_size = response.get("ContentLength", 0)
+
+def _stream_to_file(
+    response,
+    url: str,
+    cache_path: Optional[Path],
+    progress_callback: Optional[Callable[[int, int, str], None]],
+) -> str:
+    """Stream *response* to *cache_path* (or a temporary file) atomically.
+
+    Writes to a sibling temporary file with progress reporting, verifies the
+    byte count against ``Content-Length`` and, when available, the MD5 ETag,
+    stamps the file mtime from ``Last-Modified`` so later
+    ``If-Modified-Since`` requests work, then moves the file into place.
+    Returns the final path as ``str``.
+    """
+    import tempfile
+
+    total_size = int(response.headers.get("Content-Length") or 0)
+
+    last_modified = None
+    lm_header = response.headers.get("Last-Modified")
+    if lm_header:
+        try:
+            last_modified = parsedate_to_datetime(lm_header)
+        except (TypeError, ValueError):
+            pass
+
+    # A plain 32-hex-digit ETag is the object's content MD5. Multipart
+    # uploads carry a "-<parts>" suffix and are not a content hash, so
+    # those downloads are only length-checked.
+    etag = (response.headers.get("ETag") or "").strip('"')
+    md5 = hashlib.md5() if re.fullmatch(r"[0-9a-f]{32}", etag) else None
 
     if cache_path:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -507,8 +637,6 @@ def download_file_to_temp(
         temp_file = tempfile.NamedTemporaryFile(mode="wb", delete=False, suffix=".npy")
 
     temp_path = Path(temp_file.name)
-
-    body = response["Body"]
     success = False
     try:
         downloaded = 0
@@ -519,9 +647,9 @@ def download_file_to_temp(
             size_str = format_bytes(total_size) if total_size > 0 else "unknown size"
             progress_callback(0, total_size, f"Starting ({size_str})")
 
-        # Reading to end-of-stream triggers botocore's CRC64NVMe validation,
-        # which raises FlexibleChecksumError on a mismatch.
-        for chunk in body.iter_chunks(8192):
+        while chunk := response.read(256 * 1024):
+            if md5 is not None:
+                md5.update(chunk)
             temp_file.write(chunk)
             downloaded += len(chunk)
 
@@ -543,11 +671,20 @@ def download_file_to_temp(
                     progress_callback(downloaded, total_size, status)
                     last_update_time = current_time
 
+        # A dropped connection can end the stream early without raising,
+        # so check the length to keep a truncated file out of the cache.
+        if total_size and downloaded != total_size:
+            raise OSError(
+                f"Truncated download from {url}: got {downloaded} of {total_size} bytes"
+            )
+        if md5 is not None and md5.hexdigest() != etag:
+            raise OSError(
+                f"Checksum mismatch for {url}: MD5 {md5.hexdigest()} != ETag {etag}"
+            )
+
         temp_file.close()
 
         # Set file mtime from Last-Modified so the next If-Modified-Since works.
-        # boto hands LastModified back as a datetime, so there's no parsing.
-        last_modified = response.get("LastModified")
         if last_modified is not None:
             try:
                 ts = last_modified.timestamp()
@@ -576,11 +713,10 @@ def download_file_to_temp(
         return str(final_path)
 
     finally:
-        body.close()
         # Remove the partial temp file on any failure, including
-        # KeyboardInterrupt/SystemExit (a BaseException, which a plain
-        # `except Exception` misses) — this is what left stray
-        # ``.<name>_tmp_*`` files behind on interrupted downloads.
+        # KeyboardInterrupt and SystemExit, which a plain `except Exception`
+        # would miss. This keeps interrupted downloads from leaving stray
+        # ``.<name>_tmp_*`` files behind.
         if not success:
             temp_file.close()
             if temp_path.exists():
@@ -602,7 +738,7 @@ class Registry:
     def __init__(
         self,
         version: str,
-        variant: str = DEFAULT_VARIANT,
+        variant: Optional[str] = None,
         cache_dir: Optional[Union[str, Path]] = None,
         embeddings_dir: Optional[Union[str, Path]] = None,
         registry_url: Optional[str] = None,
@@ -615,11 +751,15 @@ class Registry:
         """Initialize Registry manager with optimized Parquet registries.
 
         Args:
-            version: Dataset version. Accepts ``"v1"``/``"1.0"`` or ``"v1.1"``/``"1.1"``.
-            variant: Dataset variant to filter the manifest by. The default
-                ``"vultr"`` corresponds to the bare
-                ``global_0.1_degree_representation`` directory on S3; other
-                values (e.g. ``"cambridge"``) map to the ``.<variant>`` suffix.
+            version: Dataset version. Accepts ``"v1"``/``"1.0"``,
+                ``"v1.1"``/``"1.1"``, ``"v2"``/``"2.0"``, etc.
+            variant: Dataset variant. Defaults to the version's default
+                variant (``"vultr"`` for v1, ``"cambridge"`` for v1.1,
+                ``"2B-L~beta1"`` for v2 — see ``KNOWN_DATASETS``). The
+                (version, variant) pair selects the npy/ tree directory
+                the manifest and tiles are fetched from. Reserved
+                coming-soon variants (e.g. the v1.1 ``dclimate`` run)
+                raise ``ValueError`` until published.
             cache_dir: Optional directory for caching Parquet registries only (not data files)
             embeddings_dir: Directory for storing embedding tiles (defaults to current directory).
                 Expected structure: global_0.1_degree_representation[.<variant>]/{year}/
@@ -632,14 +772,18 @@ class Registry:
             landmasks_registry_path: Local path to existing landmasks Parquet registry file
             logger: Optional logger instance. If not provided, creates a new one
         """
-        # Resolve version into S3 path component and normalised numeric form.
+        # Resolve version into a path component and a normalised numeric form.
         self._version_path, self._version_norm = _parse_dataset_version(version)
-        self._variant = variant
-        self._embeddings_subdir = _variant_subdir(variant)
+        self._variant = variant or default_variant(self._version_norm)
+        # npy/ tree directory for this (version, variant) dataset, e.g.
+        # "v1", "v1.1-cam", "v2-2B-L~beta1". Raises for variants that are
+        # reserved but not yet published (e.g. the v1.1 dclimate run).
+        self._dataset_path = dataset_path(self._version_norm, self._variant)
+        self._embeddings_subdir = _variant_subdir(self._variant)
         # Preserve the original kwarg for callers that still read .version.
         self.version = self._version_path
-        # Public read-only view of the variant-aware subdir name used both in
-        # local mirrors and S3 URLs.
+        # Public read-only view of the variant-aware subdirectory name,
+        # recorded in the tessera_metadata.json sidecar.
         self.embeddings_subdir = self._embeddings_subdir
         self.variant = self._variant
         # Populated by _load_registry() with the local path to the manifest
@@ -686,19 +830,17 @@ class Registry:
         # Embeddings manifest (GeoDataFrame with spatial index). The wire format
         # mirrors the file-scan inventory schema; geometry is derived from
         # lon/lat at load time if the parquet was written as a plain DataFrame.
-        # One manifest per version on S3; the consumer fetches the manifest
-        # matching its dataset_version and filters by variant on load.
+        # Manifests are per dataset (one npy/ directory per (version,
+        # variant) pair); the consumer fetches the manifest matching its
+        # dataset directory and filters by variant on load.
         self._registry_gdf: Optional[gpd.GeoDataFrame] = None
-        self._registry_url = (
-            registry_url or f"{TESSERA_BASE_URL}/{self._version_path}/manifest.parquet"
-        )
+        self._registry_url = registry_url or manifest_url(self._dataset_path)
         self._registry_path = Path(registry_path) if registry_path else None
 
-        # Landmasks Parquet registry (still per-version on S3).
+        # Landmasks Parquet registry (per version).
         self._landmasks_df: Optional[pd.DataFrame] = None
-        self._landmasks_registry_url = (
-            landmasks_registry_url
-            or f"{TESSERA_BASE_URL}/{self._version_path}/landmasks.parquet"
+        self._landmasks_registry_url = landmasks_registry_url or landmasks_parquet_url(
+            self._version_path
         )
         self._landmasks_registry_path = (
             Path(landmasks_registry_path) if landmasks_registry_path else None
@@ -724,9 +866,9 @@ class Registry:
             registry_path = self._registry_path
         else:
             # Use cached version with If-Modified-Since to check for updates.
-            # Cache layout mirrors the S3 prefix so multiple versions coexist.
+            # Cache layout mirrors the npy/ tree so multiple datasets coexist.
             registry_cache_path = (
-                self._registry_cache_dir / self._version_path / "manifest.parquet"
+                self._registry_cache_dir / self._dataset_path / "manifest.parquet"
             )
             registry_cache_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -912,9 +1054,9 @@ class Registry:
                     self._landmasks_df = None
                     return
 
-        # Validate landmasks registry structure. Hash columns are no longer
-        # required — integrity is verified via the S3 CRC64NVMe header at
-        # download time.
+        # Validate landmasks registry structure. Hash columns are not
+        # required because integrity is verified against Content-Length and
+        # the MD5 ETag at download time.
         if self._landmasks_df is not None:
             required_columns = {"lat", "lon", "file_size"}
             if not required_columns.issubset(self._landmasks_df.columns):
@@ -1148,22 +1290,15 @@ class Registry:
             # Use existing local file
             return str(local_path)
 
-        # Download to embeddings_dir. Integrity is verified end-to-end against
-        # the S3 x-amz-checksum-crc64nvme response header inside the downloader.
-        # Use as_posix() to ensure forward slashes in URL even on Windows
+        # Download to embeddings_dir. Use as_posix() so the URL uses forward
+        # slashes on Windows.
         path_str = path.as_posix() if isinstance(path, Path) else path
-        url = (
-            f"{TESSERA_BASE_URL}/{self._version_path}/"
-            f"{self._embeddings_subdir}/{path_str}"
-        )
-        downloaded_path = download_file_to_temp(
+        url = embedding_url(self._dataset_path, path_str)
+        return download_file_to_temp(
             url,
             progress_callback=progress_callback,
             cache_path=local_path,
         )
-
-        # Return path to saved file
-        return downloaded_path
 
     def fetch_landmask(
         self,
@@ -1200,17 +1335,13 @@ class Registry:
             # Use existing local file
             return str(local_path)
 
-        # Download to embeddings_dir. Integrity is verified end-to-end against
-        # the S3 x-amz-checksum-crc64nvme response header inside the downloader.
-        url = f"{TESSERA_BASE_URL}/{self._version_path}/{LANDMASKS_DIR_NAME}/{filename}"
-        downloaded_path = download_file_to_temp(
+        # Download to embeddings_dir.
+        url = landmask_url(self._version_path, filename)
+        return download_file_to_temp(
             url,
             progress_callback=progress_callback,
             cache_path=local_path,
         )
-
-        # Return path to saved file
-        return downloaded_path
 
     @property
     def available_embeddings(self) -> List[Tuple[int, float, float]]:
