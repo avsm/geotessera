@@ -1,44 +1,91 @@
-## 0.10.0 (2026-08-13)
+## Unreleased
 
 ### Breaking Changes
 
-- All NPY downloads now come from the Source Cooperative, fronted by CloudFlare.
-  Embeddings, landmasks and manifests are served from the public
+- **All downloads now come from Source Cooperative**, fronted by CloudFlare.
+  Embeddings, landmasks, manifests, and the zarr store are served from the public
   `https://data.source.coop/tessera/tessera` repository over HTTPS,
-  replacing the retired `tessera-embeddings` AWS S3 bucket.
-
-  The repository is organised by media type. The `npy/` tree has one
-  directory per *dataset* — a (version, variant) pair — with the variant
-  encoded as a directory suffix: all v1 variants share `npy/v1/`,
-  1.1/cambridge lives in `npy/v1.1-cam/`, and the v2 beta in
-  `npy/v2-2B-L~beta1/`. Each dataset directory carries its own
-  `manifest.parquet`. The `landmasks/{version}/` and `zarr/{version}/`
-  trees stay keyed by plain version. (@avsm, @mtelvers)
-
-- `botocore` and `awscrt` are no longer required dependencies (@avsm)
+  replacing the retired `tessera-embeddings` AWS S3 bucket. The repository
+  is organised by media type (`npy/{version}/`, `landmasks/{version}/`,
+  `zarr/{version}/`) with per-version `manifest.parquet` and
+  `landmasks.parquet` files colocated with their data, and carries one
+  embedding tree per version. (@avsm, @mtelvers)
+- **Dependencies removed**: `botocore` and `awscrt` are no longer required.
+  Downloads use the standard library with retry/backoff, `If-Modified-Since`
+  conditional-GET caching, and integrity verification against the response
+  `Content-Length` plus a streamed MD5 whenever the server's `ETag` is a
+  content MD5 (single-part uploads) (@avsm)
 
 ### New Features
 
-- Per-version default variant allows omitting the dataset-variant.
-  `--dataset-variant` now selects the version's default variant (`vultr`
-  for v1, `cambridge` for v1.1, `2B-L~beta1` for v2) instead of always
-  `vultr`, so `GeoTessera(dataset_version="v1.1")` works. The known
-  datasets — including the reserved, not-yet-published `v1.1-dclimate`
-  complete-global run, which raises a "coming soon" error if selected —
-  are listed in the new "Known Datasets" table printed by
-  `geotessera info` (@avsm)
-- `geotessera-registry zarr-consolidate` is a new subcommand that
-  re-consolidates a store's root metadata after in-place changes.
-  Mostly only for repairs and not regular use.
-- `geotessera-registry s3scan` scans Source Cooperative to list
-  embeddings. This allows manifests and landmask registries to be
-  regenerated directly from the Source Cooperative repository. Listing
-  requests retry transient failures (429/5xx, timeouts, connection
-  resets) with exponential backoff; if a shard still fails after all
-  retries the affected manifest is not written and the command exits
-  non-zero, so an incomplete manifest can never be uploaded. The summary
-  panel prints per-file `aws s3 cp` upload commands with the correct
-  per-tree destinations (@avsm)
+- **Per-version default variant**: omitting `dataset_variant` /
+  `--dataset-variant` now selects the version's published variant (`vultr`
+  for v1, `cambridge` for v1.1) instead of always `vultr`, so
+  `GeoTessera(dataset_version="v1.1")` works without an explicit variant.
+  (@avsm)
+- **Remote zarr builds**: `zarr-init` and `zarr-fill` now take locations
+  rather than paths — both the tile source and the output store may be
+  fsspec URLs (`s3://bucket/prefix`), so a store on one S3 node can be
+  filled from tiles on another with no local mirror. Remote tiles are read
+  with byte-range GETs sized to the rows each shard needs (an `.npy` is a
+  header plus a flat C-ordered buffer), so no scratch disk is involved.
+  `--source-*` and `--store-*` flags configure the two endpoints
+  independently; credentials come from the environment, a named profile
+  (`--store-profile`), or an instance role rather than argv, and
+  `--store-acl` stamps a canned ACL such as `bucket-owner-full-control` on
+  every object written. `s3://` locations need the new optional
+  `s3` extra (`pip install 'geotessera[s3]'`), which is what pulls in
+  `s3fs` and `botocore`; the core install stays free of both and `https://`
+  sources work without it. (@avsm)
+- **Parallel per-zone fills**: `zarr-fill --zones N` is now safe to run as
+  one process per UTM zone against a shared store. Ingestion tracking is one
+  object per zone/year, each zone/year takes an advisory lock
+  (`--force-lock` to take over a dead run's), and root-metadata
+  consolidation is skipped by default for a zone-restricted fill. See
+  the architecture guide for the sweep recipe. (@avsm)
+- **The store now contains only Zarr**: build bookkeeping — the ingestion
+  registry, fill locks and global-preview resume markers — moved out of the
+  store into a sibling location, `<store>.build` by default and relocatable
+  with `--state-url`. Previously these sat at the store root, where every
+  hierarchy listing and `consolidate_metadata` call warned about
+  unrecognised objects and readers saw non-Zarr entries. A `_registry.parquet`
+  left inside an older store is still read, so existing stores resume
+  correctly; nothing is written back into them. (@avsm)
+- **`geotessera-registry zarr-extend`**: New subcommand that appends years
+  to an existing store's time axis, so a new year can be added without
+  rebuilding. Time is chunked one year per chunk, making this a
+  metadata-only edit — existing chunks are never rewritten — and the new
+  slice reads back with the same sentinels a freshly initialised year has.
+  Years may only be appended (inserting an earlier one would renumber every
+  chunk, so it is refused), and it will not run while a fill lock is held.
+  (@avsm)
+- **`geotessera-registry zarr-consolidate`**: New subcommand that
+  re-consolidates a store's root metadata after in-place changes, and
+  merges the per-zone ingestion registries into `_registry.parquet`. This
+  is the single-writer step that finishes a parallel sweep; also useful for
+  repairs. Accepts a local path or a remote store URL.
+
+### Bug Fixes
+
+- **Incremental fills no longer erase neighbouring tiles**: a shard write
+  replaces the whole shard, so a fill that touched a shard already holding
+  data would zero out the tiles it did not re-read. Touched shards are now
+  rebuilt from every tile overlapping them. (@avsm)
+- **Failed shards are no longer recorded as written**: tiles are only added
+  to the ingestion registry once every shard covering them succeeded, so
+  re-running a fill retries exactly the unfinished work. A fill with any
+  failed shard now reports an error. (@avsm)
+- **`geotessera-registry` propagates exit status**: command return codes
+  were discarded, so failures reported success to the shell. (@avsm)
+- **`geotessera-registry s3scan` scans Source Cooperative**: listings are
+  path-style against the S3-compatible endpoint given by `--endpoint-url`
+  (default `https://data.source.coop`); the AWS virtual-hosted addressing
+  for the retired bucket is gone, and `--region` with it. Discovery
+  understands the flat `{version}/{year}/` layout with the variant supplied
+  via `--variant`, and `--landmasks-uri` points the landmask scan at a
+  separate tree (e.g. `s3://tessera/tessera/landmasks/`), including
+  landmasks-only runs. This allows manifests and landmask registries to be
+  regenerated directly from the Source Cooperative repository. (@avsm)
 
 ## v0.9.0 (2026-06-09)
 

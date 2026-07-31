@@ -529,6 +529,143 @@ group. The store automatically routes geographic queries to the correct zone::
 Datasets are cached per zone for the lifetime of the ``GeoTesseraZarr``
 instance.
 
+Building a Zarr Store
+~~~~~~~~~~~~~~~~~~~~~
+
+Stores are built by the maintainer-facing ``geotessera-registry`` CLI in
+three steps: ``zarr-init`` lays out the (metadata-only) hierarchy from the
+landmask registry, ``zarr-fill`` writes tile data into it, and
+``zarr-consolidate`` refreshes the root metadata that HTTP readers depend on.
+
+**Locations, not paths**: the tile source and the output store are each
+either a local directory or an fsspec URL. A store on one S3 node can be
+filled from tiles on another with no local mirror::
+
+    geotessera-registry zarr-fill \
+        s3://source-bucket/tessera \
+        s3://dest-bucket/tessera.zarr \
+        --year 2024 --zones 30 \
+        --source-endpoint-url https://data.source.coop --source-anon \
+        --store-endpoint-url https://s3.example.org
+
+Credentials come from the environment (``AWS_ACCESS_KEY_ID``,
+``AWS_SECRET_ACCESS_KEY``, ``AWS_PROFILE``, instance roles) rather than
+flags, so they never appear in a process listing. ``--source-*`` and
+``--store-*`` flags configure the two endpoints independently, so a named
+AWS CLI profile is selected with ``--store-profile``.
+
+Where the destination bucket belongs to another account, ``--store-acl``
+stamps a canned ACL on every object written — the equivalent of the AWS
+CLI's ``--acl``::
+
+    --store-profile sc-writer --store-acl bucket-owner-full-control
+
+It applies to the store's Zarr chunks and metadata as well as the sidecar
+parquet and lock objects, and is filtered out of read requests.
+
+``s3://`` locations need the optional ``s3`` extra, which pulls in ``s3fs``
+and ``botocore``::
+
+    pip install 'geotessera[s3]'
+
+The core install stays free of both; ``https://`` sources (including the
+public Source Cooperative front) work without the extra, since fsspec reads
+those over the ``aiohttp`` already required.
+
+**Streaming reads**: a ``.npy`` tile is a short header followed by a flat
+C-ordered buffer, so the rows a shard needs are one contiguous byte range.
+Remote tiles are read with a single ranged GET per shard overlap rather
+than downloaded whole, which means no scratch disk and no cache eviction
+policy to tune.
+
+Adding a Year to an Existing Store
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The time axis is fixed at ``zarr-init``, but it can be grown afterwards.
+Because time is chunked one year per chunk, appending is a **metadata-only**
+edit — existing chunks keep their keys and are never rewritten, however large
+the store::
+
+    # 1. grow every zone's time axis (no fills in flight)
+    geotessera-registry zarr-extend s3://dest-bucket/tessera.zarr --years 2026
+
+    # 2. fill the new year, one process per zone as usual
+    geotessera-registry zarr-fill s3://source-bucket/tessera \
+        s3://dest-bucket/tessera.zarr --year 2026 --zones 30
+
+The new slice reads back exactly like a freshly initialised year —
+embeddings at 0, scales at ``+inf`` ("land, no data yet") — so ``zarr-fill``
+treats it no differently from the original ones, and the per-zone ingestion
+registry keys on ``(zone, year)`` so earlier years are untouched.
+
+Two constraints:
+
+* **Append only.** Adding a year *earlier* than the current maximum would
+  renumber every existing chunk's time index, i.e. rewrite the store. It is
+  refused rather than done silently.
+* **Single writer.** Unlike a fill, this rewrites array metadata for every
+  zone, so it refuses to run while any fill lock is held, and it *does*
+  re-consolidate afterwards (readers cannot see the new year until it has).
+
+.. _zarr-parallel-sweep:
+
+Parallel Per-Zone Sweeps
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+A UTM zone's pixels live entirely within its own ``utm{zone}`` group, and
+shards never straddle zones. That makes ``--zones N`` the natural unit of
+parallelism: one process per zone, all writing to the same store.
+
+Everything a fill mutates is keyed by ``(zone, year)``, and none of it lives
+inside the store — build bookkeeping goes to a sibling location so the
+published hierarchy contains only Zarr:
+
+.. code-block:: text
+
+    tessera.zarr/
+        zarr.json                              # shared — consolidation only
+        utm30/, utm31/, ...                    # one zone per process
+
+    tessera.zarr.build/                        # --state-url to relocate
+        _registry/utm30_2024.parquet           # per-zone ingestion tracking
+        _registry.parquet                      # merged view, written by consolidate
+        _locks/utm30_2024.json                 # advisory fill lock
+
+* **Ingestion tracking** is one object per zone/year, so no two jobs
+  read-modify-write the same file. It records which tiles have already been
+  written, which is what makes a fill resumable and lets a later run pick up
+  tiles the manifest has gained since. It is build state, not published
+  data — a reader of the store never needs it — so it lives in the state
+  sibling. Stores built before this split kept a ``_registry.parquet``
+  inside the hierarchy; that is still read, so they resume correctly.
+* **An advisory lock** is taken for the duration of a zone/year fill. It
+  catches the same zone being launched twice — the case that would silently
+  corrupt data, because a shard write replaces the whole shard. Object
+  stores offer no atomic create, so the lock is advisory; ``--force-lock``
+  takes over one left behind by a dead run.
+* **Consolidation is skipped** by default when ``--zones`` is given, since
+  the root ``zarr.json`` is the one object all jobs share.
+
+A sweep therefore looks like::
+
+    # fan out — one process per zone, in parallel
+    parallel -j8 geotessera-registry zarr-fill \
+        s3://source-bucket/tessera s3://dest-bucket/tessera.zarr \
+        --year 2024 --zones {} ::: $(seq 1 60)
+
+    # single-writer finish: merge the per-zone registries, refresh the root
+    geotessera-registry zarr-consolidate s3://dest-bucket/tessera.zarr
+
+Each zone job exits non-zero if any of its shards failed, and tiles are only
+recorded as written once every shard covering them succeeded — so re-running
+the same command retries exactly the unfinished work.
+
+The one thing that is *not* safe is splitting a single zone across
+processes: whole-shard writes mean two jobs with different tile subsets
+would erase each other's pixels. Within one job this is handled by
+rebuilding each touched shard from all of its tiles, including ones an
+earlier run already wrote.
+
 Future Extensions
 ~~~~~~~~~~~~~~~~~
 
