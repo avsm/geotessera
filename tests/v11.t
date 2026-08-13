@@ -80,6 +80,79 @@ The numeric form ``1.1`` is equivalent:
   > "
   [2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
 
+Test: Variant Defaults Are Per Version
+--------------------------------------
+
+Each version has a default variant (the first published variant listed for
+it in ``KNOWN_DATASETS``); unknown versions fall back to ``vultr``:
+
+  $ uv run python -c "
+  > from geotessera.registry import default_variant
+  > print(default_variant('1.0'), default_variant('1.1'), default_variant('2.0'), default_variant('9.9'))
+  > "
+  vultr cambridge 2B-L~beta1 vultr
+
+Test: Dataset Paths Encode (version, variant)
+---------------------------------------------
+
+The npy/ tree has one directory per dataset. Every v1 variant collapses
+into the bare ``v1/`` directory; later versions get a ``-<suffix>`` per
+variant (``cambridge`` abbreviates to ``cam``):
+
+  $ uv run python -c "
+  > from geotessera.registry import dataset_path
+  > print(dataset_path('1.0', 'vultr'))
+  > print(dataset_path('1.0', 'someothervariant'))
+  > print(dataset_path('1.1', 'cambridge'))
+  > print(dataset_path('2.0', '2B-L~beta1'))
+  > "
+  v1
+  v1
+  v1.1-cam
+  v2-2B-L~beta1
+
+The inverse mapping resolves directory names back to (version, variant),
+with bare version dirs resolving to the version's default variant:
+
+  $ uv run python -c "
+  > from geotessera.registry import dataset_from_path
+  > for d in ('v1', 'v1.1-cam', 'v2-2B-L~beta1', 'not-a-dataset'):
+  >     print(d, '->', dataset_from_path(d))
+  > "
+  v1 -> ('1.0', 'vultr')
+  v1.1-cam -> ('1.1', 'cambridge')
+  v2-2B-L~beta1 -> ('2.0', '2B-L~beta1')
+  not-a-dataset -> None
+
+Test: Reserved Variants Raise Until Published
+---------------------------------------------
+
+The ``dclimate`` variant of v1.1 is reserved but not yet published, so
+selecting it fails with a clear "coming soon" error:
+
+  $ uv run python -c "
+  > from geotessera.registry import dataset_path
+  > try:
+  >     dataset_path('1.1', 'dclimate')
+  > except ValueError as e:
+  >     print('ValueError:', e)
+  > "
+  ValueError: Dataset variant 'dclimate' for version 1.1 is coming soon but not yet published. Currently available variant(s) for 1.1: cambridge. Run 'geotessera info' to list all datasets.
+
+Omitting ``dataset_variant`` for v1.1 selects cambridge:
+
+  $ uv run python -c "
+  > from geotessera import GeoTessera
+  > import tempfile, os
+  > with tempfile.TemporaryDirectory() as d:
+  >     gt = GeoTessera(dataset_version='v1.1',
+  >                     cache_dir=os.path.join(d, 'c'), embeddings_dir=os.path.join(d, 'e'))
+  >     print(gt.dataset_variant)
+  >     print(min(gt.registry.get_available_years()), max(gt.registry.get_available_years()))
+  > "
+  cambridge
+  2015 2025
+
 Test: Bad Variant Raises a Clear ValueError
 -------------------------------------------
 
@@ -99,10 +172,11 @@ manifest must fail loudly, not silently render an empty dataset:
   > " 2>&1 | grep -F 'ValueError: Manifest has no rows'
   ValueError: Manifest has no rows for version=1.0, variant=nonexistent. Check the dataset_version and dataset_variant arguments.
 
-Test: Manifest URLs Are Per-Version
+Test: Manifest URLs Are Per-Dataset
 ------------------------------------
 
-Confirm the consumer fetches from the per-version path on S3:
+Confirm the consumer fetches from the per-dataset manifest path (the npy/
+directory encodes the (version, variant) pair):
 
   $ uv run python -c "
   > from geotessera.registry import Registry
@@ -117,8 +191,8 @@ Confirm the consumer fetches from the per-version path on S3:
   > print('v1 URL :', r1._registry_url)
   > print('v1.1   :', r2._registry_url)
   > " 2>&1 | grep -E '^v1'
-  v1 URL : https://s3.us-west-2.amazonaws.com/tessera-embeddings/v1/manifest.parquet
-  v1.1   : https://s3.us-west-2.amazonaws.com/tessera-embeddings/v1.1/manifest.parquet
+  v1 URL : https://data.source.coop/tessera/tessera/npy/v1/manifest.parquet
+  v1.1   : https://data.source.coop/tessera/tessera/npy/v1.1-cam/manifest.parquet
 
 Test: S3 Embeddings Subdir Reflects Variant
 -------------------------------------------
@@ -170,6 +244,7 @@ the tiles (since the local dir layout is variant-agnostic):
   >                                 extra={'format': 'npy', 'year': 2024, 'tile_count': 1})
   >     payload = json.loads(p.read_text())
   > for k in ('dataset_version', 'dataset_version_path', 'dataset_variant',
+  >           'dataset_path', 'source_url_prefix',
   >           'embeddings_subdir', 's3_embeddings_subdir', 'format', 'year', 'tile_count'):
   >     print(f'{k}: {payload[k]}')
   > print(f'filename: {TESSERA_METADATA_FILENAME}')
@@ -177,6 +252,8 @@ the tiles (since the local dir layout is variant-agnostic):
   dataset_version: 1.1
   dataset_version_path: v1.1
   dataset_variant: cambridge
+  dataset_path: v1.1-cam
+  source_url_prefix: https://data.source.coop/tessera/tessera/npy/v1.1-cam/
   embeddings_subdir: global_0.1_degree_representation
   s3_embeddings_subdir: global_0.1_degree_representation.cambridge
   format: npy

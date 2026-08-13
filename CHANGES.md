@@ -1,10 +1,44 @@
-## Unreleased
+## 0.10.0 (2026-08-13)
+
+### Breaking Changes
+
+- All NPY downloads now come from the Source Cooperative, fronted by CloudFlare.
+  Embeddings, landmasks and manifests are served from the public
+  `https://data.source.coop/tessera/tessera` repository over HTTPS,
+  replacing the retired `tessera-embeddings` AWS S3 bucket.
+
+  The repository is organised by media type. The `npy/` tree has one
+  directory per *dataset* — a (version, variant) pair — with the variant
+  encoded as a directory suffix: all v1 variants share `npy/v1/`,
+  1.1/cambridge lives in `npy/v1.1-cam/`, and the v2 beta in
+  `npy/v2-2B-L~beta1/`. Each dataset directory carries its own
+  `manifest.parquet`. The `landmasks/{version}/` and `zarr/{version}/`
+  trees stay keyed by plain version. (@avsm, @mtelvers)
+
+- `botocore` and `awscrt` are no longer required dependencies (@avsm)
 
 ### New Features
 
-- **`geotessera-registry zarr-consolidate`**: New subcommand that
+- Per-version default variant allows omitting the dataset-variant.
+  `--dataset-variant` now selects the version's default variant (`vultr`
+  for v1, `cambridge` for v1.1, `2B-L~beta1` for v2) instead of always
+  `vultr`, so `GeoTessera(dataset_version="v1.1")` works. The known
+  datasets — including the reserved, not-yet-published `v1.1-dclimate`
+  complete-global run, which raises a "coming soon" error if selected —
+  are listed in the new "Known Datasets" table printed by
+  `geotessera info` (@avsm)
+- `geotessera-registry zarr-consolidate` is a new subcommand that
   re-consolidates a store's root metadata after in-place changes.
   Mostly only for repairs and not regular use.
+- `geotessera-registry s3scan` scans Source Cooperative to list
+  embeddings. This allows manifests and landmask registries to be
+  regenerated directly from the Source Cooperative repository. Listing
+  requests retry transient failures (429/5xx, timeouts, connection
+  resets) with exponential backoff; if a shard still fails after all
+  retries the affected manifest is not written and the command exits
+  non-zero, so an incomplete manifest can never be uploaded. The summary
+  panel prints per-file `aws s3 cp` upload commands with the correct
+  per-tree destinations (@avsm)
 
 ## v0.9.0 (2026-06-09)
 

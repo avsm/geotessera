@@ -144,10 +144,10 @@ def visualize_sources_coverage(
     legend.
 
     Args:
-        manifest_path: Local path to a manifest parquet — or a list of paths
-            which are concatenated before rendering. With per-version manifests
-            on S3 (``s3://tessera-embeddings/{v}/manifest.parquet``), pass a
-            list to compare versions on a single map.
+        manifest_path: Local path to a manifest parquet, or a list of paths
+            that are concatenated before rendering. Manifests are per version
+            (``data.source.coop/tessera/tessera/npy/{v}/manifest.parquet``),
+            so pass a list to compare versions on a single map.
         output_path: Output PNG path.
         year: Optional year filter (applies to all sources).
         width_pixels: Output image width in pixels.

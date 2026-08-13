@@ -9,16 +9,19 @@ representations optimized for downstream geospatial analysis tasks.
 
 .. important::
 
-   **Two Tessera versions are now published.** Prefer the newer **1.1** model
-   wherever it's available; it's a strict improvement over the legacy 1.0
-   line. The 1.1 currently runs in a ``cambridge`` variant — test embeddings
-   produced by the Cambridge team while the model is being rolled out. The
-   legacy 1.0 line is frozen (no new years will be added). **Never mix
+   **Multiple Tessera versions are now published.** Prefer the newer **1.1**
+   model wherever it's available; it's a strict improvement over the legacy
+   1.0 line. The 1.1 currently runs in a ``cambridge`` variant — test
+   embeddings produced by the Cambridge team while the model is being rolled
+   out (a complete global ``dclimate`` run is coming soon). A **TESSERA v2**
+   beta (variant ``2B-L~beta1``) is also appearing in the repository. The
+   legacy 1.0 line is frozen (no new years will be added) but remains the
+   default, as the only version with full global coverage. **Never mix
    embeddings from different versions or variants in the same downstream
    task**: the 128-channel feature spaces are independently learned and not
    interchangeable. Pick one ``(dataset_version, dataset_variant)`` pair per
-   project. See :ref:`dataset-versions` for full details and the CLI/Python
-   flags.
+   project — list the choices with ``geotessera info`` — and see
+   :ref:`dataset-versions` for full details and the CLI/Python flags.
 
 Overview
 --------
@@ -33,7 +36,7 @@ Key Features
 
 * **Global Coverage**: Access embeddings for any terrestrial location worldwide where data exists
 * **Flexible Formats**: Export as numpy arrays for analysis or GeoTIFF for GIS integration
-* **Cloud-Native Zarr Access**: Stream embeddings directly via ``GeoTesseraZarr`` without downloading files
+* **Cloud-Native Zarr Access**: Stream embeddings directly via ``GeoTesseraZarr`` without downloading files (*forthcoming in a future release* — the hosted Zarr store is not yet published)
 * **Projection Preservation**: Native UTM projections preserved from landmask tiles
 * **High Resolution**: 10m spatial resolution
 * **Temporal Compression**: Full year of satellite observations in each embedding
@@ -146,9 +149,10 @@ The Tessera embeddings use a **0.1-degree grid system**:
 File Structure and Downloads
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-When you request embeddings, GeoTessera downloads files from the public S3
-bucket (using anonymous, unsigned requests) into your chosen output directory,
-where they persist for re-use:
+When you request embeddings, GeoTessera downloads files over plain HTTPS from
+the public Source Cooperative repository
+(``https://data.source.coop/tessera/tessera``, fronted by Cloudflare) into
+your chosen output directory, where they persist for re-use:
 
 **Embedding Files** (via ``fetch_embedding``):
 
@@ -189,7 +193,7 @@ Data Flow
         ↓
     Per-version Manifest Lookup (filter manifest.parquet by year/lon/lat/variant)
         ↓
-    Anonymous S3 Downloads (with CRC64NVMe verification on the wire)
+    HTTPS Downloads from Source Cooperative (with integrity checks on the wire)
         ├── embedding.npy (int8 quantized) → output_dir
         └── embedding_scales.npy (float32 scale factors) → output_dir
         ↓
@@ -199,34 +203,42 @@ Data Flow
         ├── NumPy arrays + tessera_metadata.json sidecar → Direct analysis
         └── GeoTIFF (with TESSERA_DATASET_VERSION/VARIANT tags) → GIS integration
 
-**Storage Note**: Manifest + landmask Parquets (~hundreds of MB combined) are
-cached per-version under ``~/.cache/geotessera/{v1,v1.1}/``. Embedding tiles
-land in the user-specified ``--output`` directory (resumable across runs via
-existence checks).
+**Storage Note**: Manifest + landmask Parquets (tens to a couple of hundred
+MB per dataset) are cached under ``~/.cache/geotessera/`` in per-dataset
+subdirectories. Embedding tiles land in the user-specified ``--output``
+directory (resumable across runs via existence checks).
 
 Manifest System
 ~~~~~~~~~~~~~~~
 
 GeoTessera uses a Parquet-based per-version manifest for efficient data access:
 
-* **One manifest per dataset version**: ``s3://tessera-embeddings/{v1,v1.1}/manifest.parquet``.
+* **One manifest per dataset** — a ``(version, variant)`` pair with its own
+  ``npy/`` directory:
+  ``data.source.coop/tessera/tessera/npy/{v1,v1.1-cam,v2-2B-L~beta1}/manifest.parquet``.
   Each carries the file-scan inventory schema (``year, lon, lat, grid_size,
   scales_size, grid_path, ...``) plus explicit ``version`` and ``variant``
-  columns so a single file covers every variant in that version.
+  columns.
 * **Fast queries**: pandas/GeoPandas DataFrames with spatial R-tree on lon/lat
 * **Block-based queries**: Internal 5×5° geographic blocks keep region lookups O(blocks)
-* **Conditional fetches**: Per-version ETag sidecars enable ``If-None-Match``
-  conditional GETs — refetches only happen when the bucket's ETag actually
-  changes; otherwise the server returns 304 with no body.
-* **Integrity checking**: End-to-end CRC64NVMe verification using S3's
-  ``x-amz-checksum-crc64nvme`` response header on every download.
+* **Conditional fetches**: cached manifests are revalidated with an
+  ``If-Modified-Since`` conditional GET keyed on the cached file's mtime —
+  refetches only happen when the server copy has actually changed;
+  otherwise the server returns 304 with no body.
+* **Integrity checking**: Every download is verified against the response
+  ``Content-Length``, and against a streamed MD5 whenever the server's
+  ``ETag`` is a content MD5 (single-part uploads).
 
 The manifest can be loaded from multiple sources:
 
 1. **Default remote** (recommended, downloads and caches automatically per version)
-2. **Local file** (via ``--registry-path`` parameter)
-3. **Local directory** (via ``--registry-dir`` parameter, looks for ``manifest.parquet``)
-4. **Custom URL** (via ``--registry-url`` parameter)
+2. **Local file** (via the ``registry_path`` Python parameter)
+3. **Local directory** (via ``--registry-dir`` on the CLI or the ``registry_dir`` Python parameter; looks for ``manifest.parquet``)
+4. **Custom URL** (via the ``registry_url`` Python parameter)
+
+Maintainers can regenerate the manifests at any time by scanning the Source
+Cooperative repository with ``geotessera-registry s3scan`` — see
+:doc:`maintenance`.
 
 Understanding Tessera Embeddings
 --------------------------------
@@ -253,19 +265,33 @@ GeoTessera ships embeddings under two orthogonal axes:
   Different versions have *different 128-channel feature spaces*: a feature
   vector from one version is **not comparable** to a vector from another.
 * **dataset variant** — for a given version, an independent model run /
-  release channel. The default is ``vultr`` (the production hosting on
-  Vultr); ``cambridge`` is a test deployment by the Cambridge team for the
-  1.1 line.
+  release channel. ``vultr`` (the production hosting on Vultr) is the
+  variant for the 1.0 line; ``cambridge`` is the Cambridge team's deployment
+  for the 1.1 line; ``2B-L~beta1`` is the v2 beta run. Each version has a
+  default variant that is selected when ``--dataset-variant`` is omitted.
 
-Currently published combinations on ``s3://tessera-embeddings/``:
+Each ``(version, variant)`` pair — a *dataset* — has its own directory in
+the repository's ``npy/`` tree. The v1 series predates this scheme, so all
+its variants share the bare ``v1/`` directory; later versions encode the
+variant as a suffix. Known datasets on ``data.source.coop/tessera/tessera``
+(list them any time with ``geotessera info``):
 
-+-------------+------------------+--------------+----------------+----------------------------------------------------------------+
-| ``version`` | ``S3 path``      | ``variant``  | Years          | Notes                                                          |
-+=============+==================+==============+================+================================================================+
-| ``1.0``     | ``v1/``          | ``vultr``    | 2017–2025      | Legacy production line. Frozen — no new years will be added.   |
-+-------------+------------------+--------------+----------------+----------------------------------------------------------------+
-| ``1.1``     | ``v1.1/``        | ``cambridge``| 2017–2025      | Newer model. Cambridge test embeddings; active development.    |
-+-------------+------------------+--------------+----------------+----------------------------------------------------------------+
++-------------+---------------------+--------------------+----------------+----------------------------------------------------------------+
+| ``version`` | ``variant``         | ``npy/`` directory | Years          | Notes                                                          |
++=============+=====================+====================+================+================================================================+
+| ``1.0``     | ``vultr`` (default) | ``v1/``            | 2017–2025      | Legacy production line. Frozen — no new years will be added.   |
++-------------+---------------------+--------------------+----------------+----------------------------------------------------------------+
+| ``1.1``     | ``cambridge``       | ``v1.1-cam/``      | 2015–2025      | Newer model. Cambridge test embeddings; active development.    |
+|             | (default)           |                    |                |                                                                |
++-------------+---------------------+--------------------+----------------+----------------------------------------------------------------+
+| ``1.1``     | ``dclimate``        | —                  | —              | **Coming soon.** Complete global v1.1 run; not yet published.  |
++-------------+---------------------+--------------------+----------------+----------------------------------------------------------------+
+| ``2.0``     | ``2B-L~beta1``      | ``v2-2B-L~beta1/`` | 2017–2025      | TESSERA v2 beta (2B parameters, L size). Experimental.         |
+|             | (default)           |                    |                |                                                                |
++-------------+---------------------+--------------------+----------------+----------------------------------------------------------------+
+
+The library defaults remain ``dataset_version="v1"`` and ``year=2024`` —
+the only combination with full global coverage today.
 
 Which one should I use?
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -307,14 +333,17 @@ accepts both flags::
         --year 2024 \
         --output ./tiles
 
-``--dataset-version`` accepts either form: ``v1`` and ``1.0`` are aliases
-(legacy S3 path uses ``v1/``); ``v1.1`` and ``1.1`` are aliases. The
-internal normalised form (used in manifests and the metadata sidecar) is
-``1.0`` / ``1.1``; the S3 path component is ``v1`` / ``v1.1``.
+``--dataset-version`` accepts either form: ``v1`` and ``1.0`` are aliases,
+as are ``v1.1``/``1.1`` and ``v2``/``2.0``. The internal normalised form
+(used in manifests and the metadata sidecar) is ``1.0`` / ``1.1`` / ``2.0``;
+the ``npy/`` tree directory is derived from the (version, variant) pair
+(``v1``, ``v1.1-cam``, ``v2-2B-L~beta1``).
 
-``--dataset-variant`` defaults to ``vultr`` so unflagged commands keep
-working against the legacy line; pass ``cambridge`` (or any other
-published variant) explicitly.
+``--dataset-variant`` defaults to the version's default variant
+(``vultr`` for 1.0, ``cambridge`` for 1.1, ``2B-L~beta1`` for 2.0), so
+unflagged commands work for any version; pass a variant explicitly to
+override. List every known dataset — including reserved coming-soon
+variants — with ``geotessera info``.
 
 **Python API**::
 
@@ -337,7 +366,7 @@ What gets recorded
 ~~~~~~~~~~~~~~~~~~
 
 Every NPY download drops a ``tessera_metadata.json`` sidecar in the output
-directory with the resolved ``(version, variant)``, the S3 URL prefix the
+directory with the resolved ``(version, variant)``, the source URL prefix the
 tiles came from, generation time, and tile count. Every exported GeoTIFF
 is stamped with ``TESSERA_DATASET_VERSION``, ``TESSERA_DATASET_VERSION_PATH``,
 and ``TESSERA_DATASET_VARIANT`` metadata tags. Use these as the source of
@@ -358,26 +387,38 @@ layer toggles. See the CLI reference for the full flag set.
 Data Organization
 -----------------
 
-**Remote Server Structure** (S3, ``us-west-2``)::
+**Remote Server Structure** (Source Cooperative)::
 
-    https://s3.us-west-2.amazonaws.com/tessera-embeddings/
-    ├── v1/                                          # Dataset version 1.0
-    │   ├── manifest.parquet                         # Per-version tile manifest
-    │   ├── landmasks.parquet                        # Landmask manifest
-    │   ├── global_0.1_degree_representation/        # vultr variant (default)
+    https://data.source.coop/tessera/tessera/
+    ├── npy/                                         # NPY embeddings + scales
+    │   │                                            # (one dir per (version, variant) dataset)
+    │   ├── v1/                                      # 1.0 — all variants share this dir
+    │   │   ├── manifest.parquet                     # Per-dataset tile manifest
     │   │   └── 2024/grid_0.15_52.05/grid_0.15_52.05{,_scales}.npy
-    │   └── global_0.1_degree_tiff_all/
-    │       └── grid_0.15_52.05.tiff                 # Landmask TIFF
-    └── v1.1/                                        # Dataset version 1.1
-        ├── manifest.parquet
-        ├── landmasks.parquet                        # Copy of v1's (same grid)
-        └── global_0.1_degree_representation.cambridge/
-            └── 2024/grid_0.15_52.05/grid_0.15_52.05{,_scales}.npy
+    │   ├── v1.1-cam/                                # 1.1 / cambridge
+    │   │   ├── manifest.parquet
+    │   │   └── 2024/grid_0.15_52.05/grid_0.15_52.05{,_scales}.npy
+    │   └── v2-2B-L~beta1/                           # 2.0 / 2B-L~beta1 (beta)
+    │       └── 2024/grid_0.15_52.05/grid_0.15_52.05{,_scales}.npy
+    ├── landmasks/                                   # Landmask TIFFs (per version)
+    │   ├── v1/
+    │   │   ├── landmasks.parquet                    # Landmask manifest
+    │   │   └── grid_0.15_52.05.tiff
+    │   ├── v1.1/
+    │   │   ├── landmasks.parquet
+    │   │   └── grid_0.15_52.05.tiff
+    │   └── v2/
+    │       ├── landmasks.parquet
+    │       └── grid_0.15_52.05.tiff
+    └── zarr/                                        # Cloud-native zarr store
+        └── v1/                                      # (forthcoming in a future release)
 
-Each ``manifest.parquet`` is scoped to one version and lists every
-``(year, lon, lat)`` tile available for that version's variants. The
-client downloads only the manifest matching its ``dataset_version`` and
-filters by ``dataset_variant`` on load.
+Each ``manifest.parquet`` is scoped to one dataset — the npy/ directory
+name encodes the ``(version, variant)`` pair (a future ``v1.1-dclimate``
+dataset is reserved but not yet published). The client downloads only the
+manifest for its dataset directory and filters by ``dataset_variant`` on
+load. Landmasks are a property of the 0.1° grid, so they stay keyed by
+plain version (``landmasks/v1.1/`` serves every 1.1 variant).
 
 **Local Mirror Structure** (when downloading via ``geotessera download``)::
 
@@ -390,27 +431,31 @@ filters by ``dataset_variant`` on load.
     └── global_0.1_degree_tiff_all/
         └── grid_0.15_52.05.tiff
 
-**Local Cache Structure** (manifests + landmark manifests, per-version)::
+**Local Cache Structure** (mirrors the remote trees: manifests are cached
+per dataset directory, landmask registries per version)::
 
     ~/.cache/geotessera/                             # Default cache location
     ├── v1/
-    │   ├── manifest.parquet
-    │   ├── manifest.parquet.etag                    # HTTP ETag for conditional GETs
-    │   ├── landmasks.parquet
-    │   └── landmasks.parquet.etag
-    └── v1.1/
-        ├── manifest.parquet
-        ├── manifest.parquet.etag
-        ├── landmasks.parquet
-        └── landmasks.parquet.etag
+    │   ├── manifest.parquet                         # 1.0 embeddings manifest
+    │   └── landmasks.parquet                        # v1 landmask registry
+    ├── v1.1-cam/
+    │   └── manifest.parquet                         # 1.1/cambridge manifest
+    ├── v1.1/
+    │   └── landmasks.parquet                        # v1.1 landmask registry
+    ├── v2-2B-L~beta1/
+    │   └── manifest.parquet                         # 2.0 beta manifest
+    └── v2/
+        └── landmasks.parquet                        # v2 landmask registry
 
-The ``.etag`` sidecars enable conditional ``If-None-Match`` requests: the
-client refetches only when the bucket's ETag has actually changed, and S3
-returns ``304 Not Modified`` (zero body bytes) otherwise.
+Cached manifests are revalidated with conditional ``If-Modified-Since``
+requests keyed on the cached file's modification time: the client refetches
+only when the server copy has actually changed, and the server returns
+``304 Not Modified`` (zero body bytes) otherwise.
 
 Embeddings are organized by:
 
-* **Year**: 2017–2025 for both ``v1/vultr`` and ``v1.1/cambridge``
+* **Year**: 2017–2025 for ``1.0/vultr`` and ``2.0/2B-L~beta1``;
+  2015–2025 for ``1.1/cambridge``
 * **Location**: Global 0.1-degree grid system (same grid across all versions)
 * **Format**: NumPy arrays with shape (height, width, 128) after dequantisation
 
@@ -451,6 +496,7 @@ Documentation Sections
    architecture
    tutorials
    cli_reference
+   maintenance
 
 .. toctree::
    :maxdepth: 2

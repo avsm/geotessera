@@ -38,10 +38,16 @@ from rich.progress import (
 )
 
 from .registry import (
+    TESSERA_MIRROR_ENDPOINT,
+    _DATASET_DIR_RE,
     block_from_world,
     block_to_embeddings_registry_filename,
     block_to_landmasks_registry_filename,
+    dataset_from_path,
+    dataset_path,
+    default_variant,
     parse_grid_name,
+    zarr_store_url,
 )
 from ._terminal import console, emoji
 
@@ -2443,24 +2449,45 @@ def _parse_s3_uri(uri: str) -> Tuple[str, str]:
     return bucket, prefix
 
 
+# Transient HTTP statuses worth retrying during listings: rate limiting
+# and server/CDN-side errors (Cloudflare fronting data.source.coop returns
+# 503s under load).
+_RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
+# Per-page attempts: 6 tries with 1, 2, 4, 8, 16s backoff (~31s worst case).
+_S3_LIST_ATTEMPTS = 6
+
+
 def _s3_list(
     bucket: str,
     prefix: str,
-    region: str,
+    endpoint_url: str,
     delimiter: Optional[str] = None,
 ) -> Iterator[Tuple[str, int, str]]:
     """Yield (key, size, last_modified) for every object under prefix.
 
-    Uses anonymous HTTPS calls to the S3 ListObjectsV2 endpoint. Follows
-    continuation tokens until the listing is exhausted. If delimiter is
-    set, yields CommonPrefixes as (prefix, 0, "") tuples instead of object
-    contents.
-    """
-    import xml.etree.ElementTree as ET
-    from urllib.parse import urlencode
-    from urllib.request import urlopen
+    Issues anonymous path-style HTTPS calls to the S3-compatible
+    ListObjectsV2 endpoint at *endpoint_url* (e.g.
+    ``https://data.source.coop``). Follows continuation tokens until the
+    listing is exhausted. If delimiter is set, yields CommonPrefixes as
+    (prefix, 0, "") tuples instead of object contents.
 
-    base = f"https://{bucket}.s3.{region}.amazonaws.com/"
+    Each page request is retried with exponential backoff on transient
+    failures (429/5xx, timeouts, connection resets, truncated bodies).
+    Retrying happens before any of the page's entries are yielded, so the
+    stream never contains duplicates; the continuation token makes the
+    re-request idempotent. A page that still fails after all attempts
+    raises RuntimeError.
+    """
+    import time as _time
+    import xml.etree.ElementTree as ET
+    from http.client import HTTPException
+    from urllib.error import HTTPError, URLError
+    from urllib.parse import urlencode
+    from urllib.request import Request, urlopen
+
+    from . import __version__
+
+    base = f"{endpoint_url.rstrip('/')}/{bucket}/"
     token: Optional[str] = None
     while True:
         params = {"list-type": "2", "prefix": prefix}
@@ -2469,8 +2496,38 @@ def _s3_list(
         if token is not None:
             params["continuation-token"] = token
         url = base + "?" + urlencode(params)
-        with urlopen(url, timeout=60) as resp:
-            root = ET.parse(resp).getroot()
+
+        root = None
+        last_err: Optional[BaseException] = None
+        for attempt in range(_S3_LIST_ATTEMPTS):
+            if attempt:
+                _time.sleep(2 ** (attempt - 1))
+            request = Request(
+                url,
+                headers={"User-Agent": f"geotessera/{__version__}"},
+            )
+            try:
+                with urlopen(request, timeout=60) as resp:
+                    body = resp.read()
+                root = ET.fromstring(body)
+                break
+            except HTTPError as e:
+                if e.code not in _RETRYABLE_HTTP_CODES:
+                    raise
+                last_err = e
+            except (
+                URLError,
+                TimeoutError,
+                ConnectionError,
+                HTTPException,
+                ET.ParseError,
+            ) as e:
+                last_err = e
+        if root is None:
+            raise RuntimeError(
+                f"S3 listing failed after {_S3_LIST_ATTEMPTS} attempts "
+                f"for {url}: {last_err}"
+            ) from last_err
 
         if delimiter is not None:
             for cp in root.findall(f"{S3_NS}CommonPrefixes"):
@@ -2493,12 +2550,14 @@ def _s3_list(
 
 
 # Bucket-layout regexes shared by the s3scan discovery walker.
-#   Versions live as top-level dirs like ``v1/`` or ``v1.1/`` (the legacy ``v1``
-#   is treated as ``1.0``).
-#   Variants live under a version as ``global_0.1_degree_representation`` (the
-#   default ``vultr`` variant) or ``global_0.1_degree_representation.<name>``
-#   (e.g. ``.cambridge``).
-#   Years are 4-digit directories under a variant.
+#   Datasets live as top-level dirs named after the version, optionally
+#   with a ``-<variant>`` suffix: ``v1/`` (all 1.0 variants), ``v1.1-cam/``
+#   (1.1/cambridge), ``v2-2B-L~beta1/`` (matched by _DATASET_DIR_RE from
+#   .registry; a bare ``v1.1/`` legacy dir is also accepted).
+#   In the legacy layout, variants live under a version dir as
+#   ``global_0.1_degree_representation`` (the default ``vultr`` variant) or
+#   ``global_0.1_degree_representation.<name>`` (e.g. ``.cambridge``).
+#   Years are 4-digit directories under a dataset (or legacy variant) dir.
 _VERSION_RE = re.compile(r"^v(\d+)(?:\.(\d+))?$")
 _VARIANT_RE = re.compile(r"^global_0\.1_degree_representation(?:\.([\w-]+))?$")
 _YEAR_RE = re.compile(r"^(\d{4})$")
@@ -2514,21 +2573,43 @@ def _normalize_version(version_dir: str) -> str:
 
 
 def _discover_scan_units(
-    bucket: str, root_prefix: str, region: str, console: "Console"
+    bucket: str,
+    root_prefix: str,
+    endpoint_url: str,
+    console: "Console",
+    flat_variant: Optional[str] = None,
 ) -> List[Tuple[str, str, int, str]]:
     """Walk an S3 prefix and return a list of (version, variant, year, year_prefix).
 
-    Auto-detects the level of ``root_prefix``: bucket root, version dir, or
-    variant dir. Version/variant components already present in the supplied
-    prefix are inferred from the path and don't need to be discovered again.
+    Auto-detects the level of ``root_prefix``: tree root, dataset dir, or
+    legacy variant dir. Version/variant components already present in the
+    supplied prefix are inferred from the path and don't need to be
+    discovered again.
+
+    Supports three layouts:
+
+    * the dataset-dir layout (``{version}-{variant_suffix}/{year}/``, e.g.
+      ``v1.1-cam/2024/``) where the directory name encodes the variant;
+    * the flat layout (``{version}/{year}/``, e.g. ``v1/2024/``) which
+      carries no variant in the path — rows are attributed to
+      *flat_variant*, or to the version's default variant when that is
+      None;
+    * the legacy variant-subdir layout
+      (``{version}/global_0.1_degree_representation[.<variant>]/{year}/``).
     """
     # Infer any version/variant already encoded in the path.
     pre_version = None
     pre_variant = None
     for part in root_prefix.rstrip("/").split("/"):
-        m = _VERSION_RE.match(part)
+        m = _DATASET_DIR_RE.match(part)
         if m:
-            pre_version = _normalize_version(part)
+            parsed = dataset_from_path(part)
+            if parsed is not None:
+                pre_version, ds_variant = parsed
+                # A -variant suffix pins the variant; a bare version dir
+                # leaves it open for the legacy variant-subdir layout.
+                if m.group(3) is not None:
+                    pre_variant = ds_variant
             continue
         m = _VARIANT_RE.match(part)
         if m:
@@ -2538,14 +2619,21 @@ def _discover_scan_units(
 
     def walk(prefix: str, version: Optional[str], variant: Optional[str], indent: int):
         pad = "  " * indent
-        for sp, _, _ in _s3_list(bucket, prefix, region, delimiter="/"):
+        for sp, _, _ in _s3_list(bucket, prefix, endpoint_url, delimiter="/"):
             tail = sp[len(prefix) :].rstrip("/")
             if version is None:
-                m = _VERSION_RE.match(tail)
-                if m:
-                    v = _normalize_version(tail)
-                    console.print(f"{pad}Version: [green]{tail}[/green] (= {v})")
-                    walk(sp, v, variant, indent + 1)
+                m = _DATASET_DIR_RE.match(tail)
+                if m and dataset_from_path(tail) is not None:
+                    v, ds_variant = dataset_from_path(tail)
+                    if m.group(3) is not None:
+                        # Suffixed dataset dir: variant comes from the name.
+                        console.print(
+                            f"{pad}Dataset: [green]{tail}[/green] (= {v}/{ds_variant})"
+                        )
+                        walk(sp, v, ds_variant, indent + 1)
+                    else:
+                        console.print(f"{pad}Version: [green]{tail}[/green] (= {v})")
+                        walk(sp, v, variant, indent + 1)
                     continue
             if variant is None:
                 m = _VARIANT_RE.match(tail)
@@ -2555,8 +2643,12 @@ def _discover_scan_units(
                     walk(sp, version, var, indent + 1)
                     continue
             m = _YEAR_RE.match(tail)
-            if m and version is not None and variant is not None:
-                units.append((version, variant, int(m.group(1)), sp))
+            if m and version is not None:
+                # A year directly under a bare version dir is the flat
+                # layout; under a suffixed dataset dir the variant is
+                # already bound.
+                var = variant or flat_variant or default_variant(version)
+                units.append((version, var, int(m.group(1)), sp))
 
     walk(root_prefix, pre_version, pre_variant, 1)
     return units
@@ -2567,14 +2659,18 @@ _LANDMASK_RE = re.compile(r"grid_(-?\d+\.\d+)_(-?\d+\.\d+)\.tiff$")
 
 
 def _discover_landmask_prefixes(
-    bucket: str, root_prefix: str, region: str, console: "Console"
+    bucket: str,
+    root_prefix: str,
+    endpoint_url: str,
+    console: "Console",
 ) -> List[Tuple[str, str, str]]:
     """Return ``(version_norm, version_path, landmask_prefix)`` per version.
 
-    Skips versions that don't have a ``global_0.1_degree_tiff_all/`` dir (e.g.
-    v1.1 currently ships only the cambridge variant, no landmasks). When
-    ``root_prefix`` already points at or inside a version dir, only that
-    version is probed.
+    Supports both layouts: TIFFs under ``{version}/global_0.1_degree_tiff_all/``
+    and TIFFs directly under the version directory (the Source Cooperative
+    ``landmasks/{version}/`` tree). Versions with no TIFFs at either location
+    are skipped. When ``root_prefix`` already points at or inside a version
+    dir, only that version is probed.
     """
     candidates: List[Tuple[str, str]] = []  # (version_norm, version_prefix)
 
@@ -2596,7 +2692,7 @@ def _discover_landmask_prefixes(
             version_prefix = root_prefix
         candidates.append((pre_version, version_prefix))
     else:
-        for sp, _, _ in _s3_list(bucket, root_prefix, region, delimiter="/"):
+        for sp, _, _ in _s3_list(bucket, root_prefix, endpoint_url, delimiter="/"):
             tail = sp[len(root_prefix) :].rstrip("/")
             m = _VERSION_RE.match(tail)
             if m:
@@ -2604,18 +2700,19 @@ def _discover_landmask_prefixes(
 
     from .registry import _version_path_from_norm
 
+    from itertools import islice
+
     out: List[Tuple[str, str, str]] = []
     for version_norm, version_prefix in candidates:
-        lm_prefix = version_prefix + _LANDMASK_DIR + "/"
-        # Probe with a single key — landmask dirs are flat and large; a quick
-        # "is anything there?" listing is cheap.
-        has_any = any(True for _ in _s3_list(bucket, lm_prefix, region))
         version_path = _version_path_from_norm(version_norm)
-        if has_any:
-            console.print(
-                f"  Landmasks: [green]{version_path}/{_LANDMASK_DIR}/[/green]"
-            )
-            out.append((version_norm, version_path, lm_prefix))
+        # Probe a few keys at each candidate location. TIFF keys sort before
+        # any parquet sidecars, so the first page suffices.
+        for lm_prefix in (version_prefix + _LANDMASK_DIR + "/", version_prefix):
+            probe = islice(_s3_list(bucket, lm_prefix, endpoint_url), 20)
+            if any(key.endswith(".tiff") for key, _, _ in probe):
+                console.print(f"  Landmasks: [green]{lm_prefix}[/green]")
+                out.append((version_norm, version_path, lm_prefix))
+                break
     return out
 
 
@@ -2624,17 +2721,18 @@ def s3scan_command(args):
 
     The input URI may point at any level of the bucket layout:
 
-    * ``s3://bucket/`` — discover all versions, variants, and years
-    * ``s3://bucket/v1.1/`` — one version, all variants
+    * ``s3://bucket/tessera/npy/`` — discover all datasets and years
+    * ``s3://bucket/tessera/npy/v1.1-cam/`` — one dataset (the directory
+      name encodes the (version, variant) pair)
     * ``s3://bucket/v1.1/global_0.1_degree_representation.cambridge/`` —
-      one (version, variant)
+      one (version, variant) in the legacy variant-subdir layout
 
     Each discovered (version, variant, year) is then listed in parallel
     using integer-longitude shards. One ``manifest.parquet`` is written per
-    dataset version under ``{output_dir}/{version_path}/manifest.parquet``,
-    mirroring the S3 layout so the whole tree can be uploaded with
-    ``aws s3 cp --recursive``. Each manifest carries ``version`` and
-    ``variant`` columns so all variants within a version share one file.
+    dataset directory under ``{output_dir}/{dataset_dir}/manifest.parquet``
+    (e.g. ``v1/``, ``v1.1-cam/``, ``v2-2B-L~beta1/``), mirroring the npy/
+    tree so the output can be uploaded with ``aws s3 cp --recursive``.
+    Each manifest carries ``version`` and ``variant`` columns.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from datetime import datetime
@@ -2647,7 +2745,10 @@ def s3scan_command(args):
         console.print(f"[red]Error: {e}[/red]")
         return 1
 
-    region = args.region
+    endpoint = args.endpoint_url
+    if not endpoint:
+        console.print("[red]Error: --endpoint-url must not be empty[/red]")
+        return 1
 
     # Output is a *directory* under which per-version manifests are written
     # as ``{output_dir}/{version_path}/manifest.parquet``. This mirrors the S3
@@ -2659,26 +2760,40 @@ def s3scan_command(args):
             f"[bold blue]🔍 Spidering S3 for Embedding Tiles[/bold blue]\n"
             f"📦 Bucket: {bucket}\n"
             f"🔑 Prefix: {prefix or '(root)'}\n"
-            f"🌐 Region: {region}\n"
+            f"🌐 Endpoint: {endpoint}\n"
             f"📂 Output dir: {output_dir}",
             style="blue",
         )
     )
 
-    console.print("\n[cyan]Discovering versions, variants, and years...[/cyan]")
-    try:
-        scan_units = _discover_scan_units(bucket, prefix, region, console)
-    except Exception as e:
-        console.print(f"[red]Error listing S3 prefix: {e}[/red]")
-        return 1
+    # With an explicit --landmasks-uri the landmask scan can proceed even
+    # when the embeddings prefix yields nothing (a landmasks-only run).
+    landmasks_only_ok = not args.no_landmasks and args.landmasks_uri is not None
 
-    if not scan_units:
-        console.print(
-            "[yellow]No (version, variant, year) units found! "
-            "Expected layout: <root>/v<N>(.<M>)/global_0.1_degree_representation"
-            "(.<variant>)/<YYYY>/grid_*[/yellow]"
-        )
-        return 1
+    scan_units: List[Tuple[str, str, int, str]] = []
+    if landmasks_only_ok and args.landmasks_uri == args.s3_uri:
+        # A pure landmasks run. Skip embedding discovery: walking a flat
+        # landmask tree pages through every TIFF key to find no year dirs.
+        console.print("\n[cyan]Landmasks-only run; skipping embedding scan.[/cyan]")
+    else:
+        console.print("\n[cyan]Discovering versions, variants, and years...[/cyan]")
+        try:
+            scan_units = _discover_scan_units(
+                bucket, prefix, endpoint, console, flat_variant=args.variant
+            )
+        except Exception as e:
+            console.print(f"[red]Error listing S3 prefix: {e}[/red]")
+            return 1
+
+        if not scan_units:
+            console.print(
+                "[yellow]No (version, variant, year) units found! "
+                "Expected layout: <root>/v<N>(.<M>)/"
+                "[global_0.1_degree_representation(.<variant>)/]<YYYY>/grid_*[/yellow]"
+            )
+            if not landmasks_only_ok:
+                return 1
+            console.print("[yellow]Continuing with the landmask scan only.[/yellow]")
 
     grid_re = re.compile(r"grid_(-?\d+\.\d+)_(-?\d+\.\d+)(_scales)?\.npy$")
 
@@ -2706,7 +2821,7 @@ def s3scan_command(args):
         """List one (version, variant, year, lon-shard) and return tile records."""
         tiles: Dict[Tuple[float, float], Dict[str, Tuple[str, int, str]]] = {}
         listed = 0
-        for key, size, lm in _s3_list(bucket, year_prefix + shard, region):
+        for key, size, lm in _s3_list(bucket, year_prefix + shard, endpoint):
             listed += 1
             # Batch UI updates: every 50 objects is plenty smooth and avoids
             # contention on the Progress lock during big listings.
@@ -2758,6 +2873,10 @@ def s3scan_command(args):
 
     records: List[Dict] = []
     units_found = set()
+    # (version, variant) datasets that lost one or more shards even after
+    # _s3_list's built-in retries. Their manifests would be silently
+    # incomplete, so they are not written.
+    failed_datasets: set = set()
     tile_counts: Dict[Tuple[str, str, int], int] = {
         (v, var, y): 0 for v, var, y, _ in scan_units
     }
@@ -2803,6 +2922,7 @@ def s3scan_command(args):
                     console.print(
                         f"[red]Error scanning {v}/{var}/{y}/{shard}: {e}[/red]"
                     )
+                    failed_datasets.add((v, var))
                     shards_left[key] -= 1
                     continue
                 if out:
@@ -2828,50 +2948,82 @@ def s3scan_command(args):
 
     if not records:
         console.print("[yellow]No embedding tiles found![/yellow]")
-        return 1
+        if not landmasks_only_ok:
+            return 1
 
     from .registry import _version_path_from_norm
 
-    df = pd.DataFrame(records)
-    df = df.sort_values(["version", "variant", "year", "lon", "lat"])
-    df["lon_i"] = (df["lon"] * 100).round().astype(np.int32)
-    df["lat_i"] = (df["lat"] * 100).round().astype(np.int32)
-
-    # One parquet per dataset version. Layout mirrors S3 so the whole tree
-    # can be uploaded with ``aws s3 cp --recursive <output_dir>/ s3://<bucket>/``.
+    # One parquet per dataset version. Layout mirrors the remote tree so the
+    # whole output can be uploaded with
+    # ``aws s3 cp --recursive <output_dir>/ s3://<bucket>/``.
     written_files: List[Path] = []
+    # Set when a landmask scan loses shards; embedding-side losses are
+    # tracked in failed_datasets. Either makes the run exit non-zero.
+    scan_had_failures = False
     try:
-        for version_norm, group_df in df.groupby("version", sort=True):
-            version_path = _version_path_from_norm(str(version_norm))
-            # Defensive dedupe: bucket-side misfiling (e.g. a tile filed under
-            # the wrong grid directory) can surface the same key twice via
-            # different lon-shards.
-            before_dedupe = len(group_df)
-            group_df = group_df.drop_duplicates(
-                subset=["version", "variant", "year", "lon", "lat"], keep="first"
-            )
-            if len(group_df) != before_dedupe:
-                console.print(
-                    f"[yellow]  Dropped {before_dedupe - len(group_df):,} duplicate "
-                    f"(variant, year, lon, lat) rows for {version_path}[/yellow]"
+        if records:
+            df = pd.DataFrame(records)
+            df = df.sort_values(["version", "variant", "year", "lon", "lat"])
+            df["lon_i"] = (df["lon"] * 100).round().astype(np.int32)
+            df["lat_i"] = (df["lat"] * 100).round().astype(np.int32)
+            # One parquet per dataset directory. dataset_path collapses all
+            # 1.0 variants into v1/ and maps later versions to their
+            # suffixed dirs (v1.1-cam, v2-2B-L~beta1, ...), so the output
+            # lands exactly where the npy/ tree expects the manifest.
+            df["_dataset_dir"] = [
+                dataset_path(str(v), str(var))
+                for v, var in zip(df["version"], df["variant"])
+            ]
+            failed_dataset_dirs = {
+                dataset_path(str(v), str(var)) for v, var in failed_datasets
+            }
+            for dataset_dir, group_df in df.groupby("_dataset_dir", sort=True):
+                if dataset_dir in failed_dataset_dirs:
+                    console.print(
+                        f"[red]Not writing {dataset_dir}/manifest.parquet: "
+                        f"one or more lon-shards failed to list even after "
+                        f"retries, so the manifest would be incomplete. "
+                        f"Re-run the scan for this dataset.[/red]"
+                    )
+                    continue
+                group_df = group_df.drop(columns=["_dataset_dir"])
+                # Defensive dedupe: bucket-side misfiling (e.g. a tile filed
+                # under the wrong grid directory) can surface the same key
+                # twice via different lon-shards.
+                before_dedupe = len(group_df)
+                group_df = group_df.drop_duplicates(
+                    subset=["version", "variant", "year", "lon", "lat"],
+                    keep="first",
                 )
-            out_file = output_dir / version_path / "manifest.parquet"
-            out_file.parent.mkdir(parents=True, exist_ok=True)
-            console.print(
-                f"[cyan]Writing {len(group_df):,} tiles to {out_file}...[/cyan]"
-            )
-            _atomic_write_parquet(group_df, out_file)
-            written_files.append(out_file)
+                if len(group_df) != before_dedupe:
+                    console.print(
+                        f"[yellow]  Dropped {before_dedupe - len(group_df):,} "
+                        f"duplicate (variant, year, lon, lat) rows for "
+                        f"{dataset_dir}[/yellow]"
+                    )
+                out_file = output_dir / str(dataset_dir) / "manifest.parquet"
+                out_file.parent.mkdir(parents=True, exist_ok=True)
+                console.print(
+                    f"[cyan]Writing {len(group_df):,} tiles to {out_file}...[/cyan]"
+                )
+                _atomic_write_parquet(group_df, out_file)
+                written_files.append(out_file)
 
-        # Landmask scan: one parquet per version that has a landmasks dir.
-        # Versions that share the 0.1° grid but don't ship their own landmasks
-        # dir (e.g. v1.1 → reuses v1's landmasks) get a copy of the first
-        # scanned landmasks parquet.
+        # Landmask scan: one parquet per version that has landmask TIFFs.
         landmask_files_by_version: Dict[str, Path] = {}
         if not args.no_landmasks:
+            # The landmask tree may live outside the embeddings prefix (on
+            # data.source.coop it is the sibling landmasks/ tree);
+            # --landmasks-uri points the scan there.
+            if args.landmasks_uri:
+                lm_bucket, lm_root = _parse_s3_uri(args.landmasks_uri)
+            else:
+                lm_bucket, lm_root = bucket, prefix
             console.print("\n[cyan]Discovering landmask directories...[/cyan]")
             try:
-                lm_units = _discover_landmask_prefixes(bucket, prefix, region, console)
+                lm_units = _discover_landmask_prefixes(
+                    lm_bucket, lm_root, endpoint, console
+                )
             except Exception as e:
                 console.print(f"[yellow]Could not list landmasks: {e}[/yellow]")
                 lm_units = []
@@ -2885,7 +3037,9 @@ def s3scan_command(args):
 
                 def _scan_lm_shard(shard: str):
                     out_local = []
-                    for key, size, lm in _s3_list(bucket, lm_prefix + shard, region):
+                    for key, size, lm in _s3_list(
+                        lm_bucket, lm_prefix + shard, endpoint
+                    ):
                         name = key.rsplit("/", 1)[-1]
                         m = _LANDMASK_RE.match(name)
                         if not m:
@@ -2902,7 +3056,7 @@ def s3scan_command(args):
                                 "mtime": datetime.fromisoformat(
                                     lm.replace("Z", "+00:00")
                                 ),
-                                "key": f"s3://{bucket}/{key}",
+                                "key": f"s3://{lm_bucket}/{key}",
                             }
                         )
                     return out_local
@@ -2921,6 +3075,7 @@ def s3scan_command(args):
                         f"[cyan]{version_path} landmasks[/cyan]",
                         total=len(shard_prefixes),
                     )
+                    lm_shards_failed = 0
                     with ThreadPoolExecutor(max_workers=args.workers) as pool:
                         futures = {
                             pool.submit(_scan_lm_shard, s): s for s in shard_prefixes
@@ -2932,7 +3087,19 @@ def s3scan_command(args):
                                 console.print(
                                     f"[red]  Landmask shard {futures[fut]} failed: {e}[/red]"
                                 )
+                                lm_shards_failed += 1
                             lm_progress.update(lm_task, advance=1)
+
+                if lm_shards_failed:
+                    # An incomplete landmask registry is worse than none:
+                    # skip the write so a partial file can't be uploaded.
+                    console.print(
+                        f"[red]Not writing {version_path}/landmasks.parquet: "
+                        f"{lm_shards_failed} shard(s) failed to list even "
+                        f"after retries. Re-run the scan.[/red]"
+                    )
+                    scan_had_failures = True
+                    continue
 
                 if not lm_records:
                     console.print(
@@ -2970,8 +3137,8 @@ def s3scan_command(args):
             missing = sorted(embedding_version_paths - landmask_files_by_version.keys())
             for vpath in missing:
                 console.print(
-                    f"[yellow]Warning: {vpath} has embeddings but no "
-                    f"global_0.1_degree_tiff_all/ on S3. No landmasks.parquet "
+                    f"[yellow]Warning: {vpath} has embeddings but no landmask "
+                    f"TIFFs at the scanned location. No landmasks.parquet "
                     f"will be written for {vpath}.[/yellow]"
                 )
 
@@ -2981,24 +3148,64 @@ def s3scan_command(args):
         summary: Dict[Tuple[str, str], List[int]] = defaultdict(list)
         for v, var, y in sorted(units_found):
             summary[(v, var)].append(y)
-        summary_lines = [
-            "[green]✅ S3 Scan Complete[/green]",
-            f"📊 Tiles found: {len(records):,}",
-        ]
+        if scan_had_failures or failed_datasets:
+            summary_lines = [
+                "[red]⚠ S3 Scan finished with failures[/red]",
+                f"📊 Tiles found: {len(records):,}",
+            ]
+        else:
+            summary_lines = [
+                "[green]✅ S3 Scan Complete[/green]",
+                f"📊 Tiles found: {len(records):,}",
+            ]
         for (v, var), years in sorted(summary.items()):
             summary_lines.append(
                 f"  • {v}/{var}: {', '.join(str(y) for y in sorted(years))}"
             )
+        for v, var in sorted(failed_datasets):
+            summary_lines.append(
+                f"  [red]• {v}/{var}: shards failed — manifest not written[/red]"
+            )
         summary_lines.append("📄 Output files:")
         for f in written_files:
             summary_lines.append(f"  • {f}")
-        summary_lines.append("")
-        summary_lines.append("[dim]Upload with:[/dim]")
-        summary_lines.append(
-            f"[dim]  aws s3 cp --recursive {output_dir}/ s3://{bucket}/[/dim]"
+
+        if written_files:
+            # Per-file upload hints with the correct destinations: manifests
+            # go under the npy/ tree root, landmask registries under the
+            # landmasks/ tree root. (A single recursive cp of output_dir
+            # would mix the two trees.)
+            def _tree_root(pfx: str, tail_re) -> str:
+                parts = pfx.rstrip("/").split("/") if pfx.strip("/") else []
+                if parts and tail_re.match(parts[-1]):
+                    parts = parts[:-1]
+                return "/".join(parts) + "/" if parts else ""
+
+            npy_root = _tree_root(prefix, _DATASET_DIR_RE)
+            if args.landmasks_uri:
+                lm_hint_bucket, lm_hint_root = _parse_s3_uri(args.landmasks_uri)
+            else:
+                lm_hint_bucket, lm_hint_root = bucket, prefix
+            lm_hint_root = _tree_root(lm_hint_root, _VERSION_RE)
+
+            summary_lines.append("")
+            summary_lines.append("[dim]Upload with:[/dim]")
+            for f in written_files:
+                rel = f.relative_to(output_dir).as_posix()
+                if f.name == "manifest.parquet":
+                    dest = f"s3://{bucket}/{npy_root}{rel}"
+                else:
+                    dest = f"s3://{lm_hint_bucket}/{lm_hint_root}{rel}"
+                summary_lines.append(
+                    f'[dim]  aws s3 cp "{f}" "{dest}" --endpoint-url {endpoint}[/dim]'
+                )
+        console.print(
+            Panel.fit(
+                "\n".join(summary_lines),
+                style="red" if (scan_had_failures or failed_datasets) else "green",
+            )
         )
-        console.print(Panel.fit("\n".join(summary_lines), style="green"))
-        return 0
+        return 1 if (scan_had_failures or failed_datasets) else 0
     except Exception as e:
         console.print(f"[red]Error writing parquet files: {e}[/red]")
         import traceback
@@ -3192,7 +3399,8 @@ def _detect_dataset_metadata(
 
     If the user passes the flags explicitly we honour them; otherwise we look
     for a ``tessera_metadata.json`` sidecar (written by the CLI download
-    flow) and use what it recorded. Falls back to v1/vultr.
+    flow) and use what it recorded. Falls back to v1 and the version's
+    published variant.
     """
     if explicit_version and explicit_variant:
         return explicit_version, explicit_variant
@@ -3214,7 +3422,11 @@ def _detect_dataset_metadata(
         except (OSError, ValueError):
             pass
 
-    return explicit_version or "v1", explicit_variant or "vultr"
+    from .registry import _parse_dataset_version
+
+    version = explicit_version or "v1"
+    variant = explicit_variant or default_variant(_parse_dataset_version(version)[1])
+    return version, variant
 
 
 def zarr_init_command(args):
@@ -3930,14 +4142,18 @@ Examples:
   # Specify custom output path
   geotessera-registry file-scan /path/to/embeddings --output /path/to/inventory.parquet
 
-  # Spider an S3 bucket prefix to build an inventory parquet (no AWS creds required for public buckets)
-  geotessera-registry s3scan s3://tessera-embeddings/v1/global_0.1_degree_representation
+  # Spider the Source Cooperative repository to rebuild a per-dataset manifest.
+  # Dataset dirs encode (version, variant): v1, v1.1-cam, v2-2B-L~beta1, ...
+  geotessera-registry s3scan s3://tessera/tessera/npy/v1.1-cam/ --landmasks-uri s3://tessera/tessera/landmasks/v1.1/
+
+  # Or rescan every dataset in one go:
+  geotessera-registry s3scan s3://tessera/tessera/npy/ --landmasks-uri s3://tessera/tessera/landmasks/
 
   # This will:
   # - List year subprefixes (e.g. 2024/, 2023/) via anonymous ListObjectsV2 HTTPS calls
   # - Paginate listings for each year in parallel and pair grid_*.npy with grid_*_scales.npy
   # - Use S3 LastModified/Size for the mtime/size columns (no per-object stat calls)
-  # - Emit a parquet file with the same schema as file-scan, but with s3:// URLs in path columns
+  # - Emit one manifest.parquet per dataset dir with the file-scan schema plus s3:// URLs in path columns
 
   # Check multiple inventory files for duplicate coordinates (year/lon/lat)
   geotessera-registry file-check machine1_inventory.parquet machine2_inventory.parquet machine3_inventory.parquet
@@ -4089,15 +4305,28 @@ Directory Structure:
     )
     s3scan_parser.add_argument(
         "s3_uri",
-        help="S3 URI at any level: bucket root (discovers all versions + "
-        "variants), version dir (e.g. s3://bucket/v1.1/), or variant dir "
+        help="S3 URI at any level: tree root (discovers all datasets), "
+        "dataset dir (e.g. s3://tessera/tessera/npy/v1.1-cam/ — the "
+        "directory name encodes the (version, variant) pair), or legacy "
+        "variant dir "
         "(e.g. s3://bucket/v1.1/global_0.1_degree_representation.cambridge/)",
     )
     s3scan_parser.add_argument(
-        "--region",
+        "--endpoint-url",
         type=str,
-        default="us-west-2",
-        help="AWS region of the bucket (default: us-west-2)",
+        default=TESSERA_MIRROR_ENDPOINT,
+        help="S3-compatible endpoint for path-style listing requests "
+        f"(default: {TESSERA_MIRROR_ENDPOINT})",
+    )
+    s3scan_parser.add_argument(
+        "--variant",
+        type=str,
+        default=None,
+        help="Variant recorded in the manifest when the layout carries no "
+        "variant in the path, i.e. years sit directly under a bare version "
+        "dir like v1/ (default: the version's default variant, e.g. vultr "
+        "for v1). Suffixed dataset dirs (v1.1-cam, v2-2B-L~beta1) encode "
+        "the variant in their name and ignore this.",
     )
     s3scan_parser.add_argument(
         "--workers",
@@ -4118,6 +4347,15 @@ Directory Structure:
         "--no-landmasks",
         action="store_true",
         help="Skip scanning landmask TIFFs and writing landmasks.parquet",
+    )
+    s3scan_parser.add_argument(
+        "--landmasks-uri",
+        type=str,
+        default=None,
+        help="S3 URI of the landmask tree when it is not under the embeddings "
+        "prefix, e.g. s3://tessera/tessera/landmasks/ or a version dir within "
+        "it. With this set, the landmask scan runs even when the embeddings "
+        "prefix yields no tiles, so a landmasks-only regeneration is possible.",
     )
     s3scan_parser.set_defaults(func=s3scan_command)
 
@@ -4172,7 +4410,8 @@ Directory Structure:
         type=str,
         default=None,
         help="Tessera dataset variant (e.g. vultr, cambridge). "
-        "Default: read from tessera_metadata.json in base_dir, else vultr.",
+        "Default: read from tessera_metadata.json in base_dir, else the "
+        "version's published variant.",
     )
     zarr_init_parser.set_defaults(func=zarr_init_command)
 
@@ -4226,7 +4465,8 @@ Directory Structure:
         type=str,
         default=None,
         help="Tessera dataset variant (e.g. vultr, cambridge). "
-        "Default: read from tessera_metadata.json in base_dir, else vultr.",
+        "Default: read from tessera_metadata.json in base_dir, else the "
+        "version's published variant.",
     )
     zarr_fill_parser.set_defaults(func=zarr_fill_command)
 
@@ -4431,7 +4671,7 @@ Directory Structure:
     )
     verify_parser.add_argument(
         "--store",
-        default="https://s3.us-west-2.amazonaws.com/tessera-embeddings/v1/zarr",
+        default=zarr_store_url("v1"),
         help="Zarr store URL",
     )
     verify_parser.set_defaults(func=verify_tile_command)
@@ -4446,7 +4686,7 @@ Directory Structure:
     print_parser.add_argument("--year", type=int, required=True, help="Year")
     print_parser.add_argument(
         "--store",
-        default="https://s3.us-west-2.amazonaws.com/tessera-embeddings/v1/zarr",
+        default=zarr_store_url("v1"),
         help="Zarr store URL",
     )
     print_parser.set_defaults(func=print_command)

@@ -6,9 +6,11 @@ This guide will get you up and running with GeoTessera quickly.
 .. tip::
 
    **Pick your Tessera version first.** GeoTessera publishes two model
-   versions on S3: the legacy ``1.0`` (frozen) and the newer ``1.1`` (active
-   development, ``cambridge`` variant). Prefer ``1.1 / cambridge`` for new
-   work. Add ``--dataset-version v1.1 --dataset-variant cambridge`` to every
+   versions on the Source Cooperative repository: the ``1.0``
+   (frozen) and the newer ``1.1`` variant, plus an experimental ``2.0``
+   beta. List every available dataset (and each version's default variant)
+   with ``geotessera info``.
+   Add ``--dataset-version v1.1 --dataset-variant cambridge`` to every
    command in this guide if that's the line you want. Never mix versions or
    variants within the same downstream task — they are independently learned
    feature spaces. See the main :ref:`dataset-versions` section for details.
@@ -78,7 +80,8 @@ GeoTessera supports two output formats:
 - **tiff**: Georeferenced GeoTIFF files (default, best for GIS) - fully dequantized and ready to use
 - **npy**: Quantized numpy arrays with scales and landmask TIFFs (for advanced analysis and storage efficiency)
 
-For cloud-native zarr access without downloading files, see :ref:`zarr-access` below.
+For cloud-native zarr access without downloading files (forthcoming in a
+future release), see :ref:`zarr-access` below.
 
 Download as GeoTIFF (Recommended for GIS)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -437,6 +440,14 @@ Use both numpy and GeoTIFF formats in the same workflow::
 
 Cloud-Native Zarr Access
 ~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. note::
+
+   **Zarr support is forthcoming in a future release.** The hosted Zarr
+   store has not yet been published to the Source Cooperative repository,
+   so the API below is a preview and will not find data at the default
+   location until the store is uploaded. Use the ``download`` workflow
+   above in the meantime.
 
 For interactive or large-scale analysis without downloading files, use the Zarr
 store. This streams data directly from the cloud::

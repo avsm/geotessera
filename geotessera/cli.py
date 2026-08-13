@@ -266,15 +266,19 @@ def info(
     dataset_version: Annotated[
         str,
         typer.Option(
-            "--dataset-version", help="Tessera dataset version (e.g., v1, v1.1)"
+            "--dataset-version",
+            help="Tessera dataset version (e.g. v1, v1.1, v2; default v1)",
         ),
     ] = "v1",
     dataset_variant: Annotated[
-        str,
+        Optional[str],
         typer.Option(
-            "--dataset-variant", help="Tessera dataset variant (default: vultr)"
+            "--dataset-variant",
+            help="Tessera dataset variant (default: the version's default "
+            "variant, e.g. vultr for v1, cambridge for v1.1, 2B-L~beta1 "
+            "for v2). Run 'geotessera info' to list available datasets.",
         ),
-    ] = "vultr",
+    ] = None,
     verbose: Annotated[
         bool, typer.Option("--verbose", "-v", help="Verbose output")
     ] = False,
@@ -465,6 +469,32 @@ def info(
             )
         )
 
+        # List every known (version, variant) dataset so users can discover
+        # valid --dataset-version/--dataset-variant combinations.
+        from geotessera.registry import KNOWN_DATASETS, VERSION_DEFAULT_VARIANTS
+
+        datasets_table = create_table(box=None)
+        datasets_table.add_column("Version")
+        datasets_table.add_column("Variant")
+        datasets_table.add_column("Repository dir")
+        datasets_table.add_column("Status")
+        for ds_version, ds_variant, ds_dir in KNOWN_DATASETS:
+            is_default = VERSION_DEFAULT_VARIANTS.get(ds_version) == ds_variant
+            datasets_table.add_row(
+                ds_version,
+                ds_variant + (" (default)" if is_default else ""),
+                ds_dir or "-",
+                "available" if ds_dir else "coming soon",
+            )
+        rprint(
+            create_panel(
+                datasets_table,
+                title="[bold]📚 Known Datasets[/bold] "
+                "(select with --dataset-version/--dataset-variant)",
+                border_style="cyan",
+            )
+        )
+
 
 @app.command()
 def coverage(
@@ -547,7 +577,7 @@ def coverage(
         Optional[str],
         typer.Option(
             "--dataset-version",
-            help="Tessera dataset version (e.g. v1, v1.1). Defaults to v1 "
+            help="Tessera dataset version (e.g. v1, v1.1, v2). Defaults to v1 "
             "for the single-source view; with --by-source, omitting this "
             "flag means 'all known versions'. Pass 'all' explicitly to "
             "force the multi-version view.",
@@ -557,9 +587,11 @@ def coverage(
         Optional[str],
         typer.Option(
             "--dataset-variant",
-            help="Tessera dataset variant. Defaults to vultr for the "
-            "single-source view; with --by-source, omitting this means "
-            "'all variants'. Pass 'all' explicitly to force the multi-variant view.",
+            help="Tessera dataset variant. Defaults to the version's "
+            "default variant for the single-source view; with --by-source, "
+            "omitting this means 'all variants'. Pass 'all' explicitly to "
+            "force the multi-variant view. Run 'geotessera info' to list "
+            "available datasets.",
         ),
     ] = None,
     cache_dir: Annotated[
@@ -755,8 +787,14 @@ def coverage(
         version_spec = dataset_version if dataset_version is not None else "all"
         variant_spec = dataset_variant if dataset_variant is not None else "all"
     else:
+        from geotessera.registry import _parse_dataset_version, default_variant
+
         version_spec = dataset_version if dataset_version is not None else "v1"
-        variant_spec = dataset_variant if dataset_variant is not None else "vultr"
+        variant_spec = (
+            dataset_variant
+            if dataset_variant is not None
+            else default_variant(_parse_dataset_version(version_spec)[1])
+        )
 
     # The placeholder GeoTessera below initialises one Registry to get its
     # cache paths; additional manifests are downloaded into the same cache
@@ -833,40 +871,44 @@ def coverage(
                 region_file_to_use = country_geojson_file
 
             if by_source:
-                # Multi-source render. With per-version manifests on S3 we
-                # download one manifest per requested dataset version and
-                # concat them in the renderer.
+                # Multi-source render. Download one manifest per requested
+                # dataset (npy/ directory) and concatenate them in the
+                # renderer.
                 from geotessera.visualization import visualize_sources_coverage
                 from geotessera.registry import (
                     _parse_dataset_version,
                     download_file_to_temp,
-                    KNOWN_VERSIONS,
-                    TESSERA_BASE_URL,
+                    manifest_url,
+                    published_datasets,
                 )
 
                 if version_spec.lower() == "all":
-                    target_version_paths = list(KNOWN_VERSIONS)
+                    target_dataset_dirs = [d for _v, _var, d in published_datasets()]
                 else:
-                    vpath, _ = _parse_dataset_version(version_spec)
-                    target_version_paths = [vpath]
+                    _vpath, vnorm = _parse_dataset_version(version_spec)
+                    target_dataset_dirs = [
+                        d for v, _var, d in published_datasets() if v == vnorm
+                    ]
 
                 manifest_paths = []
-                for vp in target_version_paths:
+                for dataset_dir in target_dataset_dirs:
                     cache_path = (
-                        gt.registry._registry_cache_dir / vp / "manifest.parquet"
+                        gt.registry._registry_cache_dir
+                        / dataset_dir
+                        / "manifest.parquet"
                     )
                     cache_path.parent.mkdir(parents=True, exist_ok=True)
-                    if vp == gt.registry._version_path:
+                    if dataset_dir == gt.registry._dataset_path:
                         # Already downloaded during GeoTessera init.
                         manifest_paths.append(gt.registry.manifest_path)
                         continue
-                    url = f"{TESSERA_BASE_URL}/{vp}/manifest.parquet"
+                    url = manifest_url(dataset_dir)
                     try:
                         manifest_paths.append(
                             Path(download_file_to_temp(url, cache_path=cache_path))
                         )
                     except Exception as e:
-                        rprint(f"[yellow]Skipping {vp}: {e}[/yellow]")
+                        rprint(f"[yellow]Skipping {dataset_dir}: {e}[/yellow]")
 
                 if not manifest_paths:
                     rprint("[red]No manifests available to render.[/red]")
@@ -960,7 +1002,7 @@ def coverage(
             #   --by-source coverage: every (version, variant) the user asked for.
             from geotessera.registry import (
                 _parse_dataset_version,
-                KNOWN_VERSIONS,
+                published_datasets,
             )
 
             datasets_to_export = []  # list of dicts: {dataset_version, dataset_variant, dataset_id, color}
@@ -974,21 +1016,16 @@ def coverage(
                 (140, 86, 75),  # tab:brown
             ]
             if by_source:
-                # Walk the same combos that the static PNG rendered.
-                version_paths = (
-                    list(KNOWN_VERSIONS)
-                    if version_spec.lower() == "all"
-                    else [_parse_dataset_version(version_spec)[0]]
-                )
-                # For variant we'd ideally probe each manifest; for now treat
-                # 'all' as the wildcard and let the per-dataset GeoTessera init
-                # fail-soft if the (version, variant) pair has no rows.
-                variant_choices = (
-                    [variant_spec]
-                    if variant_spec.lower() != "all"
-                    else ["vultr", "cambridge"]  # current known variants
-                )
-                combos = [(v, var) for v in version_paths for var in variant_choices]
+                # Walk the same combos that the static PNG rendered: the
+                # published (version, variant) datasets, narrowed by any
+                # explicit --dataset-version/--dataset-variant.
+                pubs = published_datasets()
+                if version_spec.lower() != "all":
+                    _vpath, vnorm = _parse_dataset_version(version_spec)
+                    pubs = [p for p in pubs if p[0] == vnorm]
+                if variant_spec.lower() != "all":
+                    pubs = [p for p in pubs if p[1] == variant_spec]
+                combos = [(v, var) for v, var, _d in pubs]
             else:
                 combos = [(init_version, init_variant)]
 
@@ -1182,15 +1219,19 @@ def download(
     dataset_version: Annotated[
         str,
         typer.Option(
-            "--dataset-version", help="Tessera dataset version (e.g., v1, v1.1)"
+            "--dataset-version",
+            help="Tessera dataset version (e.g. v1, v1.1, v2; default v1)",
         ),
     ] = "v1",
     dataset_variant: Annotated[
-        str,
+        Optional[str],
         typer.Option(
-            "--dataset-variant", help="Tessera dataset variant (default: vultr)"
+            "--dataset-variant",
+            help="Tessera dataset variant (default: the version's default "
+            "variant, e.g. vultr for v1, cambridge for v1.1, 2B-L~beta1 "
+            "for v2). Run 'geotessera info' to list available datasets.",
         ),
-    ] = "vultr",
+    ] = None,
     cache_dir: Annotated[
         Optional[Path], typer.Option("--cache-dir", help="Cache directory")
     ] = None,
@@ -1745,7 +1786,7 @@ def download(
                 sidecar = write_tessera_metadata(
                     output,
                     dataset_version=dataset_version,
-                    dataset_variant=dataset_variant,
+                    dataset_variant=gt.dataset_variant,
                     extra={
                         "format": format,
                         "year": year,

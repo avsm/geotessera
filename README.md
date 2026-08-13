@@ -101,9 +101,9 @@ The Tessera embeddings use a **0.1-degree grid system**:
 
 ### File Structure and Downloads
 
-When you request embeddings, GeoTessera downloads files from the public S3
-bucket (using anonymous, unsigned requests) into the output directory you
-specify, where they persist for re-use:
+When you request embeddings, GeoTessera downloads files over HTTPS from the
+public Source Cooperative repository into the output directory you specify,
+where they persist for re-use:
 
 #### Embedding Files (via `fetch_embedding`)
 1. **Quantized embeddings** (`grid_X.XX_Y.YY.npy`):
@@ -136,7 +136,7 @@ User Request (lat/lon bbox)
     ↓
 Parquet Registry Lookup (find available tiles from manifest.parquet)
     ↓
-Anonymous S3 Downloads to Output Directory (CRC64NVMe verified)
+HTTPS Downloads from Source Cooperative to Output Directory (integrity verified)
     ├── embedding.npy (quantized) → output dir
     └── embedding_scales.npy → output dir
     ↓
@@ -147,9 +147,10 @@ Output Format
     └── GeoTIFF → GIS integration
 ```
 
-**Storage Note**: Only the per-version Parquet manifests (~few MB each) are
-cached under `~/.cache/geotessera`. Embedding tiles are downloaded on demand
-into the output directory you specify and persist there for re-use across runs.
+**Storage Note**: Only the Parquet manifests (tens to a couple of hundred
+MB per dataset) are cached under `~/.cache/geotessera`. Embedding tiles are
+downloaded on demand into the output directory you specify and persist there
+for re-use across runs.
 
 ## Quick Start
 
@@ -334,6 +335,13 @@ visualize_global_coverage(
 
 ## Cloud-Native Zarr Access
 
+> [!NOTE]
+> **Zarr support is forthcoming in a future release.** The hosted Zarr store
+> has not yet been published to the new Source Cooperative repository, so the
+> `GeoTesseraZarr` API below is a preview and will not find data at the
+> default location until the store is uploaded. Use the `download` workflow
+> above in the meantime.
+
 For interactive or large-scale analysis without downloading files, use the Zarr store.
 This streams data directly from the cloud:
 
@@ -379,7 +387,7 @@ Options:
   -f, --format TEXT        Output format: 'tiff' or 'npy' (default: tiff)
   --year INT               Year of embeddings (default: 2024)
   --dataset-version TEXT   Tessera dataset version (e.g. v1, v1.1)
-  --dataset-variant TEXT   Tessera dataset variant (default: vultr)
+  --dataset-variant TEXT   Tessera dataset variant (default: the version's default variant; list with `geotessera info`)
   --bands TEXT             Comma-separated band indices (default: all 128)
   --compress TEXT          Compression for TIFF format (default: lzw)
   --dry-run                Calculate total download size without downloading
@@ -449,7 +457,7 @@ Options:
   --tile TEXT              Single tile by any point within it: 'lon,lat'
   --by-source              Render each (version, variant) source in a distinct colour
   --dataset-version TEXT   Tessera dataset version (e.g. v1, v1.1; or 'all' with --by-source)
-  --dataset-variant TEXT   Tessera dataset variant (default: vultr; or 'all' with --by-source)
+  --dataset-variant TEXT   Tessera dataset variant (default: the version's default variant; or 'all' with --by-source)
   --region-file PATH       GeoJSON/Shapefile to focus on specific region
   --country TEXT           Country name to focus on (e.g., 'United Kingdom')
   --tile-color TEXT        Color for tiles (default: red)
@@ -483,7 +491,7 @@ geotessera info [OPTIONS]
 Options:
   --tiles PATH             Analyze tile files/directory (GeoTIFF or NPY format)
   --dataset-version TEXT   Tessera dataset version (e.g. v1, v1.1)
-  --dataset-variant TEXT   Tessera dataset variant (default: vultr)
+  --dataset-variant TEXT   Tessera dataset variant (default: the version's default variant; list with `geotessera info`)
   -v, --verbose            Verbose output
 ```
 
@@ -497,17 +505,32 @@ GeoTessera uses a Parquet-based registry system to efficiently manage and access
   listing every `(year, lon, lat)` tile available for that version's variants
 - **Fast queries**: Uses pandas DataFrames for efficient spatial and temporal filtering
 - **Block-based organization**: Internal 5×5 degree geographic blocks for efficient queries
-- **Minimal storage**: Manifest files are ~few MB each and cached locally
-- **Integrity checking**: End-to-end CRC64NVMe checksums verified against S3's
-  `x-amz-checksum-crc64nvme` response header during each download
-  - **Always enforced** for data integrity — a checksum mismatch (or a missing checksum header) rejects the download
+- **Minimal storage**: Only manifest files (tens to a couple of hundred MB per dataset) are cached locally
+- **Integrity checking**: Every download is verified against the response
+  `Content-Length`, and against an MD5 computed over the streamed body whenever
+  the server's `ETag` is a content MD5 (single-part uploads)
+  - A mismatch rejects the download and triggers a retry, so corrupt or
+    truncated files never reach the cache
 
 ### Dataset Versions and Variants
 
-Tessera embeddings are published as dataset *versions* (e.g. `v1`, `v1.1`) and,
-within a version, as *variants* produced by different model runs (e.g. the
-default `vultr`, or `cambridge`). Select them on the CLI with `--dataset-version`
-and `--dataset-variant`, or in Python:
+Tessera embeddings are published as dataset *versions* (e.g. `v1`, `v1.1`,
+`v2`) and, within a version, as *variants* produced by different model runs.
+Each `(version, variant)` pair — a *dataset* — has its own directory in the
+repository's `npy/` tree:
+
+| Version | Variant                | `npy/` directory | Status      |
+|---------|------------------------|------------------|-------------|
+| `1.0`   | `vultr` (default)      | `v1/`            | available   |
+| `1.1`   | `cambridge` (default)  | `v1.1-cam/`      | available   |
+| `1.1`   | `dclimate`             | —                | coming soon |
+| `2.0`   | `2B-L~beta1` (default) | `v2-2B-L~beta1/` | available   |
+
+The v1 series predates the variant-suffix scheme, so all its variants share
+the bare `v1/` directory. The library defaults remain `dataset_version="v1"`
+and `year=2024` — the only combination with full global coverage today.
+List the datasets at any time with `geotessera info`, and select them on the
+CLI with `--dataset-version` and `--dataset-variant`, or in Python:
 
 ```python
 gt = GeoTessera(dataset_version="v1.1", dataset_variant="cambridge")
@@ -523,7 +546,7 @@ The registry can be loaded from multiple sources (in priority order):
 1. **Local file** (via `registry_path` parameter)
 2. **Local directory** (via `--registry-dir` or `registry_dir` parameter, looks for `manifest.parquet`, falling back to the legacy `registry.parquet`)
 3. **Remote URL** (via `registry_url` parameter)
-4. **Default remote** (from `https://s3.us-west-2.amazonaws.com/tessera-embeddings/{version}/manifest.parquet`)
+4. **Default remote** (from `https://data.source.coop/tessera/tessera/npy/{dataset}/manifest.parquet`, where `{dataset}` encodes the (version, variant) pair: `v1`, `v1.1-cam`, `v2-2B-L~beta1`)
 
 ```python
 # Use local manifest file
@@ -550,13 +573,57 @@ manifest = pd.read_parquet("manifest.parquet")
 print(manifest.head())
 ```
 
+### Regenerating Manifests (Maintainers)
+
+The per-version manifests can be rebuilt at any time by scanning the public
+Source Cooperative repository itself — no local copy of the data is needed:
+
+```bash
+# Rescan every dataset and write one manifest per npy/ directory
+# (./manifests/{v1,v1.1-cam,v2-2B-L~beta1}/manifest.parquet) plus a
+# per-version landmasks.parquet (./manifests/{v1,v1.1,v2}/landmasks.parquet)
+geotessera-registry s3scan s3://tessera/tessera/npy/ \
+    --landmasks-uri s3://tessera/tessera/landmasks/ \
+    --output ./manifests
+
+# Or scope to a single dataset — the directory name encodes the
+# (version, variant) pair, so no --variant flag is needed
+geotessera-registry s3scan "s3://tessera/tessera/npy/v1.1-cam/" \
+    --landmasks-uri s3://tessera/tessera/landmasks/v1.1/ \
+    --output ./manifests
+```
+
+The scan uses anonymous S3 `ListObjectsV2` calls against
+`https://data.source.coop`, so no credentials are required to regenerate.
+Uploading the results does require source.coop write access, and the two
+parquet files go to *different* trees (matching where clients fetch them —
+note the npy/ tree is keyed by dataset directory, the landmasks/ tree by
+plain version):
+
+```bash
+aws s3 cp manifests/v1.1-cam/manifest.parquet \
+    s3://tessera/tessera/npy/v1.1-cam/manifest.parquet \
+    --endpoint-url https://data.source.coop
+aws s3 cp manifests/v1.1/landmasks.parquet \
+    s3://tessera/tessera/landmasks/v1.1/landmasks.parquet \
+    --endpoint-url https://data.source.coop
+```
+
+The `s3scan` summary panel prints these per-file upload commands for you.
+Transient listing failures (Cloudflare 503s, timeouts) are retried with
+exponential backoff; if a shard still fails after retries, the affected
+manifest is not written and the command exits non-zero so an incomplete
+manifest can never be uploaded. See the
+[maintenance guide](https://geotessera.readthedocs.io/en/latest/maintenance.html)
+for the full workflow, including caching caveats.
+
 ### How Registry Loading Works
 
-1. **Load Parquet manifest** → Download and cache the version's manifest (if not local)
+1. **Load Parquet manifest** → Download and cache the dataset's manifest (if not local)
 2. **Request tiles for bbox** → Query DataFrame for tiles in region
 3. **Filter by year and variant** → Select tiles matching the requested year/variant
 4. **Find available tiles** → Return list of matching tiles
-5. **Anonymous S3 download** → Fetch tiles on demand into the output directory, verified with CRC64NVMe
+5. **HTTPS download** → Fetch tiles on demand from the Source Cooperative mirror into the output directory, with integrity checks
 6. **Persist** → Downloaded tiles stay in the output directory and are skipped on rerun
 
 ## Data Organization
@@ -564,30 +631,45 @@ print(manifest.head())
 ### Tessera Data Structure
 
 ```
-Remote Server (https://s3.us-west-2.amazonaws.com/tessera-embeddings)
-├── v1/                                        # Dataset version 1.0
-│   ├── manifest.parquet                       # Per-version tile manifest
-│   ├── landmasks.parquet                      # Landmask manifest
-│   ├── global_0.1_degree_representation/      # vultr variant (default)
+Remote Server (https://data.source.coop/tessera/tessera)
+├── npy/                                       # NPY embeddings + scales
+│   │                                          # (one dir per (version, variant) dataset)
+│   ├── v1/                                    # 1.0 — all variants share this dir
+│   │   ├── manifest.parquet                   # Per-dataset tile manifest
 │   │   └── 2024/grid_0.15_52.05/grid_0.15_52.05{,_scales}.npy
-│   └── global_0.1_degree_tiff_all/
-│       └── grid_0.15_52.05.tiff               # Landmask with projection info
-└── v1.1/                                      # Dataset version 1.1
-    ├── manifest.parquet
-    ├── landmasks.parquet
-    └── global_0.1_degree_representation.cambridge/
-        └── 2024/grid_0.15_52.05/grid_0.15_52.05{,_scales}.npy
+│   ├── v1.1-cam/                              # 1.1 / cambridge
+│   │   ├── manifest.parquet
+│   │   └── 2024/grid_0.15_52.05/grid_0.15_52.05{,_scales}.npy
+│   └── v2-2B-L~beta1/                         # 2.0 / 2B-L~beta1 (beta)
+│       └── 2024/grid_0.15_52.05/grid_0.15_52.05{,_scales}.npy
+├── landmasks/                                 # Landmask TIFFs (per version)
+│   ├── v1/
+│   │   ├── landmasks.parquet                  # Landmask manifest
+│   │   └── grid_0.15_52.05.tiff               # Landmask with projection info
+│   ├── v1.1/
+│   │   ├── landmasks.parquet
+│   │   └── grid_0.15_52.05.tiff
+│   └── v2/
+│       ├── landmasks.parquet
+│       └── grid_0.15_52.05.tiff
+└── zarr/                                      # Cloud-native zarr store
+    └── v1/                                    # (forthcoming in a future release)
 ```
 
 ### Local Cache Structure
 
 ```
 ~/.cache/geotessera/                 # Default cache location (manifests only)
-├── v1/
-│   ├── manifest.parquet             # Cached per-version manifest (~few MB)
+├── v1/                              # 1.0 dataset dir + v1 landmask registry
+│   ├── manifest.parquet
 │   └── landmasks.parquet
-└── v1.1/
-    ├── manifest.parquet
+├── v1.1-cam/                        # 1.1/cambridge dataset dir
+│   └── manifest.parquet
+├── v1.1/                            # v1.1 landmask registry
+│   └── landmasks.parquet
+├── v2-2B-L~beta1/                   # 2.0 beta dataset dir
+│   └── manifest.parquet
+└── v2/                              # v2 landmask registry
     └── landmasks.parquet
 
 # Note: Embedding and landmask tiles are NOT stored here. They are downloaded
@@ -602,7 +684,7 @@ Remote Server (https://s3.us-west-2.amazonaws.com/tessera-embeddings)
 
 ## Cache Configuration
 
-GeoTessera caches only the per-version Parquet manifests (~few MB each). Embedding and landmask tiles are downloaded into the output directory you specify and persist there for re-use across runs.
+GeoTessera caches only the per-dataset Parquet manifests (tens to a couple of hundred MB each). Embedding and landmask tiles are downloaded into the output directory you specify and persist there for re-use across runs.
 
 ### Python API
 
@@ -634,7 +716,7 @@ When `cache_dir` is not specified, the registry is cached in platform-appropriat
 
 ## Hash Verification
 
-GeoTessera verifies end-to-end CRC64NVMe checksums for all downloaded files (embeddings, scales, and landmasks) against S3's `x-amz-checksum-crc64nvme` response header to ensure data integrity. This check is always enforced: a download whose checksum does not match — or whose S3 object is missing the checksum header — is rejected rather than used, so corrupt or truncated files never reach the cache.
+GeoTessera verifies every downloaded file (embeddings, scales, and landmasks) against the response `Content-Length`, and additionally against an MD5 computed over the streamed body whenever the server's `ETag` is a content MD5 (a single-part upload; this covers landmask TIFFs and scales files). Large multipart-uploaded embedding tiles carry a composite ETag that is not a content hash, so they are length-checked only. A mismatch rejects the download and triggers a retry with backoff, so corrupt or truncated files never reach the cache.
 
 ## Contributing
 
