@@ -32,7 +32,13 @@
   Mostly only for repairs and not regular use.
 - `geotessera-registry s3scan` scans Source Cooperative to list
   embeddings. This allows manifests and landmask registries to be
-  regenerated directly from the Source Cooperative repository (@avsm)
+  regenerated directly from the Source Cooperative repository. Listing
+  requests retry transient failures (429/5xx, timeouts, connection
+  resets) with exponential backoff; if a shard still fails after all
+  retries the affected manifest is not written and the command exits
+  non-zero, so an incomplete manifest can never be uploaded. The summary
+  panel prints per-file `aws s3 cp` upload commands with the correct
+  per-tree destinations (@avsm)
 
 ## v0.9.0 (2026-06-09)
 

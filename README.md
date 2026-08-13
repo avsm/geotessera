@@ -609,7 +609,12 @@ aws s3 cp manifests/v1.1/landmasks.parquet \
     --endpoint-url https://data.source.coop
 ```
 
-See the [maintenance guide](https://geotessera.readthedocs.io/en/latest/maintenance.html)
+The `s3scan` summary panel prints these per-file upload commands for you.
+Transient listing failures (Cloudflare 503s, timeouts) are retried with
+exponential backoff; if a shard still fails after retries, the affected
+manifest is not written and the command exits non-zero so an incomplete
+manifest can never be uploaded. See the
+[maintenance guide](https://geotessera.readthedocs.io/en/latest/maintenance.html)
 for the full workflow, including caching caveats.
 
 ### How Registry Loading Works

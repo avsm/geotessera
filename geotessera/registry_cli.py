@@ -2449,6 +2449,14 @@ def _parse_s3_uri(uri: str) -> Tuple[str, str]:
     return bucket, prefix
 
 
+# Transient HTTP statuses worth retrying during listings: rate limiting
+# and server/CDN-side errors (Cloudflare fronting data.source.coop returns
+# 503s under load).
+_RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
+# Per-page attempts: 6 tries with 1, 2, 4, 8, 16s backoff (~31s worst case).
+_S3_LIST_ATTEMPTS = 6
+
+
 def _s3_list(
     bucket: str,
     prefix: str,
@@ -2462,8 +2470,18 @@ def _s3_list(
     ``https://data.source.coop``). Follows continuation tokens until the
     listing is exhausted. If delimiter is set, yields CommonPrefixes as
     (prefix, 0, "") tuples instead of object contents.
+
+    Each page request is retried with exponential backoff on transient
+    failures (429/5xx, timeouts, connection resets, truncated bodies).
+    Retrying happens before any of the page's entries are yielded, so the
+    stream never contains duplicates; the continuation token makes the
+    re-request idempotent. A page that still fails after all attempts
+    raises RuntimeError.
     """
+    import time as _time
     import xml.etree.ElementTree as ET
+    from http.client import HTTPException
+    from urllib.error import HTTPError, URLError
     from urllib.parse import urlencode
     from urllib.request import Request, urlopen
 
@@ -2477,12 +2495,39 @@ def _s3_list(
             params["delimiter"] = delimiter
         if token is not None:
             params["continuation-token"] = token
-        request = Request(
-            base + "?" + urlencode(params),
-            headers={"User-Agent": f"geotessera/{__version__}"},
-        )
-        with urlopen(request, timeout=60) as resp:
-            root = ET.parse(resp).getroot()
+        url = base + "?" + urlencode(params)
+
+        root = None
+        last_err: Optional[BaseException] = None
+        for attempt in range(_S3_LIST_ATTEMPTS):
+            if attempt:
+                _time.sleep(2 ** (attempt - 1))
+            request = Request(
+                url,
+                headers={"User-Agent": f"geotessera/{__version__}"},
+            )
+            try:
+                with urlopen(request, timeout=60) as resp:
+                    body = resp.read()
+                root = ET.fromstring(body)
+                break
+            except HTTPError as e:
+                if e.code not in _RETRYABLE_HTTP_CODES:
+                    raise
+                last_err = e
+            except (
+                URLError,
+                TimeoutError,
+                ConnectionError,
+                HTTPException,
+                ET.ParseError,
+            ) as e:
+                last_err = e
+        if root is None:
+            raise RuntimeError(
+                f"S3 listing failed after {_S3_LIST_ATTEMPTS} attempts "
+                f"for {url}: {last_err}"
+            ) from last_err
 
         if delimiter is not None:
             for cp in root.findall(f"{S3_NS}CommonPrefixes"):
@@ -2828,6 +2873,10 @@ def s3scan_command(args):
 
     records: List[Dict] = []
     units_found = set()
+    # (version, variant) datasets that lost one or more shards even after
+    # _s3_list's built-in retries. Their manifests would be silently
+    # incomplete, so they are not written.
+    failed_datasets: set = set()
     tile_counts: Dict[Tuple[str, str, int], int] = {
         (v, var, y): 0 for v, var, y, _ in scan_units
     }
@@ -2873,6 +2922,7 @@ def s3scan_command(args):
                     console.print(
                         f"[red]Error scanning {v}/{var}/{y}/{shard}: {e}[/red]"
                     )
+                    failed_datasets.add((v, var))
                     shards_left[key] -= 1
                     continue
                 if out:
@@ -2907,6 +2957,9 @@ def s3scan_command(args):
     # whole output can be uploaded with
     # ``aws s3 cp --recursive <output_dir>/ s3://<bucket>/``.
     written_files: List[Path] = []
+    # Set when a landmask scan loses shards; embedding-side losses are
+    # tracked in failed_datasets. Either makes the run exit non-zero.
+    scan_had_failures = False
     try:
         if records:
             df = pd.DataFrame(records)
@@ -2921,7 +2974,18 @@ def s3scan_command(args):
                 dataset_path(str(v), str(var))
                 for v, var in zip(df["version"], df["variant"])
             ]
+            failed_dataset_dirs = {
+                dataset_path(str(v), str(var)) for v, var in failed_datasets
+            }
             for dataset_dir, group_df in df.groupby("_dataset_dir", sort=True):
+                if dataset_dir in failed_dataset_dirs:
+                    console.print(
+                        f"[red]Not writing {dataset_dir}/manifest.parquet: "
+                        f"one or more lon-shards failed to list even after "
+                        f"retries, so the manifest would be incomplete. "
+                        f"Re-run the scan for this dataset.[/red]"
+                    )
+                    continue
                 group_df = group_df.drop(columns=["_dataset_dir"])
                 # Defensive dedupe: bucket-side misfiling (e.g. a tile filed
                 # under the wrong grid directory) can surface the same key
@@ -3011,6 +3075,7 @@ def s3scan_command(args):
                         f"[cyan]{version_path} landmasks[/cyan]",
                         total=len(shard_prefixes),
                     )
+                    lm_shards_failed = 0
                     with ThreadPoolExecutor(max_workers=args.workers) as pool:
                         futures = {
                             pool.submit(_scan_lm_shard, s): s for s in shard_prefixes
@@ -3022,7 +3087,19 @@ def s3scan_command(args):
                                 console.print(
                                     f"[red]  Landmask shard {futures[fut]} failed: {e}[/red]"
                                 )
+                                lm_shards_failed += 1
                             lm_progress.update(lm_task, advance=1)
+
+                if lm_shards_failed:
+                    # An incomplete landmask registry is worse than none:
+                    # skip the write so a partial file can't be uploaded.
+                    console.print(
+                        f"[red]Not writing {version_path}/landmasks.parquet: "
+                        f"{lm_shards_failed} shard(s) failed to list even "
+                        f"after retries. Re-run the scan.[/red]"
+                    )
+                    scan_had_failures = True
+                    continue
 
                 if not lm_records:
                     console.print(
@@ -3071,24 +3148,64 @@ def s3scan_command(args):
         summary: Dict[Tuple[str, str], List[int]] = defaultdict(list)
         for v, var, y in sorted(units_found):
             summary[(v, var)].append(y)
-        summary_lines = [
-            "[green]✅ S3 Scan Complete[/green]",
-            f"📊 Tiles found: {len(records):,}",
-        ]
+        if scan_had_failures or failed_datasets:
+            summary_lines = [
+                "[red]⚠ S3 Scan finished with failures[/red]",
+                f"📊 Tiles found: {len(records):,}",
+            ]
+        else:
+            summary_lines = [
+                "[green]✅ S3 Scan Complete[/green]",
+                f"📊 Tiles found: {len(records):,}",
+            ]
         for (v, var), years in sorted(summary.items()):
             summary_lines.append(
                 f"  • {v}/{var}: {', '.join(str(y) for y in sorted(years))}"
             )
+        for v, var in sorted(failed_datasets):
+            summary_lines.append(
+                f"  [red]• {v}/{var}: shards failed — manifest not written[/red]"
+            )
         summary_lines.append("📄 Output files:")
         for f in written_files:
             summary_lines.append(f"  • {f}")
-        summary_lines.append("")
-        summary_lines.append("[dim]Upload with:[/dim]")
-        summary_lines.append(
-            f"[dim]  aws s3 cp --recursive {output_dir}/ s3://{bucket}/[/dim]"
+
+        if written_files:
+            # Per-file upload hints with the correct destinations: manifests
+            # go under the npy/ tree root, landmask registries under the
+            # landmasks/ tree root. (A single recursive cp of output_dir
+            # would mix the two trees.)
+            def _tree_root(pfx: str, tail_re) -> str:
+                parts = pfx.rstrip("/").split("/") if pfx.strip("/") else []
+                if parts and tail_re.match(parts[-1]):
+                    parts = parts[:-1]
+                return "/".join(parts) + "/" if parts else ""
+
+            npy_root = _tree_root(prefix, _DATASET_DIR_RE)
+            if args.landmasks_uri:
+                lm_hint_bucket, lm_hint_root = _parse_s3_uri(args.landmasks_uri)
+            else:
+                lm_hint_bucket, lm_hint_root = bucket, prefix
+            lm_hint_root = _tree_root(lm_hint_root, _VERSION_RE)
+
+            summary_lines.append("")
+            summary_lines.append("[dim]Upload with:[/dim]")
+            for f in written_files:
+                rel = f.relative_to(output_dir).as_posix()
+                if f.name == "manifest.parquet":
+                    dest = f"s3://{bucket}/{npy_root}{rel}"
+                else:
+                    dest = f"s3://{lm_hint_bucket}/{lm_hint_root}{rel}"
+                summary_lines.append(
+                    f'[dim]  aws s3 cp "{f}" "{dest}" --endpoint-url {endpoint}[/dim]'
+                )
+        console.print(
+            Panel.fit(
+                "\n".join(summary_lines),
+                style="red" if (scan_had_failures or failed_datasets) else "green",
+            )
         )
-        console.print(Panel.fit("\n".join(summary_lines), style="green"))
-        return 0
+        return 1 if (scan_had_failures or failed_datasets) else 0
     except Exception as e:
         console.print(f"[red]Error writing parquet files: {e}[/red]")
         import traceback

@@ -125,13 +125,19 @@ upload each to its matching location::
         s3://tessera/tessera/landmasks/v1.1/landmasks.parquet \
         --endpoint-url https://data.source.coop
 
-.. warning::
+The summary panel printed at the end of ``s3scan`` includes ready-made
+per-file ``aws s3 cp`` commands with these destinations filled in, so you
+can paste them directly (adding your credentials). Avoid a single
+recursive copy of the whole output directory: it would place
+``landmasks.parquet`` under the ``npy/`` tree, where clients will never
+look for it.
 
-   The summary panel printed at the end of ``s3scan`` suggests a single
-   recursive ``aws s3 cp`` of the whole output directory. Do not follow it
-   literally: it would place ``landmasks.parquet`` under the ``npy/`` tree,
-   where clients will never look for it. Copy the files individually as
-   shown above.
+``s3scan`` retries transient listing failures (Cloudflare 503s, timeouts,
+connection resets) with exponential backoff — six attempts per request. If
+a shard still fails after all retries, the manifest for that dataset is
+**not written** (a silently incomplete manifest is worse than a failed
+run), the failure is called out in the summary, and the command exits
+non-zero; re-run the scan for that dataset.
 
 .. note::
 
