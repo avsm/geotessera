@@ -16,8 +16,6 @@ import hashlib
 import logging
 import numpy as np
 import time
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 from email.utils import formatdate, parsedate_to_datetime
 
@@ -515,6 +513,53 @@ def format_bytes(num_bytes: float) -> str:
     return f"{num_bytes:.1f} TB"
 
 
+class HTTPStatusError(OSError):
+    """Non-retryable HTTP status (e.g. 403/404) from the download endpoint.
+
+    Retryable statuses (429/5xx) never surface here — urllib3's ``Retry``
+    handles them internally and raises ``MaxRetryError`` when exhausted.
+    """
+
+    def __init__(self, url: str, status: int, reason: Optional[str]):
+        super().__init__(f"HTTP {status} {reason or ''} for {url}".rstrip())
+        self.url = url
+        self.status = status
+
+
+_pool = None
+
+
+def _http():
+    """Shared urllib3 pool for all plain-HTTPS traffic (downloads, listings).
+
+    One pool per process: connections to the CDN are reused across the
+    thousands of per-tile GETs in a region download instead of paying a TCP
+    + TLS handshake each. Retries on 429/5xx (honouring ``Retry-After``),
+    connection failures, and read errors are handled by urllib3's ``Retry``
+    with exponential backoff; urllib3 v2 also enforces ``Content-Length``,
+    so a truncated body raises instead of ending the stream silently.
+    """
+    global _pool
+    if _pool is None:
+        import urllib3
+
+        from . import __version__
+
+        _pool = urllib3.PoolManager(
+            # The Source Cooperative CDN rejects some default client
+            # User-Agents with a 403, so identify as geotessera.
+            headers={"User-Agent": f"geotessera/{__version__}"},
+            retries=urllib3.Retry(
+                total=5,
+                backoff_factor=1,  # 1, 2, 4, 8, 16s between attempts
+                status_forcelist=(429, 500, 502, 503, 504),
+                respect_retry_after_header=True,
+            ),
+            timeout=urllib3.Timeout(connect=15, read=60),
+        )
+    return _pool
+
+
 def download_file_to_temp(
     url: str,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
@@ -522,12 +567,14 @@ def download_file_to_temp(
 ) -> str:
     """Download a file over HTTPS with caching, retries, and integrity checks.
 
-    Integrity is verified against the response ``Content-Length``, and also
-    against an MD5 of the streamed body when the server's ``ETag`` is a plain
-    32-hex-digit MD5. When *cache_path* already exists, an ``If-Modified-Since``
-    conditional GET keyed on the cached file's mtime returns the cached copy on
-    a 304. Transient failures (429/5xx, connection errors, truncation, checksum
-    mismatch) are retried with exponential backoff.
+    Requests go through the shared urllib3 pool (see :func:`_http`), which
+    retries 429/5xx and connection failures with backoff and enforces the
+    response ``Content-Length``. The streamed body is additionally verified
+    against an MD5 when the server's ``ETag`` is a plain 32-hex-digit MD5.
+    When *cache_path* already exists, an ``If-Modified-Since`` conditional GET
+    keyed on the cached file's mtime returns the cached copy on a 304.
+    Failures that strike mid-stream (truncation, checksum mismatch) restart
+    the download from scratch with exponential backoff.
 
     Args:
         url: HTTPS URL.
@@ -541,17 +588,22 @@ def download_file_to_temp(
         cache hit, or a temporary path when ``cache_path`` is None.
 
     Raises:
-        urllib.error.HTTPError: On non-304 HTTP errors (after retries).
-        OSError: On a truncated, corrupted, or failed download (after retries).
+        HTTPStatusError: On a non-retryable HTTP status (e.g. 404).
+        urllib3.exceptions.MaxRetryError: When retryable failures persist.
+        OSError: On a corrupted download (after retries).
     """
+    import urllib3
+
     attempts = 4
     for attempt in range(attempts):
         try:
             return _download_once(url, progress_callback, cache_path)
-        except urllib.error.HTTPError as e:
-            if e.code not in (429, 500, 502, 503, 504) or attempt == attempts - 1:
-                raise
-        except (urllib.error.URLError, OSError):
+        except (HTTPStatusError, urllib3.exceptions.MaxRetryError):
+            # A hard status, or urllib3 already exhausted its own retries.
+            raise
+        except (urllib3.exceptions.HTTPError, OSError):
+            # Mid-stream failure (truncated body, checksum mismatch, read
+            # timeout after headers): restart the whole download.
             if attempt == attempts - 1:
                 raise
         time.sleep(2**attempt)
@@ -563,33 +615,30 @@ def _download_once(
     cache_path: Optional[Path],
 ) -> str:
     """Single download attempt (see :func:`download_file_to_temp`)."""
-    from . import __version__
-
-    # The Source Cooperative CDN rejects the default Python urllib
-    # User-Agent with a 403, so identify as geotessera.
-    request = urllib.request.Request(
-        url, headers={"User-Agent": f"geotessera/{__version__}"}
-    )
+    headers = {}
     if cache_path and cache_path.exists():
-        request.add_header(
-            "If-Modified-Since",
-            formatdate(cache_path.stat().st_mtime, usegmt=True),
+        headers["If-Modified-Since"] = formatdate(
+            cache_path.stat().st_mtime, usegmt=True
         )
 
+    response = _http().request(
+        "GET", url, headers=headers or None, preload_content=False
+    )
     try:
-        response = urllib.request.urlopen(request, timeout=60)
-    except urllib.error.HTTPError as e:
-        if e.code == 304:
-            # A 304 response means the cached copy is current.
+        if response.status == 304:
+            # The cached copy is current.
             if progress_callback:
                 progress_callback(0, 0, "Cache is current")
             return str(cache_path)
-        raise
-
-    try:
+        if response.status != 200:
+            raise HTTPStatusError(url, response.status, response.reason)
         return _stream_to_file(response, url, cache_path, progress_callback)
     finally:
-        response.close()
+        # Discard any unread remainder (errors ignored) so the connection
+        # goes back to the pool clean; an unread body would otherwise
+        # poison the reused connection.
+        response.drain_conn()
+        response.release_conn()
 
 
 def _stream_to_file(
@@ -601,12 +650,14 @@ def _stream_to_file(
     """Stream *response* to *cache_path* (or a temporary file) atomically.
 
     Writes to a sibling temporary file with progress reporting, verifies the
-    byte count against ``Content-Length`` and, when available, the MD5 ETag,
-    stamps the file mtime from ``Last-Modified`` so later
-    ``If-Modified-Since`` requests work, then moves the file into place.
-    Returns the final path as ``str``.
+    streamed body against the MD5 ETag when available, stamps the file mtime
+    from ``Last-Modified`` so later ``If-Modified-Since`` requests work, then
+    moves the file into place. Truncation needs no check here: urllib3
+    enforces ``Content-Length``, so a body that ends early raises
+    ``IncompleteRead`` out of ``response.read()``. Returns the final path as
+    ``str``.
     """
-    import tempfile
+    from .remote import atomic_output
 
     total_size = int(response.headers.get("Content-Length") or 0)
 
@@ -619,26 +670,14 @@ def _stream_to_file(
             pass
 
     # A plain 32-hex-digit ETag is the object's content MD5. Multipart
-    # uploads carry a "-<parts>" suffix and are not a content hash, so
-    # those downloads are only length-checked.
+    # uploads carry a "-<parts>" suffix, and weak validators a "W/" prefix
+    # that the quote-strip deliberately leaves in place — neither matches
+    # the pattern, so those downloads are only length-checked.
     etag = (response.headers.get("ETag") or "").strip('"')
     md5 = hashlib.md5() if re.fullmatch(r"[0-9a-f]{32}", etag) else None
 
-    if cache_path:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_file = tempfile.NamedTemporaryFile(
-            mode="wb",
-            dir=cache_path.parent,
-            delete=False,
-            prefix=f".{cache_path.name}_tmp_",
-            suffix=cache_path.suffix,
-        )
-    else:
-        temp_file = tempfile.NamedTemporaryFile(mode="wb", delete=False, suffix=".npy")
-
-    temp_path = Path(temp_file.name)
-    success = False
-    try:
+    suffix = cache_path.suffix if cache_path else ".npy"
+    with atomic_output(cache_path, suffix=suffix) as temp_path:
         downloaded = 0
         start_time = time.time()
         last_update_time = start_time
@@ -647,44 +686,41 @@ def _stream_to_file(
             size_str = format_bytes(total_size) if total_size > 0 else "unknown size"
             progress_callback(0, total_size, f"Starting ({size_str})")
 
-        while chunk := response.read(256 * 1024):
-            if md5 is not None:
-                md5.update(chunk)
-            temp_file.write(chunk)
-            downloaded += len(chunk)
+        with open(temp_path, "wb") as temp_file:
+            while chunk := response.read(256 * 1024):
+                if md5 is not None:
+                    md5.update(chunk)
+                temp_file.write(chunk)
+                downloaded += len(chunk)
 
-            if progress_callback and total_size > 0:
-                current_time = time.time()
-                # Update with speed info every ~100ms or on completion.
-                if current_time - last_update_time > 0.1 or downloaded == total_size:
-                    elapsed = current_time - start_time
-                    if elapsed > 0:
-                        speed_str = format_bytes(downloaded / elapsed) + "/s"
-                        status = (
-                            f"{format_bytes(downloaded)}/"
-                            f"{format_bytes(total_size)} @ {speed_str}"
-                        )
-                    else:
-                        status = (
-                            f"{format_bytes(downloaded)}/{format_bytes(total_size)}"
-                        )
-                    progress_callback(downloaded, total_size, status)
-                    last_update_time = current_time
+                if progress_callback and total_size > 0:
+                    current_time = time.time()
+                    # Update with speed info every ~100ms or on completion.
+                    if (
+                        current_time - last_update_time > 0.1
+                        or downloaded == total_size
+                    ):
+                        elapsed = current_time - start_time
+                        if elapsed > 0:
+                            speed_str = format_bytes(downloaded / elapsed) + "/s"
+                            status = (
+                                f"{format_bytes(downloaded)}/"
+                                f"{format_bytes(total_size)} @ {speed_str}"
+                            )
+                        else:
+                            status = (
+                                f"{format_bytes(downloaded)}/{format_bytes(total_size)}"
+                            )
+                        progress_callback(downloaded, total_size, status)
+                        last_update_time = current_time
 
-        # A dropped connection can end the stream early without raising,
-        # so check the length to keep a truncated file out of the cache.
-        if total_size and downloaded != total_size:
-            raise OSError(
-                f"Truncated download from {url}: got {downloaded} of {total_size} bytes"
-            )
         if md5 is not None and md5.hexdigest() != etag:
             raise OSError(
                 f"Checksum mismatch for {url}: MD5 {md5.hexdigest()} != ETag {etag}"
             )
 
-        temp_file.close()
-
-        # Set file mtime from Last-Modified so the next If-Modified-Since works.
+        # Set file mtime from Last-Modified so the next If-Modified-Since
+        # works; replace() inside atomic_output preserves it.
         if last_modified is not None:
             try:
                 ts = last_modified.timestamp()
@@ -692,35 +728,14 @@ def _stream_to_file(
             except OSError as e:
                 logging.getLogger(__name__).warning(f"Could not set file mtime: {e}")
 
-        # If caching, move into place atomically. Use replace() (not rename()):
-        # it overwrites an existing destination on both POSIX and Windows,
-        # whereas rename() raises FileExistsError on Windows.
-        if cache_path:
-            temp_path.replace(cache_path)
-            final_path = cache_path
-        else:
-            final_path = temp_path
+    if progress_callback:
+        progress_callback(
+            downloaded,
+            total_size or downloaded,
+            f"Complete ({format_bytes(downloaded)})",
+        )
 
-        success = True
-
-        if progress_callback:
-            progress_callback(
-                downloaded,
-                total_size or downloaded,
-                f"Complete ({format_bytes(downloaded)})",
-            )
-
-        return str(final_path)
-
-    finally:
-        # Remove the partial temp file on any failure, including
-        # KeyboardInterrupt and SystemExit, which a plain `except Exception`
-        # would miss. This keeps interrupted downloads from leaving stray
-        # ``.<name>_tmp_*`` files behind.
-        if not success:
-            temp_file.close()
-            if temp_path.exists():
-                temp_path.unlink()
+    return str(cache_path if cache_path else temp_path)
 
 
 class Registry:

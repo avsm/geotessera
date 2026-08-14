@@ -33,6 +33,7 @@ dependencies = [
     "scikit-image>=0.25.2",
     "pyarrow>=17.0.0",
     "cram>=0.7",
+    "urllib3>=2",
     "xarray",
     "rioxarray",
     "zarr",

@@ -59,34 +59,19 @@ logger = logging.getLogger(__name__)
 def _atomic_write_parquet(df, dest, *, compression=None):
     """Write ``df`` to ``dest`` atomically via a temp file + rename (cron-safe).
 
-    The temp file is created in ``dest``'s directory so the rename stays on a
-    single filesystem, and it is removed if the write fails (including on
-    KeyboardInterrupt). Works for both DataFrames (regular parquet) and
-    GeoDataFrames (GeoParquet, chosen automatically by ``to_parquet``).
+    Works for both DataFrames (regular parquet) and GeoDataFrames
+    (GeoParquet, chosen automatically by ``to_parquet``).
     """
-    import tempfile
+    from .remote import atomic_output
 
-    dest = Path(dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="wb",
-        dir=dest.parent,
-        prefix=f".{dest.name}_tmp_",
-        suffix=".parquet",
-        delete=False,
-    ) as temp_file:
-        temp_path = temp_file.name
-    try:
+    with atomic_output(dest, suffix=".parquet") as temp_path:
+        # NamedTemporaryFile creates 0o600; these files are published, so
+        # make them world-readable like a normal write would.
         os.chmod(temp_path, 0o644)
         if compression:
             df.to_parquet(temp_path, compression=compression, index=False)
         else:
             df.to_parquet(temp_path, index=False)
-        os.rename(temp_path, str(dest))
-    except BaseException:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-        raise
 
 
 @dataclass
@@ -2450,14 +2435,6 @@ def _parse_s3_uri(uri: str) -> Tuple[str, str]:
     return bucket, prefix
 
 
-# Transient HTTP statuses worth retrying during listings: rate limiting
-# and server/CDN-side errors (Cloudflare fronting data.source.coop returns
-# 503s under load).
-_RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
-# Per-page attempts: 6 tries with 1, 2, 4, 8, 16s backoff (~31s worst case).
-_S3_LIST_ATTEMPTS = 6
-
-
 def _s3_list(
     bucket: str,
     prefix: str,
@@ -2472,21 +2449,19 @@ def _s3_list(
     listing is exhausted. If delimiter is set, yields CommonPrefixes as
     (prefix, 0, "") tuples instead of object contents.
 
-    Each page request is retried with exponential backoff on transient
-    failures (429/5xx, timeouts, connection resets, truncated bodies).
-    Retrying happens before any of the page's entries are yielded, so the
-    stream never contains duplicates; the continuation token makes the
-    re-request idempotent. A page that still fails after all attempts
-    raises RuntimeError.
+    Requests go through the shared urllib3 pool (``registry._http``), whose
+    ``Retry`` transparently retries 429/5xx (honouring ``Retry-After``),
+    connection failures, and read errors — a truncated body raises inside
+    the request and is retried there, since the page is read whole. Retrying
+    happens before any of the page's entries are yielded, so the stream
+    never contains duplicates; the continuation token makes the re-request
+    idempotent. A page that still fails raises out of the pool
+    (``MaxRetryError``) or as RuntimeError for a hard HTTP status.
     """
-    import time as _time
     import xml.etree.ElementTree as ET
-    from http.client import HTTPException
-    from urllib.error import HTTPError, URLError
     from urllib.parse import urlencode
-    from urllib.request import Request, urlopen
 
-    from . import __version__
+    from .registry import _http
 
     base = f"{endpoint_url.rstrip('/')}/{bucket}/"
     token: Optional[str] = None
@@ -2498,37 +2473,10 @@ def _s3_list(
             params["continuation-token"] = token
         url = base + "?" + urlencode(params)
 
-        root = None
-        last_err: Optional[BaseException] = None
-        for attempt in range(_S3_LIST_ATTEMPTS):
-            if attempt:
-                _time.sleep(2 ** (attempt - 1))
-            request = Request(
-                url,
-                headers={"User-Agent": f"geotessera/{__version__}"},
-            )
-            try:
-                with urlopen(request, timeout=60) as resp:
-                    body = resp.read()
-                root = ET.fromstring(body)
-                break
-            except HTTPError as e:
-                if e.code not in _RETRYABLE_HTTP_CODES:
-                    raise
-                last_err = e
-            except (
-                URLError,
-                TimeoutError,
-                ConnectionError,
-                HTTPException,
-                ET.ParseError,
-            ) as e:
-                last_err = e
-        if root is None:
-            raise RuntimeError(
-                f"S3 listing failed after {_S3_LIST_ATTEMPTS} attempts "
-                f"for {url}: {last_err}"
-            ) from last_err
+        resp = _http().request("GET", url)
+        if resp.status != 200:
+            raise RuntimeError(f"S3 listing failed: HTTP {resp.status} for {url}")
+        root = ET.fromstring(resp.data)
 
         if delimiter is not None:
             for cp in root.findall(f"{S3_NS}CommonPrefixes"):
@@ -3532,8 +3480,7 @@ def _add_storage_args(parser, prefix: str, label: str, writable: bool = False) -
         f"--{prefix}-profile",
         type=str,
         default=None,
-        help=f"Shared-config profile for the {label.lower()} "
-        f"(default: $AWS_PROFILE)",
+        help=f"Shared-config profile for the {label.lower()} (default: $AWS_PROFILE)",
     )
     group.add_argument(
         f"--{prefix}-requester-pays",
@@ -3609,9 +3556,7 @@ def _report_store_error(e: Exception, console: "Console") -> int:
     return 1
 
 
-def _storage_options_for(
-    args, prefix: str, location: str
-) -> Optional[Dict[str, Any]]:
+def _storage_options_for(args, prefix: str, location: str) -> Optional[Dict[str, Any]]:
     """Build fsspec storage options from ``--{prefix}-*`` flags.
 
     Returns None for local paths so plain filesystem access never picks up
@@ -4006,9 +3951,7 @@ def zarr_scan_command(args):
     # ever hold data, and that comes from the much smaller landmask registry.
     if args.base_dir:
         try:
-            registry, source, dataset_version, _variant = _resolve_source(
-                args, console
-            )
+            registry, source, dataset_version, _variant = _resolve_source(args, console)
         except ValueError as e:
             console.print(f"[red]{emoji('❌ ')}{e}[/red]")
             return 1
@@ -5032,8 +4975,7 @@ Directory Structure:
         "--output",
         required=True,
         type=str,
-        help="Output store path or URL (e.g. tessera.zarr, "
-        "s3://bucket/tessera.zarr)",
+        help="Output store path or URL (e.g. tessera.zarr, s3://bucket/tessera.zarr)",
     )
     zarr_init_parser.add_argument(
         "--stretch-sample-size",
@@ -5079,8 +5021,7 @@ Directory Structure:
     zarr_fill_parser.add_argument(
         "--zones",
         default=None,
-        help="Zone numbers to fill (e.g. 30 or 29-34). "
-        "Default: all initialised zones",
+        help="Zone numbers to fill (e.g. 30 or 29-34). Default: all initialised zones",
     )
     zarr_fill_parser.add_argument(
         "--workers",

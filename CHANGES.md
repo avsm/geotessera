@@ -1,21 +1,5 @@
 ## Unreleased
 
-### Breaking Changes
-
-- **Convention metadata now comes from `zarr-cm`**, replacing
-  `geozarr-toolkit`. Stores stamp `spatial:` and `proj:` at revision **r3**
-  and `multiscales` at **r2** (no r3 exists upstream), each pinned to the
-  spec commit that defined it. The previous `refs/tags/v1` URLs were dead —
-  every schema URL written by earlier builds returns 404, since those tags
-  were never cut and `geo-proj` has since moved to `zarr-conventions/proj`.
-  Convention UUIDs and every `spatial:`/`proj:`/`multiscales` attribute
-  keep their existing names and shapes, so readers are unaffected; only the
-  `spec_url`/`schema_url` registrations change. Existing published stores
-  keep their dead URLs until their metadata is rewritten. Drops the
-  `pydantic` and `structlog` transitive dependencies. (@avsm)
-
-### New Features
-
 - **`zarr-global-preview` runs zones in parallel**: `--reproject-only` stops
   a zone's coarsening at the depth where zones stay disjoint (level 6,
   measured against the real written-shard footprints: an odd/even zone split
