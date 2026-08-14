@@ -2,14 +2,6 @@
 
 ### Breaking Changes
 
-- **All downloads now come from Source Cooperative**, fronted by CloudFlare.
-  Embeddings, landmasks, manifests, and the zarr store are served from the public
-  `https://data.source.coop/tessera/tessera` repository over HTTPS,
-  replacing the retired `tessera-embeddings` AWS S3 bucket. The repository
-  is organised by media type (`npy/{version}/`, `landmasks/{version}/`,
-  `zarr/{version}/`) with per-version `manifest.parquet` and
-  `landmasks.parquet` files colocated with their data, and carries one
-  embedding tree per version. (@avsm, @mtelvers)
 - **Convention metadata now comes from `zarr-cm`**, replacing
   `geozarr-toolkit`. Stores stamp `spatial:` and `proj:` at revision **r3**
   and `multiscales` at **r2** (no r3 exists upstream), each pinned to the
@@ -21,11 +13,6 @@
   `spec_url`/`schema_url` registrations change. Existing published stores
   keep their dead URLs until their metadata is rewritten. Drops the
   `pydantic` and `structlog` transitive dependencies. (@avsm)
-- **Dependencies removed**: `botocore` and `awscrt` are no longer required.
-  Downloads use the standard library with retry/backoff, `If-Modified-Since`
-  conditional-GET caching, and integrity verification against the response
-  `Content-Length` plus a streamed MD5 whenever the server's `ETag` is a
-  content MD5 (single-part uploads) (@avsm)
 
 ### New Features
 
@@ -60,64 +47,6 @@
   but must not run concurrently. A pre-existing `global_rgb` of the wrong
   shape is deleted for a local destination and refused for a remote one,
   rather than implicitly dropping a prefix of millions of objects. (@avsm)
-
-### Bug Fixes
-
-- **Out-of-range scales no longer poison the stretch statistics**:
-  `MAX_VALID_SCALE` was `1e6`, set to reject only the `~FLT_MAX` sentinel and
-  pass everything below. Measured over the published v1 store's 1.2M pooled
-  sample pixels, real scales run median 0.064 / p99.9 0.119 / p99.99 0.137,
-  and only 5 in 1.2M exceed 1.0 — but pixels with scales just under `1e6`
-  survived the filter and contributed ~1e16 apiece to the second moment,
-  poisoning **47 of 60 zones** (max|prod|/n of 1e6–1.9e8 against 27–653 for a
-  clean zone) and so every colour derived from the PCA. The limit is now
-  `1.0`: seven times the p99.99 of real data, six orders of magnitude below
-  the corrupt values. The pooled sample is also re-filtered on read, since a
-  reservoir written under the old limit can still hold a few. (@avsm)
-- **`zarr-stretch` refuses to persist a stretch that fails its own drift
-  check** unless `--allow-drift`. It previously warned and saved anyway,
-  which is how a covariance known to be wrong reached the store and then
-  every preview built from it. (@avsm)
-- **`zarr-global-preview` no longer races itself creating the pyramid**:
-  zarr's create is check-then-write, so a parallel zone sweep had several
-  callers pass the existence check before any wrote, and the losers died with
-  `A group exists ... at path 'global_rgb/2'` or `An array exists ... at path
-  'global_rgb/0/rgb'`. Every creation step is now idempotent, so all callers
-  build the identical structure and converge. (@avsm)
-- **Antimeridian zones no longer coarsen the whole grid width**: the
-  reprojection work list was tightened (below), but the coarsening still took
-  a single enclosing rectangle, which for a zone with chunks at both grid
-  edges spans every column — 16.0M chunk slots for utm01's 18.8k real chunks
-  and 16.7M for utm60's 37.8k, each one read and rewritten by
-  `_coarsen_tile`. Footprints now split on a column gap wider than half the
-  grid, giving two tight rectangles: utm01 falls to 347k slots (853x -> 18.5x
-  overhead) and utm60 to 364k (442x -> 9.6x), with every other zone still a
-  single rectangle and bit-identical. (@avsm)
-- **Antimeridian shards no longer enqueue the whole globe**: a shard
-  straddling 180° samples corners near -180 and +180, and taking the naive
-  min/max of those made `_chunks_for_shards` claim every chunk column at that
-  latitude. utm60 enqueued 1,395,753 level-0 chunks from 360 shards (~3,900
-  per shard, against ~65 for a normal zone) and utm01 877,648 from 146 — some
-  22% of a year's reprojection work list, all of it reprojecting to nothing.
-  The wrap is now detected by re-measuring the span with longitudes shifted
-  to `[0, 360)` and split into two column ranges; a polar shard, which
-  genuinely does span most longitudes, keeps the full range. For 2024 this
-  cuts utm60 to 37,791 chunks and utm01 to 18,766, leaves every other zone
-  bit-identical, and reduces the cross-zone conflict graph from 172 pairs to
-  60 — 59 adjacent plus utm01↔utm60, which really are neighbours. (@avsm)
-- **Pyramid levels keep their per-level geometry**: `zarr-global-preview`
-  computed `spatial:shape` and `spatial:transform` for each multiscale level,
-  but `geozarr-toolkit`'s layout builder silently dropped both, so every
-  level advertised only its scale factor. `zarr-cm` preserves them, and the
-  multiscales schema permits them (`additionalProperties: true`). (@avsm)
-
-### New Features
-
-- **Per-version default variant**: omitting `dataset_variant` /
-  `--dataset-variant` now selects the version's published variant (`vultr`
-  for v1, `cambridge` for v1.1) instead of always `vultr`, so
-  `GeoTessera(dataset_version="v1.1")` works without an explicit variant.
-  (@avsm)
 - **Remote zarr builds**: `zarr-init` and `zarr-fill` now take locations
   rather than paths — both the tile source and the output store may be
   fsspec URLs (`s3://bucket/prefix`), so a store on one S3 node can be
@@ -268,14 +197,62 @@
   Years may only be appended (inserting an earlier one would renumber every
   chunk, so it is refused), and it will not run while a fill lock is held.
   (@avsm)
-- **`geotessera-registry zarr-consolidate`**: New subcommand that
-  re-consolidates a store's root metadata after in-place changes, and
-  merges the per-zone ingestion registries into `_registry.parquet`. This
-  is the single-writer step that finishes a parallel sweep; also useful for
-  repairs. Accepts a local path or a remote store URL.
+- **`zarr-consolidate` merges registries and works remotely**: the
+  subcommand (introduced in 0.10.0) now also merges the per-zone ingestion
+  registries into `_registry.parquet` — the single-writer step that
+  finishes a parallel sweep — and accepts a remote store URL as well as a
+  local path. (@avsm)
 
 ### Bug Fixes
 
+
+- **Out-of-range scales no longer poison the stretch statistics**:
+  `MAX_VALID_SCALE` was `1e6`, set to reject only the `~FLT_MAX` sentinel and
+  pass everything below. Measured over the published v1 store's 1.2M pooled
+  sample pixels, real scales run median 0.064 / p99.9 0.119 / p99.99 0.137,
+  and only 5 in 1.2M exceed 1.0 — but pixels with scales just under `1e6`
+  survived the filter and contributed ~1e16 apiece to the second moment,
+  poisoning **47 of 60 zones** (max|prod|/n of 1e6–1.9e8 against 27–653 for a
+  clean zone) and so every colour derived from the PCA. The limit is now
+  `1.0`: seven times the p99.99 of real data, six orders of magnitude below
+  the corrupt values. The pooled sample is also re-filtered on read, since a
+  reservoir written under the old limit can still hold a few. (@avsm)
+- **`zarr-stretch` refuses to persist a stretch that fails its own drift
+  check** unless `--allow-drift`. It previously warned and saved anyway,
+  which is how a covariance known to be wrong reached the store and then
+  every preview built from it. (@avsm)
+- **`zarr-global-preview` no longer races itself creating the pyramid**:
+  zarr's create is check-then-write, so a parallel zone sweep had several
+  callers pass the existence check before any wrote, and the losers died with
+  `A group exists ... at path 'global_rgb/2'` or `An array exists ... at path
+  'global_rgb/0/rgb'`. Every creation step is now idempotent, so all callers
+  build the identical structure and converge. (@avsm)
+- **Antimeridian zones no longer coarsen the whole grid width**: the
+  reprojection work list was tightened (below), but the coarsening still took
+  a single enclosing rectangle, which for a zone with chunks at both grid
+  edges spans every column — 16.0M chunk slots for utm01's 18.8k real chunks
+  and 16.7M for utm60's 37.8k, each one read and rewritten by
+  `_coarsen_tile`. Footprints now split on a column gap wider than half the
+  grid, giving two tight rectangles: utm01 falls to 347k slots (853x -> 18.5x
+  overhead) and utm60 to 364k (442x -> 9.6x), with every other zone still a
+  single rectangle and bit-identical. (@avsm)
+- **Antimeridian shards no longer enqueue the whole globe**: a shard
+  straddling 180° samples corners near -180 and +180, and taking the naive
+  min/max of those made `_chunks_for_shards` claim every chunk column at that
+  latitude. utm60 enqueued 1,395,753 level-0 chunks from 360 shards (~3,900
+  per shard, against ~65 for a normal zone) and utm01 877,648 from 146 — some
+  22% of a year's reprojection work list, all of it reprojecting to nothing.
+  The wrap is now detected by re-measuring the span with longitudes shifted
+  to `[0, 360)` and split into two column ranges; a polar shard, which
+  genuinely does span most longitudes, keeps the full range. For 2024 this
+  cuts utm60 to 37,791 chunks and utm01 to 18,766, leaves every other zone
+  bit-identical, and reduces the cross-zone conflict graph from 172 pairs to
+  60 — 59 adjacent plus utm01↔utm60, which really are neighbours. (@avsm)
+- **Pyramid levels keep their per-level geometry**: `zarr-global-preview`
+  computed `spatial:shape` and `spatial:transform` for each multiscale level,
+  but `geozarr-toolkit`'s layout builder silently dropped both, so every
+  level advertised only its scale factor. `zarr-cm` preserves them, and the
+  multiscales schema permits them (`additionalProperties: true`). (@avsm)
 - **Incremental fills no longer erase neighbouring tiles**: a shard write
   replaces the whole shard, so a fill that touched a shard already holding
   data would zero out the tiles it did not re-read. Touched shards are now
@@ -286,15 +263,48 @@
   failed shard now reports an error. (@avsm)
 - **`geotessera-registry` propagates exit status**: command return codes
   were discarded, so failures reported success to the shell. (@avsm)
-- **`geotessera-registry s3scan` scans Source Cooperative**: listings are
-  path-style against the S3-compatible endpoint given by `--endpoint-url`
-  (default `https://data.source.coop`); the AWS virtual-hosted addressing
-  for the retired bucket is gone, and `--region` with it. Discovery
-  understands the flat `{version}/{year}/` layout with the variant supplied
-  via `--variant`, and `--landmasks-uri` points the landmask scan at a
-  separate tree (e.g. `s3://tessera/tessera/landmasks/`), including
-  landmasks-only runs. This allows manifests and landmask registries to be
-  regenerated directly from the Source Cooperative repository. (@avsm)
+
+## 0.10.0 (2026-08-13)
+
+### Breaking Changes
+
+- All NPY downloads now come from the Source Cooperative, fronted by CloudFlare.
+  Embeddings, landmasks and manifests are served from the public
+  `https://data.source.coop/tessera/tessera` repository over HTTPS,
+  replacing the retired `tessera-embeddings` AWS S3 bucket.
+
+  The repository is organised by media type. The `npy/` tree has one
+  directory per *dataset* — a (version, variant) pair — with the variant
+  encoded as a directory suffix: all v1 variants share `npy/v1/`,
+  1.1/cambridge lives in `npy/v1.1-cam/`, and the v2 beta in
+  `npy/v2-2B-L~beta1/`. Each dataset directory carries its own
+  `manifest.parquet`. The `landmasks/{version}/` and `zarr/{version}/`
+  trees stay keyed by plain version. (@avsm, @mtelvers)
+
+- `botocore` and `awscrt` are no longer required dependencies (@avsm)
+
+### New Features
+
+- Per-version default variant allows omitting the dataset-variant.
+  `--dataset-variant` now selects the version's default variant (`vultr`
+  for v1, `cambridge` for v1.1, `2B-L~beta1` for v2) instead of always
+  `vultr`, so `GeoTessera(dataset_version="v1.1")` works. The known
+  datasets — including the reserved, not-yet-published `v1.1-dclimate`
+  complete-global run, which raises a "coming soon" error if selected —
+  are listed in the new "Known Datasets" table printed by
+  `geotessera info` (@avsm)
+- `geotessera-registry zarr-consolidate` is a new subcommand that
+  re-consolidates a store's root metadata after in-place changes.
+  Mostly only for repairs and not regular use.
+- `geotessera-registry s3scan` scans Source Cooperative to list
+  embeddings. This allows manifests and landmask registries to be
+  regenerated directly from the Source Cooperative repository. Listing
+  requests retry transient failures (429/5xx, timeouts, connection
+  resets) with exponential backoff; if a shard still fails after all
+  retries the affected manifest is not written and the command exits
+  non-zero, so an incomplete manifest can never be uploaded. The summary
+  panel prints per-file `aws s3 cp` upload commands with the correct
+  per-tree destinations (@avsm)
 
 ## v0.9.0 (2026-06-09)
 
