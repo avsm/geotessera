@@ -461,7 +461,7 @@ def tile_to_bounds(lon: float, lat: float) -> Tuple[float, float, float, float]:
 #   npy/{dataset_path}/manifest.parquet                per-dataset manifest
 #   landmasks/{version_path}/grid_....tiff             landmask TIFFs
 #   landmasks/{version_path}/landmasks.parquet         landmask registry
-#   zarr/{version_path}/tessera.zarr                   zarr store
+#   zarr/{version_path}/                               zarr store root
 # Each dataset directory holds a complete embedding tree with no variant
 # subdirectory. New datasets appear as they are uploaded. The repository is
 # also reachable as an S3-compatible endpoint at TESSERA_MIRROR_ENDPOINT
