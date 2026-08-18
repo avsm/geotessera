@@ -1,5 +1,29 @@
 ## Unreleased
 
+- **Seam-aware point reads in `GeoTesseraZarr`**: `sample_at` and
+  `sample_points` no longer return NaN for locations whose data is in the
+  store. Tiles are 0.1 degrees and UTM zones 6 degrees, so round coordinates
+  land on tile edges and multiples of 6 also land on zone seams. A zone's
+  tiles stop at its boundary though its grid extends past it, so a point on a
+  seam may belong to the zone next door; and isolated one-pixel unwritten
+  holes occur at some tile corners, cause not yet established (adjacent tiles
+  are placed with a 22-28 px overlap, so it is not edge rounding). Both are
+  10 m artifacts sitting exactly where people sample. Confirmed against v1
+  2024: nine reported coordinates in Japan, California and the Amazon all
+  read `+inf` at the exact pixel and all had data within one pixel; at
+  (-60.0, -3.0) the value was in `utm20` while the reader looked in `utm21`.
+
+  Two fallbacks, on by default and separately disableable: `cross_zone` tries
+  the neighbouring zone within 1 degree of a seam, `search_px` accepts the
+  nearest valid pixel within 1 pixel. Neither can report land for sea — water
+  is `NaN` and returns immediately, only unwritten `+inf` triggers a search.
+  A point away from a seam opens no extra zone groups.
+
+  New `probe()` on the store and the `.tessera` accessor returns
+  `(embedding, status)` with status `valid`, `water`, `nodata` or `outside`,
+  distinguishing open water from a location missing from the store —
+  `sample_at` collapses both to NaN. It also rejects points beyond the grid
+  rather than letting `sel(method="nearest")` snap to an edge pixel. (@avsm)
 - **`zarr-init --matryoshka-depths 4,16`**: also store the first N dimensions
   of every embedding as their own arrays, so a client can read a 4- or
   16-dimensional prefix without decoding all 128 bands. `embeddings` is one
