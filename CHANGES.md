@@ -1,5 +1,20 @@
 ## Unreleased
 
+- **Remote reads can no longer hang forever**: every S3 and HTTP filesystem now
+  carries a connect and read timeout (20 s and 120 s, overridable with
+  `GEOTESSERA_CONNECT_TIMEOUT` / `GEOTESSERA_READ_TIMEOUT`). Without one, a
+  worker blocked in `fsspec.asyn.sync` never returns: captured with `py-spy` on
+  three v2 zone fills that had sat in `futex_do_wait` with zero CPU for up to
+  seven hours, each stopped in `read_npy_window` after doing real work, while
+  the parent waited in `as_completed`. Whole-zone retries cannot recover from
+  that, because nothing ever fails — the retry loop is built around a non-zero
+  exit. The existing adaptive retries only help once a request *returns*.
+  `read_timeout` bounds the gap between reads rather than the whole transfer,
+  so a large slow tile is not cut short. (@avsm)
+- **`convertv2.sh STRETCH_STATS=0`**: skip fill-time stretch statistics. v2's
+  preview reads bands 0-2 of `embeddings_d4` directly, so the statistics that
+  exist to support a 128-band PCA earn much less there. (@avsm)
+
 - **`zarr-init --no-landmask`**: for datasets whose inference covers every
   pixel of a tile it emits, so a present tile is data all the way to its
   edges. No landmask registry is fetched and no landmask GeoTIFF is read
