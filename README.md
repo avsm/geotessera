@@ -751,4 +751,4 @@ If you use Tessera in your research, please cite the [arXiv paper](https://arxiv
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=ucam-eo/geotessera&type=Date)](https://www.star-history.com/#ucam-eo/geotessera&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=ucam-eo/geotessera&type=Date)](https://star-history.dera.page/#ucam-eo/geotessera&Date)
