@@ -80,8 +80,8 @@ GeoTessera supports two output formats:
 - **tiff**: Georeferenced GeoTIFF files (default, best for GIS) - fully dequantized and ready to use
 - **npy**: Quantized numpy arrays with scales and landmask TIFFs (for advanced analysis and storage efficiency)
 
-For cloud-native zarr access without downloading files (forthcoming in a
-future release), see :ref:`zarr-access` below.
+For cloud-native zarr access without downloading files, see
+:ref:`zarr-access` below.
 
 Download as GeoTIFF (Recommended for GIS)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -440,14 +440,6 @@ Use both numpy and GeoTIFF formats in the same workflow::
 
 Cloud-Native Zarr Access
 ~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. note::
-
-   **Zarr support is forthcoming in a future release.** The hosted Zarr
-   store has not yet been published to the Source Cooperative repository,
-   so the API below is a preview and will not find data at the default
-   location until the store is uploaded. Use the ``download`` workflow
-   above in the meantime.
 
 For interactive or large-scale analysis without downloading files, use the Zarr
 store. This streams data directly from the cloud::

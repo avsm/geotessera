@@ -33,7 +33,7 @@ the ``landmasks/`` and ``zarr/`` trees are keyed by plain version::
     │   │   └── ...
     │   └── v2/
     │       └── ...
-    └── zarr/                                    # forthcoming in a future release
+    └── zarr/                                    # cloud-native zarr store
         └── v1/
 
 The dataset directory name is the version path plus a ``-<variant>``
@@ -182,5 +182,4 @@ tile trees (used on the machines that generate embeddings, before upload):
 
 Run ``geotessera-registry --help`` for the complete list, including the
 Zarr store construction commands (``zarr-init``, ``zarr-fill``,
-``zarr-consolidate``, …) that will back the forthcoming cloud-native Zarr
-release.
+``zarr-consolidate``, …) that build the published cloud-native Zarr store.

@@ -83,6 +83,36 @@ def _zone_for_point(x: float, y: float, crs: str = "EPSG:4326") -> int:
     return _zone_for_lon(lon)
 
 
+# Tiles are 0.1 degrees and UTM zones 6 degrees, so round coordinates land on
+# tile edges and multiples of 6 land on zone seams as well. Both leave gaps: a
+# tile edge can be one unwritten pixel wide, and a zone's tiles stop at its
+# boundary although its grid runs past it.
+
+SEAM_SEARCH_PX = 1  # nearest-valid-pixel radius
+
+# How close to a seam before the neighbouring zone is worth trying. A tile is
+# 0.1 degrees and belongs to the zone containing its centre, so a point can
+# only be covered by the zone next door if it is within half a tile — 0.05
+# degrees — of the boundary. This is that bound doubled, which absorbs the
+# sub-pixel spread of a tile's curved UTM footprint and still consults a
+# neighbour only where one can actually hold the data.
+SEAM_DEGREES = 0.1
+
+VALID, WATER, NODATA, OUTSIDE = "valid", "water", "nodata", "outside"
+
+
+def _seam_neighbours(lon: float) -> List[int]:
+    """Zones to try after the one containing *lon*.  Empty away from a seam."""
+    z = _zone_for_lon(lon)
+    frac = (lon + 180.0) % 6.0
+    out: List[int] = []
+    if frac <= SEAM_DEGREES:
+        out.append(60 if z == 1 else z - 1)
+    if frac >= 6.0 - SEAM_DEGREES:
+        out.append(1 if z == 60 else z + 1)
+    return out
+
+
 def open_zone(
     store_url: str = DEFAULT_STORE,
     *,
@@ -213,6 +243,7 @@ class TesseraAccessor:
         year: int,
         *,
         crs: str = "EPSG:4326",
+        search_px: int = SEAM_SEARCH_PX,
     ) -> np.ndarray:
         """Sample a single dequantised embedding.  Returns ``(B,)`` float32.
 
@@ -222,6 +253,8 @@ class TesseraAccessor:
             year: Year to sample.
             crs: Input coordinate CRS (default WGS84).  Accepts any
                 pyproj-compatible CRS string.
+            search_px: Nearest-valid-pixel radius for unwritten pixels;
+                0 disables.  See :meth:`probe`.
         """
         if crs == f"EPSG:{self._epsg}":
             e, n = x, y
@@ -233,20 +266,58 @@ class TesseraAccessor:
 
         log.debug("sample_at(%.6f, %.6f, crs=%s) → UTM(%.1f, %.1f)", x, y, crs, e, n)
 
-        # Use tile transform coords (xc/yc) if available, else regular (x/y)
-        if "xc" in self._ds.coords:
-            pixel = self._ds.sel(
-                time=year,
-                xc=xr.DataArray(e),
-                yc=xr.DataArray(n),
-                method="nearest",
-            )
+        vec, _status = self.probe(e, n, year, search_px=search_px)
+        return vec if vec is not None else np.full(self.n_bands, np.nan, np.float32)
+
+    def probe(
+        self,
+        e: float,
+        n: float,
+        year: int,
+        *,
+        search_px: int = SEAM_SEARCH_PX,
+    ) -> Tuple[Optional[np.ndarray], str]:
+        """Sample at UTM ``(e, n)``, reporting why when there is no value.
+
+        Returns ``(embedding, status)``, the status one of ``valid``,
+        ``water``, ``nodata`` (never written) or ``outside`` (beyond this
+        zone's grid).
+
+        Within *search_px*, an unwritten pixel falls back to the nearest valid
+        one; 0 disables that.  Water is answered as ``water`` rather than
+        searched past, so the fallback can never report land for a sea
+        location.
+        """
+        xname, yname = ("xc", "yc") if "xc" in self._ds.coords else ("x", "y")
+        xs = self._ds.coords[xname].values
+        ys = self._ds.coords[yname].values
+        xi = int(np.abs(xs - e).argmin())
+        yi = int(np.abs(ys - n).argmin())
+
+        # sel(method="nearest") would snap a distant point to an edge pixel.
+        if abs(xs[xi] - e) > self._px or abs(ys[yi] - n) > self._px:
+            return None, OUTSIDE
+
+        r = max(0, int(search_px))
+        x0, x1 = max(0, xi - r), min(len(xs), xi + r + 1)
+        y0, y1 = max(0, yi - r), min(len(ys), yi + r + 1)
+        win = self._ds.isel({xname: slice(x0, x1), yname: slice(y0, y1)}).sel(time=year)
+        scales = np.asarray(win["scales"].values, dtype=np.float64)
+        ci, cj = yi - y0, xi - x0
+
+        centre = scales[ci, cj]
+        if np.isnan(centre):
+            return None, WATER
+        if np.isfinite(centre):
+            bi, bj = ci, cj
         else:
-            pixel = self._ds.sel(time=year, x=e, y=n, method="nearest")
-        scale = float(pixel["scales"].values)
-        if not np.isfinite(scale):
-            return np.full(self.n_bands, np.nan, dtype=np.float32)
-        return pixel["embeddings"].values.astype(np.float32) * scale
+            rows, cols = np.nonzero(np.isfinite(scales))
+            if not len(rows):
+                return None, NODATA
+            k = int(np.argmin((rows - ci) ** 2 + (cols - cj) ** 2))
+            bi, bj = int(rows[k]), int(cols[k])
+        emb = np.asarray(win["embeddings"].values)
+        return emb[:, bi, bj].astype(np.float32) * float(scales[bi, bj]), VALID
 
     def sample_points(
         self,
@@ -367,6 +438,7 @@ class GeoTesseraZarr:
         root_attrs = dict(root.attrs)
         self.model_version: str = root_attrs.get("geoemb:model", "")
         self.build_version: str = root_attrs.get("geoemb:build_version", "")
+        self.n_bands: int = int(root_attrs.get("geoemb:dimensions", 128))
         # Derive years from the first zone's time coordinate array
         self.years: list[int] = []
         for member_name in sorted(root.keys()):
@@ -427,6 +499,8 @@ class GeoTesseraZarr:
         year: int,
         *,
         crs: str = "EPSG:4326",
+        cross_zone: bool = True,
+        search_px: int = SEAM_SEARCH_PX,
     ) -> np.ndarray:
         """Sample a single embedding, routing to the correct zone.
 
@@ -434,12 +508,76 @@ class GeoTesseraZarr:
             x: Easting or longitude.
             y: Northing or latitude.
             crs: Input CRS (default WGS84).
+            cross_zone: Also try the neighbouring zone near a seam.  A tile
+                belongs to the zone holding its centre, so a point on a seam
+                is often covered by the zone next door.
+            search_px: Nearest-valid-pixel radius; 0 disables.
 
-        Returns ``(B,)`` float32.
+        Returns ``(B,)`` float32, or a NaN row for open water and for
+        locations outside coverage.  Use :meth:`probe` to tell those apart.
         """
-        z = _zone_for_point(x, y, crs)
-        ds = self.open_zone(zone=z)
-        return ds.tessera.sample_at(x, y, year, crs=crs)
+        vec, _status = self.probe(
+            x, y, year, crs=crs, cross_zone=cross_zone, search_px=search_px
+        )
+        return vec if vec is not None else np.full(self.n_bands, np.nan, np.float32)
+
+    def probe(
+        self,
+        x: float,
+        y: float,
+        year: int,
+        *,
+        crs: str = "EPSG:4326",
+        cross_zone: bool = True,
+        search_px: int = SEAM_SEARCH_PX,
+    ) -> Tuple[Optional[np.ndarray], str]:
+        """:meth:`sample_at`, reporting why when there is no value.
+
+        Returns ``(embedding, status)``; see :meth:`TesseraAccessor.probe`.
+        Use it in place of testing ``sample_at`` for NaN, which cannot tell
+        open water from a location missing from the store.
+        """
+        lon = x
+        if crs != "EPSG:4326":
+            lon, _ = Transformer.from_crs(crs, "EPSG:4326", always_xy=True).transform(
+                x, y
+            )
+
+        zones = [_zone_for_point(x, y, crs)]
+        if cross_zone:
+            zones += [z for z in _seam_neighbours(lon) if z not in zones]
+
+        seen = set()
+        for z in zones:
+            try:
+                acc = self.open_zone(zone=z).tessera
+            except KeyError as exc:
+                # Only "this store has no such zone group". A missing store or
+                # one without consolidated metadata raises FileNotFoundError or
+                # ValueError and fails every zone alike, so letting those
+                # through here would report `outside` for a broken store
+                # instead of saying what is wrong.
+                log.debug("probe: zone %d not in this store (%s)", z, exc)
+                continue
+            if crs == acc.crs:
+                e, n = x, y
+            else:
+                e, n = Transformer.from_crs(crs, acc.crs, always_xy=True).transform(
+                    x, y
+                )
+            vec, status = acc.probe(e, n, year, search_px=search_px)
+            if status == VALID:
+                if z != zones[0]:
+                    log.debug("probe: %.6f,%.6f served from zone %d", x, y, z)
+                return vec, VALID
+            seen.add(status)
+
+        # Water is a real answer about the location, so it outranks the
+        # rest; outside means no zone's grid covered the point at all.
+        for status in (WATER, NODATA):
+            if status in seen:
+                return None, status
+        return None, OUTSIDE
 
     def sample_points(
         self,
@@ -448,19 +586,30 @@ class GeoTesseraZarr:
         *,
         crs: str = "EPSG:4326",
         progress: bool = True,
+        cross_zone: bool = True,
+        search_px: int = SEAM_SEARCH_PX,
     ) -> np.ndarray:
         """Sample embeddings at points, routing each to its zone.
 
         Args:
             coords: List of (x, y) tuples in the given CRS.
             crs: Input CRS (default WGS84).
+            cross_zone: See :meth:`sample_at`.
+            search_px: See :meth:`sample_at`.
 
-        Returns ``(N, B)`` float32.  Points outside coverage get NaN rows.
+        Returns ``(N, B)`` float32.  Points without an embedding get NaN rows.
         """
         it = coords
         if progress:
             it = track(coords, description="Sampling points...", transient=True)
-        return np.array([self.sample_at(x, y, year, crs=crs) for x, y in it])
+        return np.array(
+            [
+                self.sample_at(
+                    x, y, year, crs=crs, cross_zone=cross_zone, search_px=search_px
+                )
+                for x, y in it
+            ]
+        )
 
     # -- Region reading (dominant zone) -------------------------------------
 

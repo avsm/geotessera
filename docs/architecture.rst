@@ -31,14 +31,14 @@ The library follows a layered architecture:
     └── Visualization (rendering and web maps)
             ↓
     Data Access Layer
-    ├── HTTPS downloads (urllib, no cloud SDK)
-    ├── Zarr v3 store (cloud-native streaming; forthcoming)
+    ├── HTTPS downloads (urllib3 pool, no cloud SDK)
+    ├── Zarr v3 store (cloud-native streaming)
     ├── Rasterio (GeoTIFF I/O)
     └── GeoPandas (geospatial operations)
             ↓
     Storage Layer
     ├── Source Cooperative repository (https://data.source.coop/tessera/tessera)
-    ├── Zarr store (https://data.source.coop/tessera/tessera/zarr/v1, forthcoming)
+    ├── Zarr store (https://data.source.coop/tessera/tessera/zarr/v1)
     └── Local cache (~/.cache/geotessera/{v1,v1.1-cam,...}/manifest.parquet)
 
 Coordinate System and Grid
@@ -296,20 +296,23 @@ Data Access Layer
 HTTPS Downloads
 ~~~~~~~~~~~~~~~
 
-GeoTessera streams all data (manifests, embedding tiles, and landmasks)
-over plain HTTPS (stdlib ``urllib``, no cloud SDK) from the public Source
-Cooperative repository:
+Manifests, embedding tiles, and landmasks all stream over plain HTTPS from
+the public Source Cooperative repository. There is no cloud SDK; every
+request shares one ``urllib3`` connection pool.
 
 **Features**:
 
-- **Per-output-dir mirroring**: Tiles land in the user-supplied
-  ``--output`` directory and persist there for re-use across runs
-- **Integrity checking**: Every download is verified against the response
-  ``Content-Length``, and against a streamed MD5 whenever the server's
-  ``ETag`` is a content MD5 (single-part uploads)
-- **Conditional caching**: Per-version manifests are refetched with an
-  ``If-Modified-Since`` conditional GET keyed on the cached file's mtime,
-  so unchanged manifests yield a 304 with zero body
+- **Per-output-dir mirroring**: Tiles land in the ``--output`` directory and
+  persist there for re-use across runs
+- **Connection pooling**: The thousands of per-tile GETs in a region download
+  reuse connections rather than paying a handshake each
+- **Retries**: Rate limiting, server errors, and dropped connections are
+  retried with exponential backoff, honouring ``Retry-After``
+- **Integrity checking**: A truncated response raises rather than ending the
+  stream silently, and the body is checked against the server's ``ETag``
+  wherever that is a content MD5
+- **Conditional caching**: Manifests are refetched with an
+  ``If-Modified-Since`` GET, so an unchanged one costs a 304 and no body
 - **Progress callbacks**: Real-time download feedback with speed and size info
 - **Resumable**: Existing files in the output dir are skipped on rerun
 
@@ -490,14 +493,6 @@ For sampling at specific locations, use the optimized point sampling method::
 Zarr Store (Cloud-Native Access)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-.. note::
-
-   **Zarr support is forthcoming in a future release.** The hosted Zarr
-   store has not yet been published to the Source Cooperative repository,
-   so ``GeoTesseraZarr`` will not find data at the default location until
-   the store is uploaded. The architecture below describes how it will
-   work once released.
-
 The ``GeoTesseraZarr`` class provides cloud-native access to embeddings
 without downloading files. It implements the ``geoemb:`` convention for
 geospatial embedding data stored in Zarr v3 format.
@@ -525,9 +520,27 @@ group. The store automatically routes geographic queries to the correct zone::
   mosaics with CRS and transform metadata
 - **Zone access**: ``open_zone()`` returns an xarray Dataset with a
   ``.tessera`` accessor for direct manipulation
+- **Diagnostics**: ``probe()`` returns ``(embedding, status)``, the status
+  one of ``valid``, ``water``, ``nodata`` or ``outside``. ``sample_at()``
+  returns NaN for all but the first, so use ``probe()`` to tell open water
+  from a location the store does not cover
 
 Datasets are cached per zone for the lifetime of the ``GeoTesseraZarr``
 instance.
+
+**Seam handling**:
+
+Tiles are 0.1 degrees and UTM zones 6 degrees, so round coordinates fall on
+tile edges and multiples of 6 fall on zone seams. Data is present at both,
+but a tile edge may be one unwritten pixel wide, and a point on a seam is
+often held by the zone next door. Point reads apply two fallbacks, each on
+by default and disableable on its own:
+
+- ``cross_zone`` also tries the neighbouring zone within 1 degree of a seam
+- ``search_px`` accepts the nearest valid pixel within that radius
+
+Neither reports land for sea. Water returns immediately as ``water``; only
+an unwritten pixel starts a search.
 
 Future Extensions
 ~~~~~~~~~~~~~~~~~

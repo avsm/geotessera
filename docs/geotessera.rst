@@ -78,18 +78,13 @@ Visualization utilities for creating maps, web tiles, and interactive visualizat
 
 Cloud-native access to Tessera embeddings via Zarr v3 format, with automatic UTM zone routing, point sampling, and region reading. Implements the ``geoemb:`` convention for geospatial embedding stores.
 
-.. note::
-
-   Zarr support is forthcoming in a future release: the hosted Zarr store
-   has not yet been published to the Source Cooperative repository, so this
-   API will not find data at the default location until then.
-
 **Key Features:**
 
 * :class:`~geotessera.store.GeoTesseraZarr` - Cloud-native Zarr store for streaming access without downloads
 * :meth:`~geotessera.store.GeoTesseraZarr.sample_points` - Sample embeddings at specific coordinates
 * :meth:`~geotessera.store.GeoTesseraZarr.read_region` - Read rectangular regions as mosaics
 * :meth:`~geotessera.store.GeoTesseraZarr.open_zone` - Open UTM zone as xarray Dataset
+* :meth:`~geotessera.store.GeoTesseraZarr.probe` - Sample a point, reporting why when there is no value
 
 .. automodule:: geotessera.store
    :members:

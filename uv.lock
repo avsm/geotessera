@@ -714,6 +714,7 @@ dependencies = [
     { name = "scikit-learn" },
     { name = "sphinx" },
     { name = "typer" },
+    { name = "urllib3" },
     { name = "xarray" },
     { name = "zarr" },
 ]
@@ -745,6 +746,7 @@ requires-dist = [
     { name = "scikit-learn", specifier = ">=1.7.1" },
     { name = "sphinx", specifier = ">=8.2.3" },
     { name = "typer" },
+    { name = "urllib3", specifier = ">=2" },
     { name = "xarray" },
     { name = "zarr" },
 ]

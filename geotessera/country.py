@@ -57,109 +57,26 @@ class CountryLookup:
         if self._progress_callback:
             self._progress_callback(0, 100, "Downloading country boundaries...")
 
-        # A small streaming downloader that adapts progress reporting to the
-        # outer progress callback.
-        class CountryDataDownloader:
-            def __init__(self, progress_callback):
-                self.outer_progress_callback = progress_callback
+        from .registry import download_file_to_temp
 
-            def __call__(self, url, output_file):
-                """Download with progress reporting."""
-                import requests
-                from pathlib import Path
-
-                # Ensure output directory exists
-                output_path = Path(output_file)
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-
-                # Report starting download
-                if self.outer_progress_callback:
-                    self.outer_progress_callback(0, 100, "Connecting to GitHub...")
-
-                # Start download with streaming, follow redirects
-                # Use a session for better connection handling
-                session = requests.Session()
-                session.headers.update(
-                    {
-                        "User-Agent": "GeoTessera/1.0 (https://github.com/tessera/geotessera)"
-                    }
-                )
-
-                try:
-                    response = session.get(
-                        url, stream=True, allow_redirects=True, timeout=60
-                    )
-                    response.raise_for_status()
-
-                    # Get total file size from headers
-                    total_size = int(response.headers.get("content-length", 0))
-
-                    # Initialize progress
-                    downloaded = 0
-                    last_mb = 0
-
-                    # Download in chunks
-                    chunk_size = 8192
-                    with open(output_file, "wb") as f:
-                        for chunk in response.iter_content(chunk_size=chunk_size):
-                            if chunk:  # Filter out keep-alive chunks
-                                f.write(chunk)
-                                downloaded += len(chunk)
-
-                                # Update progress only when we've downloaded another MB
-                                mb_downloaded = downloaded / (1024 * 1024)
-                                if int(mb_downloaded) > last_mb:
-                                    last_mb = int(mb_downloaded)
-                                    if self.outer_progress_callback:
-                                        if total_size > 0:
-                                            progress = int(
-                                                (downloaded / total_size) * 50
-                                            )  # First 50% for download
-                                            mb_total = total_size / (1024 * 1024)
-                                            self.outer_progress_callback(
-                                                progress,
-                                                100,
-                                                f"Downloading country data... {mb_downloaded:.1f}/{mb_total:.1f} MB",
-                                            )
-                                        else:
-                                            # No total size, estimate progress based on typical size (~18MB)
-                                            estimated_total = (
-                                                18 * 1024 * 1024
-                                            )  # 18MB typical size
-                                            progress = min(
-                                                45,
-                                                int(
-                                                    (downloaded / estimated_total) * 45
-                                                ),
-                                            )  # Cap at 45%
-                                            self.outer_progress_callback(
-                                                progress,
-                                                100,
-                                                f"Downloading country data... {mb_downloaded:.1f} MB",
-                                            )
-
-                    # Report download complete
-                    if self.outer_progress_callback:
-                        self.outer_progress_callback(50, 100, "Download complete")
-
-                finally:
-                    session.close()
-
-                return str(output_file)
-
-        # Download the archive
         url = "https://github.com/nvkelso/natural-earth-vector/archive/refs/tags/v5.1.2.zip"
         archive_path = self._cache_dir / "natural-earth-v5.1.2.zip"
 
+        # Downloading is the first half of this task's 0-100 scale and
+        # extraction the second. GitHub often omits Content-Length, so fall
+        # back to the archive's usual ~18 MB as the denominator.
+        progress_adapter = None
         if self._progress_callback:
-            downloader = CountryDataDownloader(self._progress_callback)
-            downloader(url, str(archive_path))
-        else:
-            # Simple download without progress reporting
-            from urllib.request import urlretrieve
+            estimated_total = 18 * 1024 * 1024
 
-            archive_path.parent.mkdir(parents=True, exist_ok=True)
-            urlretrieve(url, str(archive_path))
+            def progress_adapter(downloaded, total, status):
+                denom = total or estimated_total
+                pct = min(50, int(downloaded / denom * 50))
+                self._progress_callback(pct, 100, status)
+
+        download_file_to_temp(
+            url, progress_callback=progress_adapter, cache_path=archive_path
+        )
 
         # Extract the specific GeoJSON file we need
         if self._progress_callback:
