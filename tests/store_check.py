@@ -37,13 +37,17 @@ def check(name, condition):
 # ---------------------------------------------------------------------------
 
 check("zone interior needs no neighbours", _seam_neighbours(3.0) == [])
-check("just east of a seam looks west", _seam_neighbours(138.2) == [53])
-check("just west of a seam looks east", _seam_neighbours(137.8) == [54])
+check("just east of a seam looks west", _seam_neighbours(138.03) == [53])
+check("just west of a seam looks east", _seam_neighbours(137.97) == [54])
+# The band is half a tile wide each side, since a tile belongs to the zone
+# holding its centre.  A point a whole tile from the seam is served by its own
+# zone alone.
+check("a tile away from a seam needs no neighbours", _seam_neighbours(138.2) == [])
 # On a seam the natural zone is the eastern one, so the list holds only its
 # western neighbour: what probe() has not already tried.
 check("exactly on a seam adds the western zone", _seam_neighbours(138.0) == [53])
-check("zone 1 wraps west to 60", _seam_neighbours(-179.9) == [60])
-check("zone 60 wraps east to 1", _seam_neighbours(179.9) == [1])
+check("zone 1 wraps west to 60", _seam_neighbours(-179.97) == [60])
+check("zone 60 wraps east to 1", _seam_neighbours(179.97) == [1])
 
 check(
     "zone routing still agrees with the plain longitude rule away from seams",
