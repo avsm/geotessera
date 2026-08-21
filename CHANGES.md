@@ -33,7 +33,7 @@
   of 6 fall on zone seams — the coordinates people reach for first. A tile
   edge can be one unwritten pixel wide, and a point on a seam is often held
   by the zone next door. Two fallbacks now cover both: `cross_zone` tries the
-  neighbouring zone within 1 degree of a seam, and `search_px` accepts the
+  neighbouring zone within 0.1 degrees of a seam, and `search_px` accepts the
   nearest valid pixel within 1 pixel. Each is on by default and disableable
   on its own; away from a seam, no extra zone is opened. Neither can report
   land for sea, since water returns immediately.

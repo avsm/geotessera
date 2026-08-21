@@ -89,7 +89,14 @@ def _zone_for_point(x: float, y: float, crs: str = "EPSG:4326") -> int:
 # boundary although its grid runs past it.
 
 SEAM_SEARCH_PX = 1  # nearest-valid-pixel radius
-SEAM_DEGREES = 1.0  # how near a seam before neighbouring zones are tried
+
+# How close to a seam before the neighbouring zone is worth trying. A tile is
+# 0.1 degrees and belongs to the zone containing its centre, so a point can
+# only be covered by the zone next door if it is within half a tile — 0.05
+# degrees — of the boundary. This is that bound doubled, which absorbs the
+# sub-pixel spread of a tile's curved UTM footprint and still consults a
+# neighbour only where one can actually hold the data.
+SEAM_DEGREES = 0.1
 
 VALID, WATER, NODATA, OUTSIDE = "valid", "water", "nodata", "outside"
 
@@ -544,8 +551,13 @@ class GeoTesseraZarr:
         for z in zones:
             try:
                 acc = self.open_zone(zone=z).tessera
-            except Exception as exc:  # zone absent from this store
-                log.debug("probe: zone %d unavailable (%s)", z, exc)
+            except KeyError as exc:
+                # Only "this store has no such zone group". A missing store or
+                # one without consolidated metadata raises FileNotFoundError or
+                # ValueError and fails every zone alike, so letting those
+                # through here would report `outside` for a broken store
+                # instead of saying what is wrong.
+                log.debug("probe: zone %d not in this store (%s)", z, exc)
                 continue
             if crs == acc.crs:
                 e, n = x, y
