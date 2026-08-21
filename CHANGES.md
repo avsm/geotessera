@@ -7,71 +7,42 @@
   `https://data.source.coop/tessera/tessera` repository over HTTPS,
   replacing the retired `tessera-embeddings` AWS S3 bucket.
 
-  The repository is organised by media type. The `npy/` tree has one
-  directory per *dataset* — a (version, variant) pair — with the variant
-  encoded as a directory suffix: all v1 variants share `npy/v1/`,
-  1.1/cambridge lives in `npy/v1.1-cam/`, and the v2 beta in
-  `npy/v2-2B-L~beta1/`. Each dataset directory carries its own
-  `manifest.parquet`. The `landmasks/{version}/` and `zarr/{version}/`
-  trees stay keyed by plain version. (@avsm, @mtelvers)
-
-- `botocore` and `awscrt` are no longer required dependencies. Every HTTPS
-  request now goes through one shared `urllib3` connection pool rather than
-  the standard library's `urllib`, so `urllib3` is a new direct dependency
-  (@avsm)
+- `botocore` and `awscrt` are no longer required dependencies as `urllib3`
+  is a new direct dependency (@avsm)
 
 ### New Features
 
-- **The hosted Zarr store is live** at
-  `https://data.source.coop/tessera/tessera/zarr/v1`, with all 60 UTM zone
-  groups, years 2017-2025, and the `global_rgb` preview pyramid.
-  `GeoTesseraZarr()` streams from it with no downloads and no configuration
-  (@avsm)
-- **Seam-aware point reads**: `sample_at` and `sample_points` no longer
-  return NaN for locations the store does have. Tiles are 0.1 degrees and
-  UTM zones 6 degrees, so round coordinates fall on tile edges and multiples
-  of 6 fall on zone seams — the coordinates people reach for first. A tile
-  edge can be one unwritten pixel wide, and a point on a seam is often held
-  by the zone next door. Two fallbacks now cover both: `cross_zone` tries the
-  neighbouring zone within 0.1 degrees of a seam, and `search_px` accepts the
-  nearest valid pixel within 1 pixel. Each is on by default and disableable
-  on its own; away from a seam, no extra zone is opened. Neither can report
-  land for sea, since water returns immediately.
+- The hosted Zarr store is available at
+  `https://data.source.coop/tessera/tessera/zarr/v1`. `GeoTesseraZarr()`
+  streams from it with no downloads and no configuration (@avsm)
 
-  A new `probe()` on the store and on the `.tessera` accessor returns
+- Seam-aware point reads for `sample_at` and `sample_points`.
+  Tiles are 0.1 degrees and UTM zones 6 degrees, so round coordinates fall on
+  tile edges and multiples of 6 fall on zone seams.  Our Zarr wrapper now
+  tries the neighbouring UTM zone within 0.1 degrees of a seam, and
+  `search_px` accepts the nearest valid pixel within 1 pixel.
+
+-  A new `probe()` on the store and on the `.tessera` accessor returns
   `(embedding, status)`, the status one of `valid`, `water`, `nodata` or
   `outside`. Use it to tell open water from a location the store does not
   cover, which `sample_at` reports alike as NaN. It also rejects a point
   beyond the grid instead of snapping it to the nearest edge pixel.
   Reported by Srinivasan Keshav (@avsm)
-- **Pooled, self-retrying downloads**: the thousands of per-tile GETs in a
-  region download now reuse connections instead of paying a handshake each.
-  Rate limiting, server errors, and dropped connections are retried with
-  exponential backoff honouring `Retry-After`, and a truncated response
-  raises rather than ending the stream silently. Failures that strike
-  mid-stream restart the transfer. The country-boundary fetch and
-  `--region-file <url>` take the same path, retiring the last two bespoke
-  downloaders and the optional `requests` import with them (@avsm)
+
 - Per-version default variant allows omitting the dataset-variant.
   `--dataset-variant` now selects the version's default variant (`vultr`
-  for v1, `cambridge` for v1.1, `2B-L~beta1` for v2) instead of always
-  `vultr`, so `GeoTessera(dataset_version="v1.1")` works. The known
-  datasets — including the reserved, not-yet-published `v1.1-dclimate`
-  complete-global run, which raises a "coming soon" error if selected —
-  are listed in the new "Known Datasets" table printed by
+  for v1, `cambridge` for v1.1, `2B-L~beta1` for v2) so
+  `GeoTessera(dataset_version="v1.1")` works. 
+  The known datasets are listed in the new "Known Datasets" table printed by
   `geotessera info` (@avsm)
+
 - `geotessera-registry zarr-consolidate` is a new subcommand that
   re-consolidates a store's root metadata after in-place changes.
   Mostly only for repairs and not regular use.
+
 - `geotessera-registry s3scan` scans Source Cooperative to list
   embeddings. This allows manifests and landmask registries to be
-  regenerated directly from the Source Cooperative repository. Listing
-  requests retry transient failures (429/5xx, timeouts, connection
-  resets) with exponential backoff; if a shard still fails after all
-  retries the affected manifest is not written and the command exits
-  non-zero, so an incomplete manifest can never be uploaded. The summary
-  panel prints per-file `aws s3 cp` upload commands with the correct
-  per-tree destinations (@avsm)
+  regenerated directly from the Source Cooperative repository.  (@avsm)
 
 ## v0.9.0 (2026-06-09)
 
