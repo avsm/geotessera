@@ -1,4 +1,4 @@
-## 0.10.0 (2026-08-13)
+## 0.10.0 (2026-08-20)
 
 ### Breaking Changes
 
@@ -15,10 +15,43 @@
   `manifest.parquet`. The `landmasks/{version}/` and `zarr/{version}/`
   trees stay keyed by plain version. (@avsm, @mtelvers)
 
-- `botocore` and `awscrt` are no longer required dependencies (@avsm)
+- `botocore` and `awscrt` are no longer required dependencies. Every HTTPS
+  request now goes through one shared `urllib3` connection pool rather than
+  the standard library's `urllib`, so `urllib3` is a new direct dependency
+  (@avsm)
 
 ### New Features
 
+- **The hosted Zarr store is live** at
+  `https://data.source.coop/tessera/tessera/zarr/v1`, with all 60 UTM zone
+  groups, years 2017-2025, and the `global_rgb` preview pyramid.
+  `GeoTesseraZarr()` streams from it with no downloads and no configuration
+  (@avsm)
+- **Seam-aware point reads**: `sample_at` and `sample_points` no longer
+  return NaN for locations the store does have. Tiles are 0.1 degrees and
+  UTM zones 6 degrees, so round coordinates fall on tile edges and multiples
+  of 6 fall on zone seams — the coordinates people reach for first. A tile
+  edge can be one unwritten pixel wide, and a point on a seam is often held
+  by the zone next door. Two fallbacks now cover both: `cross_zone` tries the
+  neighbouring zone within 1 degree of a seam, and `search_px` accepts the
+  nearest valid pixel within 1 pixel. Each is on by default and disableable
+  on its own; away from a seam, no extra zone is opened. Neither can report
+  land for sea, since water returns immediately.
+
+  A new `probe()` on the store and on the `.tessera` accessor returns
+  `(embedding, status)`, the status one of `valid`, `water`, `nodata` or
+  `outside`. Use it to tell open water from a location the store does not
+  cover, which `sample_at` reports alike as NaN. It also rejects a point
+  beyond the grid instead of snapping it to the nearest edge pixel.
+  Reported by Srinivasan Keshav (@avsm)
+- **Pooled, self-retrying downloads**: the thousands of per-tile GETs in a
+  region download now reuse connections instead of paying a handshake each.
+  Rate limiting, server errors, and dropped connections are retried with
+  exponential backoff honouring `Retry-After`, and a truncated response
+  raises rather than ending the stream silently. Failures that strike
+  mid-stream restart the transfer. The country-boundary fetch and
+  `--region-file <url>` take the same path, retiring the last two bespoke
+  downloaders and the optional `requests` import with them (@avsm)
 - Per-version default variant allows omitting the dataset-variant.
   `--dataset-variant` now selects the version's default variant (`vultr`
   for v1, `cambridge` for v1.1, `2B-L~beta1` for v2) instead of always

@@ -12,7 +12,6 @@ import time
 import http.server
 import socketserver
 import tempfile
-import urllib.request
 import urllib.parse
 import logging
 from pathlib import Path
@@ -91,14 +90,18 @@ def download_region_file(url: str) -> str:
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
         temp_path = temp_file.name
         temp_file.close()
+        # An existing file would send the downloader down its
+        # If-Modified-Since path, so drop the empty placeholder first.
+        os.unlink(temp_path)
 
-        # Download the file
-        urllib.request.urlretrieve(url, temp_path)
+        from geotessera.registry import download_file_to_temp
+
+        download_file_to_temp(url, cache_path=Path(temp_path))
 
         return temp_path
 
     except Exception as e:
-        # Don't leave the empty temp file behind if the download failed.
+        # Don't leave the temp file behind if the download failed.
         if temp_path and os.path.exists(temp_path):
             os.unlink(temp_path)
         raise Exception(f"Failed to download region file from {url}: {e}")

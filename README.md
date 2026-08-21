@@ -335,13 +335,6 @@ visualize_global_coverage(
 
 ## Cloud-Native Zarr Access
 
-> [!NOTE]
-> **Zarr support is forthcoming in a future release.** The hosted Zarr store
-> has not yet been published to the new Source Cooperative repository, so the
-> `GeoTesseraZarr` API below is a preview and will not find data at the
-> default location until the store is uploaded. Use the `download` workflow
-> above in the meantime.
-
 For interactive or large-scale analysis without downloading files, use the Zarr store.
 This streams data directly from the cloud:
 
@@ -653,7 +646,7 @@ Remote Server (https://data.source.coop/tessera/tessera)
 │       ├── landmasks.parquet
 │       └── grid_0.15_52.05.tiff
 └── zarr/                                      # Cloud-native zarr store
-    └── v1/                                    # (forthcoming in a future release)
+    └── v1/                                    # 60 UTM zone groups + RGB pyramid
 ```
 
 ### Local Cache Structure

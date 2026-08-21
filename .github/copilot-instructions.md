@@ -16,7 +16,7 @@ GeoTessera is a Python library for accessing and working with Tessera geospatial
 
 ### Core Dependencies
 
-- **Python**: 3.12 or 3.13 required (3.12+ due to geozarr-toolkit)
+- **Python**: 3.12 or 3.13 required (`requires-python = ">=3.12"`)
 - **CLI Framework**: `typer` with `rich` for interactive output
 - **Geospatial**: `rasterio`, `geopandas`, `rioxarray` for GIS operations
 - **Data Processing**: `numpy`, `pandas`, `pyarrow` (for Parquet registry)

@@ -36,7 +36,7 @@ Key Features
 
 * **Global Coverage**: Access embeddings for any terrestrial location worldwide where data exists
 * **Flexible Formats**: Export as numpy arrays for analysis or GeoTIFF for GIS integration
-* **Cloud-Native Zarr Access**: Stream embeddings directly via ``GeoTesseraZarr`` without downloading files (*forthcoming in a future release* — the hosted Zarr store is not yet published)
+* **Cloud-Native Zarr Access**: Stream embeddings directly via ``GeoTesseraZarr`` without downloading files
 * **Projection Preservation**: Native UTM projections preserved from landmask tiles
 * **High Resolution**: 10m spatial resolution
 * **Temporal Compression**: Full year of satellite observations in each embedding
@@ -411,7 +411,7 @@ Data Organization
     │       ├── landmasks.parquet
     │       └── grid_0.15_52.05.tiff
     └── zarr/                                        # Cloud-native zarr store
-        └── v1/                                      # (forthcoming in a future release)
+        └── v1/                                      # 60 UTM zone groups + RGB pyramid
 
 Each ``manifest.parquet`` is scoped to one dataset — the npy/ directory
 name encodes the ``(version, variant)`` pair (a future ``v1.1-dclimate``
