@@ -2,14 +2,19 @@
 
 ### Breaking Changes
 
-- `sphinx` and `cram` are no longer runtime dependencies.
-  Sphinx moved to a `docs` extra (`pip install geotessera[docs]`)
-  and cram to the `dev` dependency group (@avsm)
-
 - All NPY downloads now come from the Source Cooperative, fronted by CloudFlare.
   Embeddings, landmasks and manifests are served from the public
   `https://data.source.coop/tessera/tessera` repository over HTTPS,
   replacing the retired `tessera-embeddings` AWS S3 bucket.
+
+- `sphinx` and `cram` are no longer runtime dependencies.
+  Sphinx moved to a `docs` extra (`pip install geotessera[docs]`)
+  and cram to the `dev` dependency group (@avsm)
+
+- The Zarr read API drops `crs=`. The store is UTM-native, so 
+  `GeoTesseraZarr` takes lon/lat and routes to the `utm{NN}` group holding
+  the point, and the `.tessera` accessor takes eastings and northings in
+  that zone's own CRS. Project to lon/lat once up front, rather than per call.
 
 - `botocore` and `awscrt` are no longer required dependencies as `urllib3`
   is a new direct dependency (@avsm)

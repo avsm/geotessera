@@ -163,19 +163,25 @@ check(
 check(
     "sample_at repairs the hole the same way probe does",
     np.allclose(
-        holed.tessera.sample_at(cx, cy, 2024, crs="EPSG:32653"),
+        holed.tessera.sample_at(cx, cy, 2024),
         np.array([1, 2, 3, 4]) * 0.05,
         atol=1e-6,
     ),
 )
+# probe and sample_at are the same lookup, so on one zone they must read a
+# coordinate pair the same way.  They did not: probe took UTM while sample_at
+# took lon/lat, so the same numbers meant different places on adjacent methods.
+v_probe, _ = holed.tessera.probe(cx, cy, 2024)
+v_sample = holed.tessera.sample_at(cx, cy, 2024)
+check(
+    "probe and sample_at agree on the same coordinates",
+    v_probe is not None and np.allclose(v_probe, v_sample, atol=1e-6),
+)
+
 check(
     "sample_at returns a NaN row for water",
     np.all(
-        np.isnan(
-            watery.tessera.sample_at(
-                float(watery.x[2]), float(watery.y[2]), 2024, crs="EPSG:32653"
-            )
-        )
+        np.isnan(watery.tessera.sample_at(float(watery.x[2]), float(watery.y[2]), 2024))
     ),
 )
 
