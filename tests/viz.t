@@ -58,7 +58,7 @@ Test: Download Tiles for Cambridge Region (Bbox)
 Download tiles covering a small area of Cambridge using a bounding box.
 This bbox covers just 4 tiles for faster testing:
 
-  $ geotessera download \
+  $ geotessera download --source tiles \
   >   --bbox "0.086174,52.183432,0.151062,52.206318" \
   >   --year 2024 \
   >   --format tiff \
@@ -101,7 +101,7 @@ The visualize command should:
   >   "$TESTDIR/cb_tiles_tiff" \
   >   "$TESTDIR/cb_pca_mosaic.tif" 2>&1 | grep -A 1 -E 'Found|Created PCA mosaic' | sed 's/ *$//'
   Found 4 tiles (npy format)
-  Combined data shape: (3317086, 128)
+  PCA fit sample: (100000, 128)
   --
   Created PCA mosaic:
   * (glob)
@@ -142,7 +142,7 @@ Test: Visualize - NPY Format Input
 
 Download the same region in NPY format and create a visualization:
 
-  $ geotessera download \
+  $ geotessera download --source tiles \
   >   --bbox "0.086174,52.183432,0.151062,52.206318" \
   >   --year 2024 \
   >   --format npy \
@@ -156,7 +156,7 @@ Create visualization from NPY format:
   >   "$TESTDIR/cb_tiles_npy" \
   >   "$TESTDIR/cb_pca_from_npy.tif" 2>&1 | grep -A 1 -E 'Found|Created PCA mosaic' | sed 's/ *$//'
   Found 4 tiles (npy format)
-  Combined data shape: (3317086, 128)
+  PCA fit sample: (100000, 128)
   --
   Created PCA mosaic:
   * (glob)

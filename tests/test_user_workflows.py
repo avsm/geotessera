@@ -229,6 +229,84 @@ def test_stream_export_validates_before_writing(tmp_path, kwargs):
     assert not list(tmp_path.iterdir())
 
 
+def test_cli_download_streams_without_registry(tmp_path, monkeypatch):
+    import geotessera.workflows as workflows
+    import geotessera.cli as cli
+
+    gt, bbox = fake_region()
+    monkeypatch.setattr(workflows, "open_stream", lambda *args: gt)
+    monkeypatch.setattr(
+        cli,
+        "GeoTessera",
+        lambda **kwargs: pytest.fail("Zarr must not construct Registry"),
+    )
+    result = CliRunner().invoke(
+        app,
+        [
+            "download",
+            "--bbox",
+            ",".join(map(str, bbox)),
+            "--output",
+            str(tmp_path),
+            "--bands",
+            "0,2",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "tessera_2024_utm30.tif").exists()
+
+
+def test_cli_download_from_real_local_zarr(tmp_path):
+    import zarr
+
+    gt, bbox = fake_region()
+    store = tmp_path / "local.zarr"
+    gt._cache[30].to_zarr(store, group="utm30", zarr_format=3, consolidated=False)
+    root = zarr.open_group(store, mode="a")
+    root.attrs["geoemb:dimensions"] = 4
+    zarr.consolidate_metadata(root.store)
+    output = tmp_path / "output"
+    result = CliRunner().invoke(
+        app,
+        [
+            "download",
+            "--store-url",
+            str(store),
+            "--bbox",
+            ",".join(map(str, bbox)),
+            "--output",
+            str(output),
+            "--bands",
+            "2",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    with rasterio.open(output / "tessera_2024_utm30.tif") as src:
+        assert np.all(src.read() == 3)
+
+
+def test_cli_webmap_streams_region(tmp_path, monkeypatch):
+    import geotessera.workflows as workflows
+    import geotessera.cli as cli
+
+    gt, bbox = fake_region()
+    monkeypatch.setattr(workflows, "open_stream", lambda *args: gt)
+
+    def fake_tiles(**kwargs):
+        Path(kwargs["output_dir"]).mkdir(parents=True, exist_ok=True)
+        return kwargs["output_dir"]
+
+    monkeypatch.setattr(cli, "geotiff_to_web_tiles", fake_tiles)
+    result = CliRunner().invoke(
+        app, ["webmap", "--bbox", ",".join(map(str, bbox)), "--output", str(tmp_path)]
+    )
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "viewer.html").exists()
+    with rasterio.open(tmp_path / "rgb_mosaic.tif") as src:
+        assert src.count == 3 and src.crs.to_epsg() == 3857
+        assert src.dtypes == ("uint8",) * 3
+
+
 def test_folium_viewer_uses_relative_tile_path(tmp_path):
     from geotessera.web import create_simple_web_viewer
 
@@ -255,3 +333,98 @@ def test_pca_shared_basis_and_nan_mask(tmp_path):
         np.testing.assert_array_equal(a.read(), b.read())
         assert a.dataset_mask()[0, 0] == 0
         assert a.dataset_mask()[1, 1] == 255
+
+
+def test_webmap_reuses_completed_stages(tmp_path, monkeypatch):
+    import geotessera.workflows as workflows
+    import geotessera.cli as cli
+
+    gt, bbox = fake_region()
+    reads, renders = [], []
+
+    def open_stream(*args):
+        reads.append(args)
+        return gt
+
+    def tiles(**kwargs):
+        renders.append(kwargs)
+        directory = Path(kwargs["output_dir"])
+        directory.mkdir(parents=True)
+        (directory / "tile.png").touch()
+        return str(directory)
+
+    monkeypatch.setattr(workflows, "open_stream", open_stream)
+    monkeypatch.setattr(cli, "geotiff_to_web_tiles", tiles)
+    args = ["webmap", "--bbox", ",".join(map(str, bbox)), "--output", str(tmp_path)]
+    for extra, counts in [
+        ([], (1, 1)),
+        ([], (1, 1)),
+        (["--max-zoom", "14"], (1, 2)),
+        (["--bands", "2,1,0"], (2, 3)),
+        (["--bands", "2,1,0", "--force"], (3, 4)),
+    ]:
+        result = CliRunner().invoke(app, args + extra)
+        assert result.exit_code == 0, result.output
+        assert (len(reads), len(renders)) == counts
+
+
+def test_webmap_retries_failed_tiles_without_streaming(tmp_path, monkeypatch):
+    import geotessera.workflows as workflows
+    import geotessera.cli as cli
+
+    gt, bbox = fake_region()
+    monkeypatch.setattr(workflows, "open_stream", lambda *args: gt)
+
+    def failed_tiles(**kwargs):
+        directory = Path(kwargs["output_dir"])
+        directory.mkdir(parents=True)
+        (directory / "partial.png").touch()
+        raise RuntimeError("interrupted")
+
+    monkeypatch.setattr(cli, "geotiff_to_web_tiles", failed_tiles)
+    args = ["webmap", "--bbox", ",".join(map(str, bbox)), "--output", str(tmp_path)]
+    assert CliRunner().invoke(app, args).exit_code == 1
+    assert not (tmp_path / "tiles.json").exists()
+    monkeypatch.setattr(
+        workflows, "open_stream", lambda *args: pytest.fail("streamed again")
+    )
+
+    def tiles(**kwargs):
+        directory = Path(kwargs["output_dir"])
+        assert not directory.exists()
+        directory.mkdir()
+        (directory / "finished.png").touch()
+        return str(directory)
+
+    monkeypatch.setattr(cli, "geotiff_to_web_tiles", tiles)
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 0, result.output
+
+
+@pytest.mark.parametrize("ipv6", [False, True])
+def test_occupied_port_fails_before_streaming(tmp_path, monkeypatch, ipv6):
+    import socket
+    import geotessera.workflows as workflows
+
+    if ipv6 and not socket.has_dualstack_ipv6():
+        pytest.skip("IPv6 unavailable")
+    monkeypatch.setattr(workflows, "open_stream", lambda *args: pytest.fail("streamed"))
+    with socket.socket(socket.AF_INET6 if ipv6 else socket.AF_INET) as listener:
+        listener.bind(("::1" if ipv6 else "127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        for args in [
+            ["serve", str(tmp_path), "--no-open"],
+            [
+                "webmap",
+                "--bbox",
+                "0,52,0.01,52.01",
+                "--output",
+                str(tmp_path),
+                "--serve",
+            ],
+        ]:
+            result = CliRunner().invoke(app, args + ["--port", str(port)])
+            assert result.exit_code != 0
+            assert "Cannot bind web server" in result.output
+            assert not (tmp_path / "rgb_mosaic.tif").exists()

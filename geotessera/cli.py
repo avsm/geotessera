@@ -8,13 +8,10 @@ Focused on downloading tiles and creating visualizations from the generated GeoT
 import importlib.resources
 import os
 import webbrowser
-import threading
-import time
 import http.server
-import socketserver
-import tempfile
 import urllib.parse
 import logging
+from enum import StrEnum
 from pathlib import Path
 from typing import Optional, Callable
 from typing_extensions import Annotated
@@ -37,9 +34,7 @@ from rich.table import Table
 from rich import print as rprint
 
 from .core import GeoTessera
-from .country import get_country_bbox
 from .visualization import (
-    calculate_bbox_from_file,
     create_pca_mosaic,
 )
 from .web import (
@@ -50,62 +45,16 @@ from .web import (
 from ._terminal import console, emoji
 
 
-def is_url(string: str) -> bool:
-    """Check if a string is a valid URL."""
-    try:
-        result = urllib.parse.urlparse(string)
-        return all([result.scheme, result.netloc])
-    except Exception:
-        return False
+class DownloadSource(StrEnum):
+    auto = "auto"
+    zarr = "zarr"
+    tiles = "tiles"
 
 
-def download_region_file(url: str) -> str:
-    """Download a region file from a URL to a temporary location.
-
-    Args:
-        url: The URL to download from
-
-    Returns:
-        Path to the temporary downloaded file
-
-    Raises:
-        Exception: If download fails
-    """
-    temp_path = None
-    try:
-        # Create a temporary file with appropriate extension
-        parsed_url = urllib.parse.urlparse(url)
-        path = parsed_url.path
-        if path.endswith(".geojson"):
-            suffix = ".geojson"
-        elif path.endswith(".json"):
-            suffix = ".json"
-        elif path.endswith(".shp"):
-            suffix = ".shp"
-        elif path.endswith(".gpkg"):
-            suffix = ".gpkg"
-        else:
-            # Default to geojson for unknown extensions
-            suffix = ".geojson"
-
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-        temp_path = temp_file.name
-        temp_file.close()
-        # An existing file would send the downloader down its
-        # If-Modified-Since path, so drop the empty placeholder first.
-        os.unlink(temp_path)
-
-        from geotessera.registry import download_file_to_temp
-
-        download_file_to_temp(url, cache_path=Path(temp_path))
-
-        return temp_path
-
-    except Exception as e:
-        # Don't leave the temp file behind if the download failed.
-        if temp_path and os.path.exists(temp_path):
-            os.unlink(temp_path)
-        raise Exception(f"Failed to download region file from {url}: {e}")
+class BalanceMethod(StrEnum):
+    histogram = "histogram"
+    percentile = "percentile"
+    adaptive = "adaptive"
 
 
 def format_bbox(bbox_coords) -> str:
@@ -193,21 +142,6 @@ def create_table(show_header=True, header_style=None, box=None, **kwargs):
         return Table(
             show_header=show_header, header_style=header_style, box=actual_box, **kwargs
         )
-
-
-def create_panel(content, title=None, border_style=None):
-    """Return content directly without panel wrapper.
-
-    Args:
-        content: Content to display (table, text, etc.)
-        title: Panel title (ignored)
-        border_style: Panel border style (ignored)
-
-    Returns:
-        Content without panel wrapper (tables display well on their own)
-    """
-    # Don't nest tables in panels - tables look good on their own
-    return content
 
 
 def create_progress(*args, **kwargs):
@@ -381,13 +315,7 @@ def info(
         analysis_table.add_row("Years:", ", ".join(coverage["years"]))
         analysis_table.add_row("CRS:", ", ".join(coverage["crs"]))
 
-        rprint(
-            create_panel(
-                analysis_table,
-                title="[bold]📊 Tile Analysis[/bold]",
-                border_style="blue",
-            )
-        )
+        rprint(analysis_table)
 
         bounds = coverage["bounds"]
 
@@ -399,11 +327,7 @@ def info(
             "Latitude:", f"{bounds['min_lat']:.6f} to {bounds['max_lat']:.6f}"
         )
 
-        rprint(
-            create_panel(
-                bounds_table, title="[bold]🗺️ Bounding Box[/bold]", border_style="green"
-            )
-        )
+        rprint(bounds_table)
 
         bands_table = create_table(show_header=True, header_style="bold blue")
         bands_table.add_column("Band Count")
@@ -412,13 +336,7 @@ def info(
         for bands_count, count in coverage["band_counts"].items():
             bands_table.add_row(f"{bands_count} bands", str(count))
 
-        rprint(
-            create_panel(
-                bands_table,
-                title="[bold]🎵 Band Information[/bold]",
-                border_style="cyan",
-            )
-        )
+        rprint(bands_table)
 
         if verbose:
             tiles_table = create_table(show_header=True, header_style="bold blue")
@@ -433,13 +351,7 @@ def info(
                     str(tile["bands"]),
                 )
 
-            rprint(
-                create_panel(
-                    tiles_table,
-                    title="[bold]📁 First 10 Tiles[/bold]",
-                    border_style="yellow",
-                )
-            )
+            rprint(tiles_table)
 
     else:
         # Show library info
@@ -465,13 +377,7 @@ def info(
 
         info_table.add_row("Total landmasks:", f"{total_landmasks:,}")
 
-        rprint(
-            create_panel(
-                info_table,
-                title=f"[bold]🌍 GeoTessera v{__version__} Library Info[/bold]",
-                border_style="blue",
-            )
-        )
+        rprint(info_table)
 
         # List every known (version, variant) dataset so users can discover
         # valid --dataset-version/--dataset-variant combinations.
@@ -490,14 +396,7 @@ def info(
                 ds_dir or "-",
                 "available" if ds_dir else "coming soon",
             )
-        rprint(
-            create_panel(
-                datasets_table,
-                title="[bold]📚 Known Datasets[/bold] "
-                "(select with --dataset-version/--dataset-variant)",
-                border_style="cyan",
-            )
-        )
+        rprint(datasets_table)
 
 
 @app.command()
@@ -643,142 +542,24 @@ def coverage(
     from .visualization import visualize_global_coverage
     from rich.progress import BarColumn, TextColumn, TimeRemainingColumn
 
-    # Process region file or country if provided
-    region_bbox = None
-    country_geojson_file = None
-    region_file_temp = None  # Track if we created a temporary file
+    from .inputs import resolve_region
 
-    # Check mutual exclusivity of region options
-    region_sources = sum(1 for x in [bbox, tile, region_file, country] if x)
-    if region_sources > 1:
-        rprint(
-            "[red]Error: Cannot specify multiple region options. "
-            "Choose one of: --bbox, --tile, --region-file, --country[/red]"
-        )
-        raise typer.Exit(1)
-
-    if tile:
+    region_bbox, region_geometry = None, None
+    if any(value is not None for value in (bbox, tile, region_file, country)):
         try:
-            tile_coords = tuple(map(float, tile.split(",")))
-            if len(tile_coords) != 2:
-                rprint("[red]Error: --tile must be 'lon,lat'[/red]")
-                raise typer.Exit(1)
-            lon, lat = tile_coords
-            tile_center = tile_from_world(lon, lat)
+            region_bbox, region_geometry = resolve_region(
+                bbox=bbox, tile=tile, region_file=region_file, country=country
+            )
+        except (ValueError, OSError) as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        point_selector = tile if tile is not None else bbox
+        if point_selector is not None and len(point_selector.split(",")) == 2:
+            lon, lat = map(float, point_selector.split(","))
             region_bbox = point_to_tile_bbox(lon, lat)
             rprint(
-                f"[green]Point ({lon}, {lat}) -> tile "
-                f"grid_{tile_center[0]:.2f}_{tile_center[1]:.2f}[/green]"
+                f"Point ({lon}, {lat}) -> tile grid_{region_bbox[0]:.2f}_{region_bbox[1]:.2f}"
             )
-            rprint(f"[green]Region bounding box:[/green] {format_bbox(region_bbox)}")
-        except ValueError as e:
-            rprint(f"[red]Error: Invalid --tile format. Use 'lon,lat': {e}[/red]")
-            raise typer.Exit(1)
-    elif bbox:
-        try:
-            bbox_coords = tuple(map(float, bbox.split(",")))
-            if len(bbox_coords) == 2:
-                # Two coordinates = single tile
-                lon, lat = bbox_coords
-                tile_center = tile_from_world(lon, lat)
-                region_bbox = point_to_tile_bbox(lon, lat)
-                rprint(
-                    f"[green]Point ({lon}, {lat}) -> tile "
-                    f"grid_{tile_center[0]:.2f}_{tile_center[1]:.2f}[/green]"
-                )
-            elif len(bbox_coords) == 4:
-                region_bbox = bbox_coords
-            else:
-                rprint(
-                    "[red]Error: bbox must be 'lon,lat' (single tile) "
-                    "or 'min_lon,min_lat,max_lon,max_lat'[/red]"
-                )
-                raise typer.Exit(1)
-            rprint(f"[green]Region bounding box:[/green] {format_bbox(region_bbox)}")
-        except ValueError:
-            rprint(
-                "[red]Error: Invalid bbox format. Use: 'lon,lat' or "
-                "'min_lon,min_lat,max_lon,max_lat'[/red]"
-            )
-            raise typer.Exit(1)
-    elif region_file:
-        try:
-            # Check if region_file is a URL
-            if is_url(region_file):
-                rprint(f"[blue]Downloading region file from URL: {region_file}[/blue]")
-                region_file_temp = download_region_file(region_file)
-                region_file_path = region_file_temp
-            else:
-                # Check if local file exists
-                region_path = Path(region_file)
-                if not region_path.exists():
-                    rprint(
-                        f"[red]Error: Region file {region_file} does not exist[/red]"
-                    )
-                    raise typer.Exit(1)
-                region_file_path = str(region_path)
-
-            region_bbox = calculate_bbox_from_file(region_file_path)
-            rprint(f"[green]Region bounding box: {format_bbox(region_bbox)}[/green]")
-        except Exception as e:
-            rprint(f"[red]Error reading region file: {e}[/red]")
-            raise typer.Exit(1)
-    elif country:
-        # Create progress bar for country data download
-        with create_progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TextColumn("•"),
-            TextColumn("[dim]{task.fields[status]}", justify="left"),
-            TimeRemainingColumn(),
-        ) as progress:
-            country_task = progress.add_task(
-                f"{emoji('🌍 ')}Loading country data...",
-                total=100,
-                status="Checking cache...",
-            )
-
-            def country_progress_callback(current: int, total: int, status: str = None):
-                progress.update(
-                    country_task,
-                    completed=current,
-                    total=total,
-                    status=status or "Processing...",
-                )
-
-            try:
-                # Get country lookup instance
-                from .country import get_country_lookup
-
-                country_lookup = get_country_lookup(
-                    progress_callback=country_progress_callback
-                )
-
-                # Get both bbox and geometry
-                region_bbox = country_lookup.get_bbox(country)
-                country_gdf = country_lookup.get_geometry(country)
-
-                # Create temporary GeoJSON file for the country boundary
-                with tempfile.NamedTemporaryFile(
-                    mode="w", suffix=".geojson", delete=False
-                ) as tmp:
-                    tmp.close()
-                    country_gdf.to_file(tmp.name, driver="GeoJSON")
-                    country_geojson_file = tmp.name
-
-                progress.update(country_task, completed=100, status="Complete")
-            except ValueError as e:
-                rprint(f"[red]Error: {e}[/red]")
-                rprint(
-                    "[blue]Check the country name spelling (uses Natural Earth admin-0 names)[/blue]"
-                )
-                raise typer.Exit(1)
-            except Exception as e:
-                rprint(f"[red]Error fetching country data: {e}[/red]")
-                raise typer.Exit(1)
-
-        rprint(f"[green]Using country '{country}': {format_bbox(region_bbox)}[/green]")
+        rprint(f"Region bounding box: {format_bbox(region_bbox)}")
 
     # Initialize GeoTessera
     if verbose:
@@ -793,7 +574,9 @@ def coverage(
         dataset_variant is not None and dataset_variant.lower() == "all"
     ):
         if not by_source:
-            rprint("[blue]Explicit 'all' requested: enabling --by-source rendering[/blue]")
+            rprint(
+                "[blue]Explicit 'all' requested: enabling --by-source rendering[/blue]"
+            )
         by_source = True
     if by_source:
         version_spec = dataset_version if dataset_version is not None else "all"
@@ -869,18 +652,7 @@ def coverage(
             # When using region files or countries, default to no countries for cleaner view
             show_countries_final = not no_countries and not region_file and not country
 
-            # Determine which region file to use (original region file or country boundary)
-            region_file_to_use = None
-            if region_file:
-                region_file_to_use = (
-                    region_file_path
-                    if "region_file_path" in locals()
-                    else str(region_file)
-                )
-            elif (
-                country and "country_geojson_file" in locals() and country_geojson_file
-            ):
-                region_file_to_use = country_geojson_file
+            region_file_to_use = region_geometry
 
             if by_source:
                 # Multi-source render. Download one manifest per requested
@@ -1158,22 +930,6 @@ def coverage(
 
             traceback.print_exc()
         raise typer.Exit(1)
-    finally:
-        # Clean up temporary country GeoJSON file if created
-        if country_geojson_file and (
-            not region_file or country_geojson_file != str(region_file)
-        ):
-            try:
-                os.unlink(country_geojson_file)
-            except Exception:
-                pass  # Ignore cleanup errors
-
-        # Clean up temporary region file if downloaded from URL
-        if region_file_temp:
-            try:
-                os.unlink(region_file_temp)
-            except Exception:
-                pass  # Ignore cleanup errors
 
 
 @app.command()
@@ -1264,26 +1020,25 @@ def download(
             "--dry-run", help="Calculate total download size without downloading"
         ),
     ] = False,
+    source: Annotated[
+        DownloadSource,
+        typer.Option(
+            "--source", help="auto: Zarr for TIFF, tiles for NPY; or zarr/tiles"
+        ),
+    ] = DownloadSource.auto,
+    store_url: Annotated[
+        Optional[str], typer.Option("--store-url", help="Zarr URL or local store path")
+    ] = None,
+    depth: Annotated[
+        Optional[int], typer.Option("--depth", help="Matryoshka embedding depth")
+    ] = None,
 ):
-    """Download embeddings as numpy arrays or GeoTIFF files.
+    """Stream a region to GeoTIFFs, or download original NPY/GeoTIFF tiles.
 
-    Supports two output formats:
-    - tiff: Georeferenced GeoTIFF files with proper CRS metadata (default)
-    - npy: Quantized numpy arrays with separate scales files and landmask TIFFs
-
-    For GeoTIFF format, tiles are organized in the registry structure:
-    - global_0.1_degree_representation/{year}/grid_{lon:.2f}_{lat:.2f}/grid_{lon:.2f}_{lat:.2f}_{year}.tiff
-
-    For numpy format, downloads quantized embeddings in the registry structure:
-    - global_0.1_degree_representation/{year}/grid_{lon:.2f}_{lat:.2f}/grid_{lon:.2f}_{lat:.2f}.npy
-    - global_0.1_degree_representation/{year}/grid_{lon:.2f}_{lat:.2f}/grid_{lon:.2f}_{lat:.2f}_scales.npy
-    - global_0.1_degree_tiff_all/grid_{lon:.2f}_{lat:.2f}.tiff (landmask TIFF)
-
-    The NPY format supports resume - if a download is interrupted, running the command
-    again will skip files that already exist and only download missing files.
-
-    Note: Band selection (--bands) is only supported for TIFF format. The NPY format
-    downloads the full quantized embeddings as they exist in the registry.
+    TIFF output defaults to Zarr and writes tessera_YEAR_utmNN.tif per zone.
+    --source tiles preserves the original individual-tile layout and resume
+    behavior. NPY output and --registry-dir select tiles automatically.
+    --dry-run in Zarr mode estimates uncompressed output from metadata.
     """
 
     # Validate output parameter
@@ -1298,159 +1053,73 @@ def download(
     if output is None:
         output = Path(".")
 
-    # Initialize GeoTessera with embeddings_dir set to output directory
-    gt = GeoTessera(
-        dataset_version=dataset_version,
-        dataset_variant=dataset_variant,
-        cache_dir=str(cache_dir) if cache_dir else None,
-        registry_dir=str(registry_dir) if registry_dir else None,
-        embeddings_dir=str(output)
-        if not dry_run
-        else None,  # Only set for actual downloads
+    stream = source == "zarr" or (
+        source == "auto" and format == "tiff" and registry_dir is None
     )
+    if stream:
+        if format != "tiff":
+            raise typer.BadParameter(
+                "Zarr streaming exports TIFF; use --source tiles for NPY"
+            )
+        if registry_dir is not None:
+            raise typer.BadParameter(
+                "--registry-dir applies to --source tiles; use --store-url for Zarr"
+            )
+        from .workflows import stream_download
 
-    # Check mutual exclusivity of region options
-    region_sources = sum(1 for x in [bbox, tile, region_file, country] if x)
-    if region_sources > 1:
-        rprint(
-            "[red]Error: Cannot specify multiple region options. "
-            "Choose one of: --bbox, --tile, --region-file, --country[/red]"
-        )
-        raise typer.Exit(1)
-
-    # Parse bounding box or tile
-    if tile:
         try:
-            tile_coords = tuple(map(float, tile.split(",")))
-            if len(tile_coords) != 2:
-                rprint("[red]Error: --tile must be 'lon,lat'[/red]")
-                raise typer.Exit(1)
-            lon, lat = tile_coords
-            tile_center = tile_from_world(lon, lat)
+            result = stream_download(
+                output,
+                bbox=bbox,
+                tile=tile,
+                region_file=region_file,
+                country=country,
+                year=year,
+                version=dataset_version,
+                variant=dataset_variant,
+                store_url=store_url,
+                cache_dir=cache_dir,
+                bands=bands,
+                depth=depth,
+                compress=compress,
+                dry_run=dry_run,
+            )
+        except (ValueError, OSError, KeyError) as exc:
+            rprint(f"[red]{exc}[/red]")
+            raise typer.Exit(1) from exc
+        if dry_run:
+            size = sum(item["uncompressed_bytes"] for item in result)
+            rprint(
+                f"Zarr export: {len(result)} UTM zone file(s), {format_bytes(size)} uncompressed output"
+            )
+            rprint(
+                "Network transfer and compressed output sizes depend on store chunks and data."
+            )
+        else:
+            rprint(f"SUCCESS: Exported {len(result)} GeoTIFF file(s) from Zarr")
+            for path in result:
+                rprint(path)
+        return
+    if store_url is not None or depth is not None:
+        raise typer.BadParameter("--store-url and --depth require --source zarr")
+
+    from .inputs import resolve_region
+
+    try:
+        bbox_coords, _ = resolve_region(
+            bbox=bbox, tile=tile, region_file=region_file, country=country
+        )
+        # Registry point selectors intentionally use a degenerate centre bbox.
+        point_selector = tile if tile is not None else bbox
+        if point_selector is not None and len(point_selector.split(",")) == 2:
+            lon, lat = map(float, point_selector.split(","))
             bbox_coords = point_to_tile_bbox(lon, lat)
             rprint(
-                f"[green]Point ({lon}, {lat}) -> tile "
-                f"grid_{tile_center[0]:.2f}_{tile_center[1]:.2f}[/green]"
+                f"Point ({lon}, {lat}) -> tile grid_{bbox_coords[0]:.2f}_{bbox_coords[1]:.2f}"
             )
-            rprint(f"[green]Using bounding box:[/green] {format_bbox(bbox_coords)}")
-        except ValueError as e:
-            rprint(f"[red]Error: Invalid --tile format. Use 'lon,lat': {e}[/red]")
-            raise typer.Exit(1)
-    elif bbox:
-        try:
-            bbox_coords = tuple(map(float, bbox.split(",")))
-            if len(bbox_coords) == 2:
-                # Two coordinates = single tile
-                lon, lat = bbox_coords
-                tile_center = tile_from_world(lon, lat)
-                bbox_coords = point_to_tile_bbox(lon, lat)
-                rprint(
-                    f"[green]Point ({lon}, {lat}) -> tile "
-                    f"grid_{tile_center[0]:.2f}_{tile_center[1]:.2f}[/green]"
-                )
-                rprint(f"[green]Using bounding box:[/green] {format_bbox(bbox_coords)}")
-            elif len(bbox_coords) == 4:
-                rprint(f"[green]Using bounding box:[/green] {format_bbox(bbox_coords)}")
-            else:
-                rprint(
-                    "[red]Error: bbox must be 'lon,lat' (single tile) "
-                    "or 'min_lon,min_lat,max_lon,max_lat'[/red]"
-                )
-                raise typer.Exit(1)
-        except ValueError:
-            rprint(
-                "[red]Error: Invalid bbox format. Use: 'lon,lat' or "
-                "'min_lon,min_lat,max_lon,max_lat'[/red]"
-            )
-            raise typer.Exit(1)
-    elif region_file:
-        try:
-            # Check if region_file is a URL
-            if is_url(region_file):
-                rprint(f"[blue]Downloading region file from URL: {region_file}[/blue]")
-                region_file_path = download_region_file(region_file)
-                region_file_temp = region_file_path  # Track for cleanup
-            else:
-                # Check if local file exists
-                region_path = Path(region_file)
-                if not region_path.exists():
-                    rprint(
-                        f"[red]Error: Region file {region_file} does not exist[/red]"
-                    )
-                    raise typer.Exit(1)
-                region_file_path = str(region_path)
-                region_file_temp = None
-
-            bbox_coords = calculate_bbox_from_file(region_file_path)
-            rprint(
-                f"[green]Calculated bbox from {region_file}:[/green] {format_bbox(bbox_coords)}"
-            )
-        except Exception as e:
-            rprint(f"[red]Error reading region file: {e}[/red]")
-            rprint("Supported formats: GeoJSON, Shapefile, etc.")
-            # Clean up temp file if we created one
-            if "region_file_temp" in locals() and region_file_temp:
-                try:
-                    import os
-
-                    os.unlink(region_file_temp)
-                except Exception:
-                    pass
-            raise typer.Exit(1)
-    elif country:
-        # Create progress bar for country data download
-        with create_progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TextColumn("•"),
-            TextColumn("[dim]{task.fields[status]}", justify="left"),
-            TimeRemainingColumn(),
-        ) as progress:
-            country_task = progress.add_task(
-                f"{emoji('🌍 ')}Loading country data...",
-                total=100,
-                status="Checking cache...",
-            )
-
-            def country_progress_callback(current: int, total: int, status: str = None):
-                progress.update(
-                    country_task,
-                    completed=current,
-                    total=total,
-                    status=status or "Processing...",
-                )
-
-            try:
-                bbox_coords = get_country_bbox(
-                    country, progress_callback=country_progress_callback
-                )
-                progress.update(country_task, completed=100, status="Complete")
-            except ValueError as e:
-                rprint(f"[red]Error: {e}[/red]")
-                rprint(
-                    "[blue]Check the country name spelling (uses Natural Earth admin-0 names)[/blue]"
-                )
-                raise typer.Exit(1)
-            except Exception as e:
-                rprint(f"[red]Error fetching country data: {e}[/red]")
-                raise typer.Exit(1)
-
-        # Print country info after progress bar completes
-        rprint(f"[green]Using country '{country}':[/green] {format_bbox(bbox_coords)}")
-    else:
-        rprint(
-            "[red]Error: Must specify either --bbox, --tile, --region-file, or --country[/red]"
-        )
-        rprint("Examples:")
-        rprint("  --tile '0.17,52.23'          # Single tile containing point")
-        rprint(
-            "  --bbox '0.17,52.23'          # Same as above (2 coords = single tile)"
-        )
-        rprint("  --bbox '-0.2,51.4,0.1,51.6'  # London area (4 coords = region)")
-        rprint("  --region-file london.geojson  # From GeoJSON file")
-        rprint("  --country 'United Kingdom'    # Country by name")
-        raise typer.Exit(1)
+    except (ValueError, OSError) as exc:
+        rprint(f"[red]Error: {exc}[/red]")
+        raise typer.Exit(1) from exc
 
     # Parse bands
     bands_list = None
@@ -1479,6 +1148,17 @@ def download(
         rprint(f"[red]Error: Invalid format '{format}'. Must be 'tiff' or 'npy'[/red]")
         raise typer.Exit(1)
 
+    # Initialize GeoTessera with embeddings_dir set to output directory
+    gt = GeoTessera(
+        dataset_version=dataset_version,
+        dataset_variant=dataset_variant,
+        cache_dir=str(cache_dir) if cache_dir else None,
+        registry_dir=str(registry_dir) if registry_dir else None,
+        embeddings_dir=str(output)
+        if not dry_run
+        else None,  # Only set for actual downloads
+    )
+
     # Display export info
     info_table = create_table(show_header=False, box=None)
     info_table.add_row("Format:", format.upper())
@@ -1490,13 +1170,7 @@ def download(
         info_table.add_row("Compression:", compress)
     info_table.add_row("Dataset version:", dataset_version)
 
-    rprint(
-        create_panel(
-            info_table,
-            title=f"[bold]GeoTessera v{__version__} - Region of Interest Download[/bold]",
-            border_style="blue",
-        )
-    )
+    rprint(info_table)
 
     try:
         # Load tiles for the region first (before Progress context)
@@ -1535,13 +1209,7 @@ def download(
             result_table.add_row("Year:", f"[cyan]{year}[/cyan]")
             result_table.add_row("Format:", f"[cyan]{format.upper()}[/cyan]")
 
-            rprint(
-                create_panel(
-                    result_table,
-                    title="[bold]Dry Run Results[/bold]",
-                    border_style="green",
-                )
-            )
+            rprint(result_table)
 
             if format == "tiff":
                 rprint("[dim]Note: TIFF sizes are estimates (4x quantized size)[/dim]")
@@ -1618,6 +1286,7 @@ def download(
                     output.mkdir(parents=True, exist_ok=True)
 
                     files = []
+                    failed_tiles = set()
                     downloaded_files = 0
                     skipped_files = 0
 
@@ -1714,6 +1383,7 @@ def download(
                                 files.append(str(embedding_final))
                                 downloaded_files += 1
                             except Exception as e:
+                                failed_tiles.add((tile_year, tile_lon, tile_lat))
                                 rprint(
                                     f"[yellow]Warning: Failed to download embedding for ({tile_lon}, {tile_lat}, {tile_year}): {e}[/yellow]"
                                 )
@@ -1738,6 +1408,7 @@ def download(
                                 files.append(str(scales_final))
                                 downloaded_files += 1
                             except Exception as e:
+                                failed_tiles.add((tile_year, tile_lon, tile_lat))
                                 rprint(
                                     f"[yellow]Warning: Failed to download scales for ({tile_lon}, {tile_lat}, {tile_year}): {e}[/yellow]"
                                 )
@@ -1759,9 +1430,15 @@ def download(
                                 files.append(str(landmask_final))
                                 downloaded_files += 1
                             except Exception as e:
+                                failed_tiles.add((tile_year, tile_lon, tile_lat))
                                 rprint(
                                     f"[yellow]Warning: Failed to download landmask for ({tile_lon}, {tile_lat}): {e}[/yellow]"
                                 )
+
+                    if failed_tiles:
+                        raise RuntimeError(
+                            f"{len(failed_tiles)} of {len(tiles_to_fetch)} tiles are incomplete; rerun to resume"
+                        )
 
                     # Final progress update (after all tiles processed)
                     progress.update(task, completed=total_bytes, status="Complete")
@@ -1869,11 +1546,7 @@ def download(
                     f"  [cyan]geotessera visualize {output} pca_mosaic.tif[/cyan]"
                 )
 
-        rprint(
-            create_panel(
-                tips_table, title="[bold] Next steps[/bold]", border_style="green"
-            )
-        )
+        rprint(tips_table)
 
     except Exception as e:
         rprint(f"\n[red]{emoji('❌ ')}Error: {e}[/red]")
@@ -1881,15 +1554,6 @@ def download(
             rprint("\n[dim]Full traceback:[/dim]")
             console.print_exception()
         raise typer.Exit(1)
-    finally:
-        # Clean up temporary region file if downloaded from URL
-        if "region_file_temp" in locals() and region_file_temp:
-            try:
-                import os
-
-                os.unlink(region_file_temp)
-            except Exception:
-                pass  # Ignore cleanup errors
 
 
 @app.command()
@@ -1905,16 +1569,17 @@ def visualize(
         int,
         typer.Option(
             "--n-components",
+            min=1,
             help="Number of PCA components. Only first 3 used for RGB visualization - increase for analysis/research.",
         ),
     ] = 3,
     balance_method: Annotated[
-        str,
+        BalanceMethod,
         typer.Option(
             "--balance",
             help="RGB balance method: histogram (default), percentile, or adaptive",
         ),
-    ] = "histogram",
+    ] = BalanceMethod.histogram,
     percentile_low: Annotated[
         float,
         typer.Option(
@@ -1974,21 +1639,10 @@ def visualize(
         rprint("[red]Error: Output file must have .tif or .tiff extension[/red]")
         raise typer.Exit(1)
 
-    # Validate n_components
-    if n_components < 1:
-        rprint("[red]Error: Number of components must be at least 1[/red]")
-        raise typer.Exit(1)
     if n_components < 3:
         rprint(
             f"[yellow]Warning: Using {n_components} component(s). RGB visualization works best with 3+ components[/yellow]"
         )
-
-    # Validate balance_method
-    if balance_method not in ["percentile", "histogram", "adaptive"]:
-        rprint(
-            f"[red]Error: Invalid balance method '{balance_method}'. Must be 'percentile', 'histogram', or 'adaptive'[/red]"
-        )
-        raise typer.Exit(1)
 
     # Validate percentile ranges
     if balance_method == "percentile":
@@ -2045,7 +1699,7 @@ def visualize(
                 )
 
             # Convert tiles to dict format for create_pca_mosaic
-            tiles_data = [tile.to_dict() for tile in tiles]
+            tiles_data = tiles
 
             # PCA MODE: Use clean visualization function
             create_pca_mosaic(
@@ -2074,7 +1728,10 @@ def visualize(
 
 @app.command()
 def webmap(
-    rgb_mosaic: Annotated[Path, typer.Argument(help="3-band RGB mosaic GeoTIFF file")],
+    rgb_mosaic: Annotated[
+        Optional[Path],
+        typer.Argument(help="Existing RGB GeoTIFF; omit to stream a region from Zarr"),
+    ] = None,
     output: Annotated[
         Path, typer.Option("--output", "-o", help="Output directory")
     ] = None,
@@ -2090,7 +1747,8 @@ def webmap(
     force_regenerate: Annotated[
         bool,
         typer.Option(
-            "--force/--no-force", help="Force regeneration of tiles even if they exist"
+            "--force/--no-force",
+            help="Regenerate the mosaic and tiles even when the request matches",
         ),
     ] = False,
     serve_immediately: Annotated[
@@ -2113,17 +1771,73 @@ def webmap(
             help="Use newer gdal raster tile (faster but less stable) vs gdal2tiles (default, stable)",
         ),
     ] = False,
+    bbox: Annotated[
+        Optional[str],
+        typer.Option("--bbox", help="Stream west,south,east,north from Zarr"),
+    ] = None,
+    tile: Annotated[
+        Optional[str], typer.Option("--tile", help="Stream the tile containing lon,lat")
+    ] = None,
+    country: Annotated[Optional[str], typer.Option("--country")] = None,
+    year: Annotated[int, typer.Option("--year")] = 2024,
+    dataset_version: Annotated[str, typer.Option("--dataset-version")] = "v1",
+    dataset_variant: Annotated[Optional[str], typer.Option("--dataset-variant")] = None,
+    store_url: Annotated[Optional[str], typer.Option("--store-url")] = None,
+    cache_dir: Annotated[Optional[Path], typer.Option("--cache-dir")] = None,
+    bands: Annotated[
+        str, typer.Option("--bands", help="Three zero-based embedding bands for RGB")
+    ] = "0,1,2",
+    depth: Annotated[Optional[int], typer.Option("--depth")] = None,
 ):
-    """Create web tiles and viewer from a 3-band RGB mosaic.
+    """Create a web map from an RGB GeoTIFF or a streamed Zarr region.
 
-    This command takes an RGB GeoTIFF mosaic, reprojects it if needed for web viewing,
-    generates web tiles, creates an HTML viewer, and optionally starts a web server.
-
-    Example workflow:
-        1. geotessera download --bbox lon1,lat1,lon2,lat2 tiles/
-        2. geotessera visualize tiles/ --type rgb --output mosaics/
-        3. geotessera webmap mosaics/rgb_mosaic.tif --output webmap/ --serve
+    Omit RGB_MOSAIC and specify --bbox/--tile/--region-file/--country to
+    stream three embedding bands, normalize them together, and generate
+    tiles. Existing RGB mosaics remain supported as a positional argument.
     """
+    if not 0 <= min_zoom <= max_zoom <= 24:
+        raise typer.BadParameter("Zoom levels must satisfy 0 <= min <= max <= 24")
+    from .workflows import cached_stream_rgb, file_identity, stage_matches, save_stage
+
+    # Reserve the port before any expensive processing, and release it even on failure.
+    server = None
+    if serve_immediately:
+        import click
+
+        serving_directory = output or (
+            Path("tessera_webmap")
+            if rgb_mosaic is None
+            else Path(f"{rgb_mosaic.stem}_webmap")
+        )
+        server = _bind_web_server(serving_directory, port)
+        click.get_current_context().call_on_close(server.server_close)
+    if rgb_mosaic is None:
+        output = output or Path("tessera_webmap")
+        output.mkdir(parents=True, exist_ok=True)
+        try:
+            rgb_mosaic, reused = cached_stream_rgb(
+                output / "rgb_mosaic.tif",
+                force=force_regenerate,
+                bbox=bbox,
+                tile=tile,
+                region_file=region_file,
+                country=country,
+                year=year,
+                version=dataset_version,
+                variant=dataset_variant,
+                store_url=store_url,
+                cache_dir=cache_dir,
+                bands=bands,
+                depth=depth,
+            )
+        except (ValueError, OSError, KeyError) as exc:
+            rprint(f"[red]{exc}[/red]")
+            raise typer.Exit(1) from exc
+        if reused:
+            rprint("[green]Using existing streamed RGB mosaic[/green]")
+    elif any(value is not None for value in (bbox, tile, country, store_url, depth)):
+        raise typer.BadParameter("Choose an existing RGB mosaic or a Zarr region")
+
     if not rgb_mosaic.exists():
         rprint(f"[red]Error: Mosaic file {rgb_mosaic} does not exist[/red]")
         raise typer.Exit(1)
@@ -2132,35 +1846,9 @@ def webmap(
         rprint("[red]Error: Input must be a GeoTIFF file (.tif/.tiff)[/red]")
         raise typer.Exit(1)
 
-    # Handle region file URL download
+    # GeoPandas handles supported paths and URLs directly; no temporary copies.
+    region_file_path = region_file
     region_file_temp = None
-    region_file_path = None
-    if region_file:
-        try:
-            if is_url(region_file):
-                rprint(f"[blue]Downloading region file from URL: {region_file}[/blue]")
-                region_file_temp = download_region_file(region_file)
-                region_file_path = region_file_temp
-            else:
-                # Check if local file exists
-                region_path = Path(region_file)
-                if not region_path.exists():
-                    rprint(
-                        f"[red]Error: Region file {region_file} does not exist[/red]"
-                    )
-                    raise typer.Exit(1)
-                region_file_path = str(region_path)
-        except Exception as e:
-            rprint(f"[red]Error processing region file: {e}[/red]")
-            # Clean up temp file if we created one
-            if region_file_temp:
-                try:
-                    import os
-
-                    os.unlink(region_file_temp)
-                except Exception:
-                    pass
-            raise typer.Exit(1)
 
     # Default output directory
     if output is None:
@@ -2205,8 +1893,19 @@ def webmap(
         # Step 2: Generate web tiles
         tiles_dir = output / "tiles"
 
-        # Check if we should regenerate tiles
-        if force_regenerate and tiles_dir.exists():
+        tile_marker = output / "tiles.json"
+        tile_state = {
+            "schema": 1,
+            "source": file_identity(rgb_mosaic),
+            "zoom": [min_zoom, max_zoom],
+            "gdal_raster": use_gdal_raster,
+        }
+        regenerate_tiles = force_regenerate or not stage_matches(
+            tile_marker, tile_state
+        )
+        if regenerate_tiles:
+            tile_marker.unlink(missing_ok=True)
+        if regenerate_tiles and tiles_dir.exists():
             import shutil
 
             shutil.rmtree(tiles_dir)
@@ -2228,6 +1927,7 @@ def webmap(
                     zoom_levels=(min_zoom, max_zoom),
                     use_gdal_raster=use_gdal_raster,
                 )
+                save_stage(tile_marker, tile_state)
                 progress.update(task2, completed=100)
                 # Force line break before filename to avoid wrapping issues
                 tiles_status = f"Created web tiles in:\n{result_dir}"
@@ -2311,17 +2011,7 @@ def webmap(
 
     if serve_immediately:
         rprint("[blue]Starting web server...[/blue]")
-        # Call the serve function directly
-        try:
-            serve(
-                directory=output, port=port, open_browser=True, html_file="viewer.html"
-            )
-        except KeyboardInterrupt:
-            rprint("\n[green]Web server stopped.[/green]")
-        except Exception as e:
-            rprint(f"[yellow]Could not start server automatically: {e}[/yellow]")
-            rprint("[blue]To view the map, start a web server manually:[/blue]")
-            rprint(f"[cyan]  geotessera serve {output} --port {port}[/cyan]")
+        _run_web_server(server, output, True, "viewer.html")
     else:
         rprint("[blue]To view the map, start a web server:[/blue]")
         rprint(f"[cyan]  geotessera serve {output} --port {port}[/cyan]")
@@ -2367,107 +2057,58 @@ def serve(
         rprint(f"[red]Error: {directory} is not a directory[/red]")
         raise typer.Exit(1)
 
-    # Change to the directory to serve
-    original_dir = Path.cwd()
+    with _bind_web_server(directory, port) as server:
+        _run_web_server(server, directory, open_browser, html_file)
 
-    class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
-        def log_message(self, format, *args):
-            # Only log errors, not every request. Some SimpleHTTPRequestHandler
-            # log paths call this with fewer args, so guard the index access.
-            if len(args) > 1 and args[1] != "200":
-                super().log_message(format, *args)
 
+def _bind_web_server(directory, port):
+    from functools import partial
+    import socket
+
+    dual_stack = socket.has_dualstack_ipv6()
+
+    class ExclusiveHTTPServer(http.server.ThreadingHTTPServer):
+        # Python versions may enable SO_REUSEPORT: that can share a busy port.
+        allow_reuse_address = False
+        allow_reuse_port = False
+        address_family = socket.AF_INET6 if dual_stack else socket.AF_INET
+
+        def server_bind(self):
+            if dual_stack:
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            super().server_bind()
+
+    handler = partial(
+        http.server.SimpleHTTPRequestHandler, directory=str(directory.resolve())
+    )
     try:
-        # Find available port
-        while True:
-            try:
-                with socketserver.TCPServer(("", port), QuietHTTPRequestHandler):
-                    break
-            except OSError:
-                port += 1
-                if port > 9000:
-                    rprint("[red]Error: Could not find available port[/red]")
-                    raise typer.Exit(1)
+        return ExclusiveHTTPServer(("::" if dual_stack else "", port), handler)
+    except OSError as exc:
+        raise typer.BadParameter(
+            f"Cannot bind web server on port {port}: {exc}. Choose another --port."
+        ) from exc
 
-        rprint(f"[green]Starting web server on port {port}[/green]")
-        rprint(f"[blue]Serving directory: {directory.absolute()}[/blue]")
 
-        # Debug: Show directory contents
-        try:
-            contents = list(directory.iterdir())
-            rprint(
-                f"[yellow]Directory contains: {[p.name for p in contents[:10]]}{'...' if len(contents) > 10 else ''}[/yellow]"
-            )
-        except Exception as e:
-            rprint(f"[yellow]Could not list directory contents: {e}[/yellow]")
-
-        # Determine what to open in browser
-        if html_file:
-            html_path = directory / html_file
-            if not html_path.exists():
-                rprint(f"[yellow]Warning: HTML file {html_file} not found[/yellow]")
-                browser_url = f"http://localhost:{port}/"
-            else:
-                browser_url = f"http://localhost:{port}/{html_file}"
-        else:
-            # Look for common HTML files
-            common_names = ["index.html", "viewer.html", "map.html", "coverage.html"]
-            found_html = None
-            for name in common_names:
-                if (directory / name).exists():
-                    found_html = name
-                    break
-
-            if found_html:
-                browser_url = f"http://localhost:{port}/{found_html}"
-                rprint(f"[blue]Found HTML file: {found_html}[/blue]")
-            else:
-                browser_url = f"http://localhost:{port}/"
-
-        # Start server in background thread
-        def start_server():
-            import os
-
-            os.chdir(directory)
-            try:
-                with socketserver.TCPServer(
-                    ("", port), QuietHTTPRequestHandler
-                ) as httpd:
-                    httpd.serve_forever()
-            except KeyboardInterrupt:
-                pass
-            finally:
-                os.chdir(original_dir)
-
-        server_thread = threading.Thread(target=start_server, daemon=True)
-        server_thread.start()
-
-        # Give server a moment to start
-        time.sleep(0.5)
-
-        rprint(
-            f"[green]{emoji('✅ ')}Web server running at: http://localhost:{port}/[/green]"
+def _run_web_server(server, directory, open_browser, html_file):
+    port = server.server_port
+    if html_file is None:
+        html_file = next(
+            (
+                name
+                for name in ("index.html", "viewer.html", "map.html", "coverage.html")
+                if (directory / name).exists()
+            ),
+            "",
         )
-
-        if open_browser:
-            rprint(f"[blue]Opening browser: {browser_url}[/blue]")
-            webbrowser.open(browser_url)
-        else:
-            rprint(f"[blue]Open in browser: {browser_url}[/blue]")
-
-        rprint("\n[yellow]Press Ctrl+C to stop the server[/yellow]")
-
-        try:
-            # Keep main thread alive
-            while server_thread.is_alive():
-                time.sleep(1)
-        except KeyboardInterrupt:
-            rprint("\n[green]Stopping web server...[/green]")
-            raise typer.Exit(0)
-
-    except Exception as e:
-        rprint(f"[red]Error starting web server: {e}[/red]")
-        raise typer.Exit(1)
+    url = f"http://localhost:{port}/" + urllib.parse.quote(html_file, safe="/")
+    rprint(f"Web server running at: {url}")
+    rprint(f"Serving directory: {directory.resolve()}")
+    if open_browser:
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        rprint("Stopping web server...")
 
 
 def _get_globe_html_template() -> str:
