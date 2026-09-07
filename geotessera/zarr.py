@@ -5343,15 +5343,22 @@ def _require_array(parent, name: str, **kwargs):
     )
 
 
-def _retry_windows_sharing(write, retries: int = 20, delay: float = 0.5):
-    """Retry transient Windows conflicts when replacing an open file."""
+def _retry_windows_sharing(operation, retries: int = 20, delay: float = 0.5):
+    """Retry transient Windows conflicts when reading or replacing a file."""
+    import errno
     import time
 
     for attempt in range(retries + 1):
         try:
-            return write()
+            return operation()
         except PermissionError as exc:
-            if getattr(exc, "winerror", None) not in (5, 32, 33) or attempt == retries:
+            winerror = getattr(exc, "winerror", None)
+            # FileIO uses the Windows C runtime, which reports a sharing
+            # conflict as EACCES without retaining the native winerror.
+            sharing_conflict = winerror in (5, 32, 33) or (
+                winerror is None and os.name == "nt" and exc.errno == errno.EACCES
+            )
+            if not sharing_conflict or attempt == retries:
                 raise
             time.sleep(delay)
 
@@ -5365,6 +5372,13 @@ def _ensure_global_store(
     Safe to call concurrently with the same num_levels: every creation step
     is idempotent, so callers build the identical structure and converge.
     """
+    # Windows can deny reads as well as writes while another initializer
+    # replaces metadata or band coordinates. Resume the idempotent operation
+    # to cover each I/O step with bounded retries.
+    _retry_windows_sharing(lambda: _ensure_global_store_once(dest, num_levels))
+
+
+def _ensure_global_store_once(dest: "StoreLocation", num_levels: int) -> None:
     from zarr.codecs import BloscCodec
 
     root = dest.open_group(mode="r+", zarr_format=3)
@@ -5416,11 +5430,7 @@ def _ensure_global_store(
         # Array metadata can become visible before create_array(data=...)
         # finishes writing the coordinate chunk. Repair interrupted writes.
         if not np.array_equal(band[:], band_data):
-
-            def write_band():
-                band[:] = band_data
-
-            _retry_windows_sharing(write_band)
+            band[:] = band_data
         actual_levels += 1
         h //= 2
         w //= 2
@@ -5473,9 +5483,8 @@ def _ensure_global_store(
     if any(global_grp.attrs.get(key) != value for key, value in attrs.items()):
         # Attributes.update writes once per key. Publish the complete map in
         # one metadata replacement so concurrent writers cannot expose a
-        # partially published layout. Windows may briefly deny replacement
-        # while another initializer is reading that same metadata file.
-        _retry_windows_sharing(lambda: global_grp.update_attributes(attrs))
+        # partially published layout.
+        global_grp.update_attributes(attrs)
 
 
 # Per-worker state for reprojection

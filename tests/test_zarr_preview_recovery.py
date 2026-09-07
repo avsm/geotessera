@@ -1,12 +1,21 @@
 """Concurrent and interrupted creation of preview metadata."""
 
 import errno
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import zarr
 
 import geotessera.zarr as build
+
+
+@pytest.fixture
+def windows_filesystem(monkeypatch):
+    # Change the build's platform check without making pathlib use Windows
+    # paths when these regressions run on a POSIX host.
+    monkeypatch.setattr(build, "os", SimpleNamespace(**vars(build.os)))
+    monkeypatch.setattr(build.os, "name", "nt")
 
 
 @pytest.fixture(params=[False, True], ids=["local", "file-url"])
@@ -133,6 +142,73 @@ def test_preview_retries_windows_sharing_conflicts(
     build._ensure_global_store(preview_store, 3)
     assert attempts == 2
     _assert_ready(preview_store, 3)
+
+
+@pytest.mark.parametrize("winerror", [None, 5, 32, 33])
+@pytest.mark.parametrize("read", ["metadata", "band"])
+def test_preview_retries_windows_read_conflicts(
+    preview_store, monkeypatch, windows_filesystem, winerror, read
+):
+    build._ensure_global_store(preview_store, 3)
+    pixels = preview_store.open_group(mode="r+")["global_rgb/0/rgb"]
+    pixels[0, 0] = [1, 2, 3, 4]
+    target = zarr.Group if read == "metadata" else zarr.Array
+    getitem = target.__getitem__
+    attempts = 0
+    fail_at = 2 if read == "metadata" else 1
+
+    def conflict(self, key):
+        nonlocal attempts
+        if (read == "metadata" and self.path == "" and key == "global_rgb") or (
+            read == "band" and self.path == "global_rgb/0/band"
+        ):
+            attempts += 1
+            # The second metadata read refreshes the group before publishing
+            # attrs, outside the existing create-or-fetch retry loop.
+            if attempts == fail_at:
+                error = PermissionError(errno.EACCES, "Windows read conflict")
+                if winerror is not None:
+                    error.winerror = winerror
+                raise error
+        return getitem(self, key)
+
+    monkeypatch.setattr(target, "__getitem__", conflict)
+    build._ensure_global_store(preview_store, 3)
+    assert attempts > fail_at
+    _assert_ready(preview_store, 3)
+    np.testing.assert_array_equal(pixels[0, 0], [1, 2, 3, 4])
+
+
+@pytest.mark.parametrize(
+    "platform, winerror, expected_attempts",
+    [
+        ("nt", None, 3),
+        ("nt", 5, 3),
+        ("nt", 32, 3),
+        ("nt", 33, 3),
+        ("nt", 999, 1),
+        ("posix", None, 1),
+    ],
+)
+def test_preview_sharing_retries_preserve_persistent_errors(
+    monkeypatch, platform, winerror, expected_attempts
+):
+    monkeypatch.setattr(build, "os", SimpleNamespace(**vars(build.os)))
+    monkeypatch.setattr(build.os, "name", platform)
+    error = PermissionError(errno.EACCES, "persistent permission failure")
+    if winerror is not None:
+        error.winerror = winerror
+    attempts = 0
+
+    def fail():
+        nonlocal attempts
+        attempts += 1
+        raise error
+
+    with pytest.raises(PermissionError) as raised:
+        build._retry_windows_sharing(fail, retries=2, delay=0)
+    assert raised.value is error
+    assert attempts == expected_attempts
 
 
 @pytest.mark.parametrize("error", [PermissionError("denied"), OSError("transport")])
