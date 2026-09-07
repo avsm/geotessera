@@ -294,9 +294,9 @@ def visualize_sources_coverage(
         variants_arr = df["variant"].astype(str).to_numpy()
         facecolors = np.empty((total, 4))
         for g in groups:
-            facecolors[(versions_arr == g[0]) & (variants_arr == g[1])] = (
-                group_colors[g]
-            )
+            facecolors[(versions_arr == g[0]) & (variants_arr == g[1])] = group_colors[
+                g
+            ]
 
         if progress_callback:
             progress_callback(70, 100, "Adding tiles to map...")
@@ -323,9 +323,11 @@ def visualize_sources_coverage(
             title_parts.append("(Region View)")
         ax.set_title(" – ".join(title_parts), fontsize=14, fontweight="bold")
 
-        if region_file:
+        if region_file is not None:
             try:
-                region_gdf = gpd.read_file(region_file)
+                from .inputs import read_region_file
+
+                region_gdf = read_region_file(region_file)
                 region_gdf.plot(
                     ax=ax,
                     facecolor="none",
@@ -351,7 +353,7 @@ def visualize_sources_coverage(
             legend_elements.append(
                 mpatches.Patch(color="lightgray", label="Land masses")
             )
-        if region_file:
+        if region_file is not None:
             legend_elements.append(
                 mpatches.Patch(
                     facecolor="none", edgecolor="red", label="Region boundary"
@@ -626,14 +628,16 @@ def visualize_global_coverage(
         ax.set_title(title, fontsize=14, fontweight="bold")
 
         # Add region file overlay if provided
-        if region_file and progress_callback:
+        if region_file is not None and progress_callback:
             progress_callback(77, 100, "Adding region overlay...")
-        elif region_file:
+        elif region_file is not None:
             logger.info("Adding region overlay...")
 
-        if region_file:
+        if region_file is not None:
             try:
-                region_gdf = gpd.read_file(region_file)
+                from .inputs import read_region_file
+
+                region_gdf = read_region_file(region_file)
                 # Plot region boundary with distinctive styling
                 region_gdf.plot(
                     ax=ax,
@@ -726,7 +730,7 @@ def visualize_global_coverage(
                 mpatches.Patch(color="lightgray", label="Land masses")
             )
 
-        if region_file:
+        if region_file is not None:
             legend_elements.append(
                 mpatches.Patch(
                     facecolor="none", edgecolor="red", label="Region boundary"
@@ -771,107 +775,9 @@ def create_rgb_mosaic(
     Returns:
         Path to created RGB mosaic file
     """
-    try:
-        import rasterio
-        from rasterio.enums import ColorInterp
-        import tempfile
-    except ImportError:
-        raise ImportError("rasterio required: pip install rasterio")
+    from .raster import create_rgb
 
-    if not geotiff_paths:
-        raise ValueError("No GeoTIFF files provided")
-
-    if len(bands) != 3:
-        raise ValueError(f"Must specify exactly 3 bands for RGB, got {len(bands)}")
-
-    # First merge all tiles into a single mosaic using the core function
-    if progress_callback:
-        progress_callback(10, 100, f"Merging {len(geotiff_paths)} tiles...")
-
-    with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
-        temp_mosaic = tmp.name
-
-    try:
-        # Use GeoTessera to merge files
-        from .core import GeoTessera
-
-        gt = GeoTessera()
-        gt.merge_geotiffs_to_mosaic(
-            geotiff_paths=geotiff_paths,
-            output_path=temp_mosaic,
-            target_crs=target_crs,
-        )
-
-        if progress_callback:
-            progress_callback(50, 100, f"Extracting RGB bands {bands}...")
-
-        # Now extract RGB bands from the merged mosaic
-        with rasterio.open(temp_mosaic) as src:
-            # Check we have enough bands
-            if src.count < max(bands) + 1:
-                raise ValueError(
-                    f"Not enough bands in mosaic. Requested bands {bands}, "
-                    f"but only {src.count} available"
-                )
-
-            # Read the selected bands
-            rgb_data = np.zeros((3, src.height, src.width), dtype=np.float32)
-            for i, band_idx in enumerate(bands):
-                rgb_data[i] = src.read(band_idx + 1)  # rasterio uses 1-based indexing
-
-            # Always normalize to 0-1 for consistent visualization
-            if progress_callback:
-                progress_callback(70, 100, "Normalizing RGB bands...")
-
-            for i in range(3):
-                band = rgb_data[i]
-                band_min, band_max = np.nanmin(band), np.nanmax(band)
-                if band_max > band_min:
-                    rgb_data[i] = (band - band_min) / (band_max - band_min)
-                else:
-                    rgb_data[i] = 0
-
-            if progress_callback:
-                progress_callback(80, 100, "Converting to RGB format...")
-
-            # Convert to uint8
-            rgb_uint8 = (np.clip(rgb_data, 0, 1) * 255).astype(np.uint8)
-
-            if progress_callback:
-                progress_callback(
-                    90, 100, f"Writing RGB mosaic to {Path(output_path).name}..."
-                )
-
-            # Write RGB GeoTIFF
-            profile = src.profile.copy()
-            profile.update(
-                {
-                    "count": 3,
-                    "dtype": "uint8",
-                    "compress": "lzw",
-                    "photometric": "RGB",
-                }
-            )
-
-            with rasterio.open(output_path, "w", **profile) as dst:
-                dst.write(rgb_uint8)
-                dst.colorinterp = [ColorInterp.red, ColorInterp.green, ColorInterp.blue]
-                dst.update_tags(
-                    TIFFTAG_ARTIST="GeoTessera",
-                    TIFFTAG_IMAGEDESCRIPTION=f"RGB visualization using bands {bands}",
-                )
-
-    finally:
-        # Clean up temp file
-        import os
-
-        if os.path.exists(temp_mosaic):
-            os.unlink(temp_mosaic)
-
-    if progress_callback:
-        progress_callback(100, 100, f"Completed RGB mosaic: {Path(output_path).name}")
-
-    return output_path
+    return create_rgb(geotiff_paths, output_path, bands, target_crs, progress_callback)
 
 
 def calculate_bbox_from_file(
@@ -885,13 +791,9 @@ def calculate_bbox_from_file(
     Returns:
         Bounding box as (min_lon, min_lat, max_lon, max_lat)
     """
-    gdf = gpd.read_file(filepath)
-    if gdf.crs is None:
-        gdf = gdf.set_crs("EPSG:4326")  # Assume WGS84 (GeoJSON spec default)
-    else:
-        gdf = gdf.to_crs("EPSG:4326")  # Reproject to lat/lon
-    bounds = gdf.total_bounds  # [minx, miny, maxx, maxy]
-    return tuple(bounds)
+    from .inputs import read_region_file
+
+    return tuple(read_region_file(filepath).total_bounds)
 
 
 def calculate_bbox_from_points(
@@ -931,17 +833,14 @@ def create_pca_mosaic(
     balance_method: str = "histogram",
     percentile_range: Tuple[float, float] = (2, 98),
 ) -> str:
-    """Create PCA mosaic using combined-data approach.
+    """Create a PCA mosaic with shared fitting and windowed transformation.
 
-    This function combines all embedding data across tiles, applies a single PCA
-    transformation to the combined dataset, then creates a unified RGB mosaic.
-    This ensures consistent principal components across the entire region,
-    eliminating tiling artifacts.
-
-    Works with both GeoTIFF, zarr and NPY format tiles (via Tile abstraction).
+    Fit one model on a reproducible sample of at most 100,000 valid pixels
+    across all inputs. Tile references are read in strips; existing dictionaries
+    containing HWC arrays are also accepted for compatibility.
 
     Args:
-        tiles_data: List of dicts with keys: path, data, crs, transform, bounds, height, width
+        tiles_data: Tile references or dicts with data, crs, transform, height, width
         output_path: Output path for the PCA mosaic
         n_components: Number of PCA components to compute (only first 3 used for RGB)
         target_crs: Target CRS for the output mosaic
@@ -956,231 +855,44 @@ def create_pca_mosaic(
         ImportError: If scikit-learn or rasterio are not available
         ValueError: If no tiles are provided
     """
-    try:
-        import rasterio
-        from rasterio.enums import ColorInterp
-        import numpy as np
-        import os
-        from sklearn.decomposition import PCA
-        from sklearn.preprocessing import StandardScaler
-        import tempfile
-        import shutil
-    except ImportError as e:
-        raise ImportError(f"Required packages missing: {e}")
+    import tempfile
+    import rasterio
+    from .projection import write_pca_tiles
+    from .raster import merge_geotiffs
+    from .remote import atomic_output
 
-    if not tiles_data:
-        raise ValueError("No tiles provided")
-
-    # Step 1: Read all embedding data (already loaded in tiles_data)
-    if progress_callback:
-        progress_callback(1, 5, "Reading embedding data...")
-
-    all_pixels = []  # For combined PCA
-
-    for i, tile_dict in enumerate(tiles_data):
-        # Data already loaded from Tile.to_dict()
-        data = tile_dict["data"]
-
-        # Flatten spatial dimensions for PCA: (height*width, bands)
-        pixels = data.reshape(-1, data.shape[2])
-        all_pixels.append(pixels)
-
-        # Progress update
-        if progress_callback:
-            read_progress = 1 + (i / len(tiles_data))
-            progress_callback(
-                read_progress, 5, f"Reading tile {i + 1}/{len(tiles_data)}"
-            )
-
-    # Step 2: Combine all pixel data and apply PCA
-    if progress_callback:
-        progress_callback(2, 5, "Applying PCA to combined data...")
-
-    # Combine all pixels from all tiles
-    combined_pixels = np.vstack(all_pixels)
-    logger.info(f"Combined data shape: {combined_pixels.shape}")
-
-    # Standardize the combined data
-    scaler = StandardScaler()
-    combined_pixels_scaled = scaler.fit_transform(combined_pixels)
-
-    # Apply PCA to the combined dataset
-    pca = PCA(n_components=n_components)
-    combined_pca = pca.fit_transform(combined_pixels_scaled)
-
-    explained_variance = pca.explained_variance_ratio_
-    total_variance = explained_variance.sum()
-    logger.info(
-        f"PCA explained variance: {explained_variance[:3]} (total: {total_variance:.3f})"
-    )
-
-    # Step 3: Split PCA results back into tiles and create temporary GeoTIFFs
-    if progress_callback:
-        progress_callback(3, 5, "Creating PCA tiles...")
-
-    temp_dir = tempfile.mkdtemp(prefix="pca_tiles_")
-    try:
-        pca_geotiff_paths = []
-        pixel_idx = 0
-
-        # Apply selected balancing method for better color distribution
-        component_scales = []
-
-        if balance_method == "percentile":
-            # Use percentile-based scaling for better color balance
-            # Each component gets independently scaled to maximize its dynamic range
-            for j in range(min(n_components, 3)):
-                component_data = combined_pca[:, j]
-                # Use specified percentiles to avoid outliers
-                p_low = np.percentile(component_data, percentile_range[0])
-                p_high = np.percentile(component_data, percentile_range[1])
-                component_scales.append((p_low, p_high))
-                logger.info(
-                    f"PC{j + 1} percentile scaling: [{p_low:.2f}, {p_high:.2f}]"
-                )
-
-        elif balance_method == "histogram":
-            # Apply histogram equalization to the combined PCA data first
-            try:
-                from skimage import exposure
-            except ImportError:
-                raise ImportError(
-                    "scikit-image required for histogram balance: pip install scikit-image"
-                )
-
-            # Apply histogram equalization globally to each component
-            for j in range(min(n_components, 3)):
-                component_data = combined_pca[:, j]
-                # Normalize to 0-1 first
-                p_low = np.percentile(component_data, 0.5)
-                p_high = np.percentile(component_data, 99.5)
-                if p_high > p_low:
-                    normalized = (component_data - p_low) / (p_high - p_low)
-                    normalized = np.clip(normalized, 0, 1)
-                    # Apply histogram equalization to the entire component
-                    equalized = exposure.equalize_hist(normalized)
-                    # Update the combined PCA data with equalized values
-                    combined_pca[:, j] = equalized
-
-                # Store the new min/max after equalization
-                new_min = combined_pca[:, j].min()
-                new_max = combined_pca[:, j].max()
-                component_scales.append((new_min, new_max))
-                logger.info(
-                    f"PC{j + 1} histogram equalized: [{new_min:.2f}, {new_max:.2f}]"
-                )
-
-        elif balance_method == "adaptive":
-            # Adaptive scaling based on variance
-            for j in range(min(n_components, 3)):
-                component_data = combined_pca[:, j]
-                mean = np.mean(component_data)
-                std = np.std(component_data)
-                # Scale to ±2.5 standard deviations
-                p_low = mean - 2.5 * std
-                p_high = mean + 2.5 * std
-                component_scales.append((p_low, p_high))
-                logger.info(
-                    f"PC{j + 1} adaptive scaling (μ±2.5σ): [{p_low:.2f}, {p_high:.2f}]"
-                )
-
-        else:
-            raise ValueError(f"Unknown balance_method: {balance_method}")
-
-        for i, tile_info in enumerate(tiles_data):
-            height, width = tile_info["height"], tile_info["width"]
-            n_pixels = height * width
-
-            # Extract this tile's PCA results
-            tile_pca_pixels = combined_pca[pixel_idx : pixel_idx + n_pixels]
-            pixel_idx += n_pixels
-
-            # Reshape back to image: (pixels, components) -> (height, width, components)
-            tile_pca_image = tile_pca_pixels.reshape(height, width, n_components)
-
-            # Normalize to 0-255 for visualization with per-component scaling
-            pca_normalized = np.zeros(
-                (height, width, min(n_components, 3)), dtype=np.float32
-            )
-
-            for j in range(min(n_components, 3)):
-                component = tile_pca_image[:, :, j]
-                # Use per-component scaling for better balance
-                p_low, p_high = component_scales[j]
-                if p_high > p_low:
-                    normalized = (component - p_low) / (p_high - p_low)
-                    pca_normalized[:, :, j] = normalized
-                else:
-                    pca_normalized[:, :, j] = 0.5
-
-            # Convert to uint8
-            output_data = (np.clip(pca_normalized, 0, 1) * 255).astype(np.uint8)
-
-            # Write temporary PCA tile
-            temp_path = os.path.join(temp_dir, f"pca_tile_{i}.tif")
-
-            with rasterio.open(
-                temp_path,
-                "w",
-                driver="GTiff",
-                height=height,
-                width=width,
-                count=min(n_components, 3),
-                dtype="uint8",
-                crs=tile_info["crs"],
-                transform=tile_info["transform"],
-                compress="lzw",
-            ) as dst:
-                for band_idx in range(min(n_components, 3)):
-                    dst.write(output_data[:, :, band_idx], band_idx + 1)
-                    variance_pct = explained_variance[band_idx] * 100
-                    dst.set_band_description(
-                        band_idx + 1, f"PC{band_idx + 1} ({variance_pct:.1f}%)"
-                    )
-
-            pca_geotiff_paths.append(temp_path)
-
-        # Step 4: Merge PCA tiles into final mosaic
-        if progress_callback:
-            progress_callback(4, 5, "Merging PCA mosaic...")
-
-        def merge_progress_callback(current: int, total: int, status: str = None):
-            if progress_callback:
-                step_progress = 4 + (current / max(total, 1)) * 0.9
-                progress_callback(step_progress, 5, status or "Merging tiles...")
-
-        # Import and use GeoTessera directly
-        from .core import GeoTessera
-
-        gt = GeoTessera()
-        gt.merge_geotiffs_to_mosaic(
-            geotiff_paths=pca_geotiff_paths,
-            output_path=output_path,
-            target_crs=target_crs,
-            progress_callback=merge_progress_callback,
+    with tempfile.TemporaryDirectory(prefix="geotessera_pca_") as temporary:
+        files = write_pca_tiles(
+            tiles_data,
+            temporary,
+            n_components,
+            balance_method=balance_method,
+            percentile_range=percentile_range,
+            progress_callback=progress_callback,
         )
-
-        # Add PCA-specific metadata
-        with rasterio.open(output_path, "r+") as dst:
-            dst.colorinterp = [ColorInterp.red, ColorInterp.green, ColorInterp.blue][
-                : min(n_components, 3)
-            ]
-            dst.update_tags(
-                TIFFTAG_ARTIST="GeoTessera",
-                TIFFTAG_IMAGEDESCRIPTION=f"Combined PCA visualization ({n_components} components, {balance_method} balanced)",
-                PCA_COMPONENTS=str(n_components),
-                PCA_STANDARDIZED="True",
-                PCA_BALANCE_METHOD=balance_method,
-                PCA_EXPLAINED_VARIANCE=str(explained_variance.tolist()),
-                PCA_TOTAL_VARIANCE=f"{total_variance:.3f}",
-                GEOTESSERA_TARGET_CRS=target_crs,
-            )
-
-        # Step 5: Clean up temporary files
-        if progress_callback:
-            progress_callback(5, 5, "Cleaning up...")
-
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-    return output_path
+        merged = str(Path(temporary) / "merged.tif")
+        merge_geotiffs(
+            files, merged, target_crs, bands=list(range(min(n_components, 3)))
+        )
+        with (
+            rasterio.open(merged) as src,
+            atomic_output(output_path, suffix=".tif") as staged,
+        ):
+            with rasterio.open(
+                staged, "w", **dict(src.profile, dtype="uint8", nodata=None)
+            ) as dst:
+                for _, window in src.block_windows(1):
+                    data = src.read(window=window, masked=True)
+                    dst.write(data.filled(0).astype(np.uint8), window=window)
+                    dst.write_mask(
+                        (~np.ma.getmaskarray(data).any(axis=0)).astype(np.uint8) * 255,
+                        window=window,
+                    )
+                dst.update_tags(**src.tags())
+                if dst.count == 3:
+                    dst.colorinterp = (
+                        rasterio.enums.ColorInterp.red,
+                        rasterio.enums.ColorInterp.green,
+                        rasterio.enums.ColorInterp.blue,
+                    )
+    return str(output_path)

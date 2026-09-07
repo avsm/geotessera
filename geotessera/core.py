@@ -55,6 +55,8 @@ def dequantize_embedding(
         >>> embedding.dtype
         dtype('float32')
     """
+    scales = np.asarray(scales, dtype=np.float32)
+    scales = np.where(np.isfinite(scales), scales, np.nan)
     # Handle both 2D scales (H, W) and 3D scales (H, W, 128)
     if scales.ndim == 2 and quantized_embedding.ndim == 3:
         # Broadcast 2D scales to match 3D embedding shape
@@ -326,99 +328,53 @@ class GeoTessera:
             Path to the generated texture file
         """
         try:
-            from PIL import Image, ImageDraw
+            from PIL import Image
         except ImportError:
             raise ImportError(
                 "PIL/Pillow required for texture generation: pip install Pillow"
             )
 
-        # Constants matching JavaScript
-        TILE_SIZE = 0.1
-        TILE_OFFSET = 0.05
-
-        # Calculate canvas size (one pixel per tile)
-        width = int(360 / TILE_SIZE)  # 3600
-        height = int(180 / TILE_SIZE)  # 1800
-
-        self.logger.info(f"Generating coverage texture ({width}x{height} pixels)...")
-
-        # Create RGBA image
-        img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-
-        # Get metadata for coloring logic
+        width, height = 3600, 1800
+        pixels = np.zeros((height, width, 4), dtype=np.uint8)
         tiles_dict = coverage_data["tiles"]
-        no_coverage_set = set(coverage_data.get("no_coverage", []))
-        all_years = coverage_data["years"]
-        max_years = len(all_years)
-        latest_year = max(all_years) if all_years else 0
-
-        tile_count = 0
-
-        # Iterate through grid (same as JavaScript)
-        lon = -180 + TILE_OFFSET
-        while lon < 180:
-            lat = -90 + TILE_OFFSET
-            while lat < 90:
-                # Generate tile key
-                key = f"{lon:.2f},{lat:.2f}"
-
-                # Determine color based on coverage. Single-tint mode varies
-                # the shade of one hue per dataset, so within a dataset the
-                # viewer can see *temporal* coverage at a glance (pale =
-                # sparse years, saturated = all years), and across datasets
-                # the hue distinguishes which version/variant.
-                if tint_color is not None:
-                    tile_years = tiles_dict.get(key)
-                    if tile_years:
-                        n = len(tile_years)
-                        # Interpolate exactly between n=1 -> 50% tint and
-                        # n=max_years -> full tint. (max_years=1 collapses
-                        # to full tint for everything.)
-                        if max_years <= 1:
-                            frac = 1.0
-                        else:
-                            frac = 0.5 + 0.5 * (n - 1) / (max_years - 1)
-                        r = int(tint_color[0] * frac + 255 * (1 - frac))
-                        g = int(tint_color[1] * frac + 255 * (1 - frac))
-                        b = int(tint_color[2] * frac + 255 * (1 - frac))
-                        # Alpha also scales lightly with coverage so sparse
-                        # tiles fade more into the globe; keeps a clear visual
-                        # hierarchy when two datasets overlap.
-                        alpha = (
-                            int(140 + 60 * (n / max_years)) if max_years > 0 else 200
+        no_coverage = set(coverage_data.get("no_coverage", []))
+        years = coverage_data["years"]
+        keys = list(set(tiles_dict) | (no_coverage if tint_color is None else set()))
+        tile_count = len(keys)
+        if keys:
+            coords = np.array([tuple(map(float, key.split(","))) for key in keys])
+            cols = np.rint((coords[:, 0] + 179.95) * 10).astype(int)
+            rows = np.rint((89.95 - coords[:, 1]) * 10).astype(int)
+            if tint_color is None:
+                colors = np.array(
+                    [
+                        self._get_tile_color(
+                            key,
+                            tiles_dict,
+                            no_coverage,
+                            years,
+                            len(years),
+                            max(years, default=0),
                         )
-                        color = (r, g, b, alpha)
-                    else:
-                        color = (0, 0, 0, 0)
-                else:
-                    color = self._get_tile_color(
-                        key,
-                        tiles_dict,
-                        no_coverage_set,
-                        all_years,
-                        max_years,
-                        latest_year,
-                    )
-
-                # Convert lat/lon to pixel coordinates (equirectangular projection)
-                min_lon = lon - TILE_OFFSET
-                max_lon = lon + TILE_OFFSET
-                min_lat = lat - TILE_OFFSET
-                max_lat = lat + TILE_OFFSET
-
-                x1 = int(((min_lon + 180) / 360) * width)
-                x2 = int(((max_lon + 180) / 360) * width)
-                y1 = int(((90 - max_lat) / 180) * height)
-                y2 = int(((90 - min_lat) / 180) * height)
-
-                # Draw rectangle if not transparent
-                if color[3] > 0:  # If alpha > 0
-                    draw.rectangle([x1, y1, x2, y2], fill=color)
-
-                tile_count += 1
-                lat += TILE_SIZE
-            lon += TILE_SIZE
+                        for key in keys
+                    ],
+                    dtype=np.uint8,
+                )
+            else:
+                counts = np.array([len(tiles_dict[key]) for key in keys])
+                fraction = (
+                    np.ones(len(keys))
+                    if len(years) <= 1
+                    else 0.5 + 0.5 * (counts - 1) / (len(years) - 1)
+                )
+                colors = np.empty((len(keys), 4), dtype=np.uint8)
+                colors[:, :3] = np.asarray(tint_color)[None, :] * fraction[
+                    :, None
+                ] + 255 * (1 - fraction[:, None])
+                colors[:, 3] = 140 + 60 * counts / max(len(years), 1)
+            inside = (cols >= 0) & (cols < width) & (rows >= 0) & (rows < height)
+            pixels[rows[inside], cols[inside]] = colors[inside]
+        img = Image.fromarray(pixels)
 
         # Save texture
         if output_file is None:
@@ -494,8 +450,9 @@ class GeoTessera:
             - crs: CRS object from rasterio (coordinate reference system)
             - transform: Affine transform from rasterio
         """
-        # Download each tile with progress tracking
+        # Progress requires a known total; materialise only when requested.
         if progress_callback:
+            tiles_to_fetch = list(tiles_to_fetch)
             total_tiles = len(tiles_to_fetch)
 
         for i, (year, tile_lon, tile_lat) in enumerate(tiles_to_fetch):
@@ -531,16 +488,9 @@ class GeoTessera:
                     )
 
             except Exception as e:
-                self.logger.warning(
-                    f"Failed to download tile ({tile_lon:.2f}, {tile_lat:.2f}): {e}"
-                )
-                if progress_callback:
-                    progress_callback(
-                        (i + 1) * 100 // total_tiles,
-                        100,
-                        f"Failed tile {i + 1}/{total_tiles}",
-                    )
-                continue
+                raise RuntimeError(
+                    f"Failed to fetch tile ({tile_lon:.2f}, {tile_lat:.2f}) for {year}: {e}"
+                ) from e
 
     def _ensure_tiles_available(
         self,
@@ -721,175 +671,67 @@ class GeoTessera:
             >>> predictions = classifier.predict(pixels)
             >>> classification_map = predictions.reshape(mosaic.shape[:2])
         """
-        try:
-            from rasterio.merge import merge
-            from rasterio.warp import calculate_default_transform, reproject, Resampling
-            from rasterio.io import MemoryFile
-            from rasterio.transform import array_bounds
-        except ImportError:
-            raise ImportError(
-                "rasterio required for mosaic creation. Install with: pip install rasterio"
-            )
+        import tempfile
+        import rasterio
+        from rasterio.warp import transform_bounds
+        from .inputs import parse_bbox
+        from .raster import merge_geotiffs
 
-        # Validate bbox
-        min_lon, min_lat, max_lon, max_lat = bbox
-        if not (-180 <= min_lon <= max_lon <= 180):
-            raise ValueError(f"Invalid longitude range: {min_lon} to {max_lon}")
-        if not (-90 <= min_lat <= max_lat <= 90):
-            raise ValueError(f"Invalid latitude range: {min_lat} to {max_lat}")
-
-        # Find tiles in region
-        self.logger.info(f"Finding tiles for region: {bbox}, year: {year}")
-        tiles_needed = self.registry.load_blocks_for_region(bbox, year)
-
-        if not tiles_needed:
-            raise ValueError(
-                f"No embedding tiles found for bbox {bbox} in year {year}. "
-                f"Check data availability with: geotessera info --bbox '{min_lon},{min_lat},{max_lon},{max_lat}'"
-            )
-
-        self.logger.info(f"Found {len(tiles_needed)} tiles needed for mosaic")
-
-        # Extract unique tile coordinates
-        tiles_needed_coords = {(lon, lat) for (y, lon, lat) in tiles_needed}
-
-        # Ensure all required tiles are available (download if needed)
-        local_tile_map = self._ensure_tiles_available(
-            required_coords=tiles_needed_coords,
-            year=year,
-            auto_download=auto_download,
+        bbox = parse_bbox(bbox)
+        required = {
+            (lon, lat)
+            for _, lon, lat in self.registry.load_blocks_for_region(bbox, year)
+        }
+        if not required:
+            raise ValueError("No tiles found for the requested region/year")
+        tiles = self._ensure_tiles_available(
+            required,
+            year,
+            auto_download,
             bbox=bbox,
             progress_callback=progress_callback,
-            progress_offset=0,
-            progress_total=len(tiles_needed_coords) + len(tiles_needed_coords) * 2 + 1,
         )
-
-        # Calculate number of missing tiles for progress tracking
-        # (already downloaded by _ensure_tiles_available if auto_download=True)
-        num_missing = sum(
-            1
-            for coord in tiles_needed_coords
-            if coord not in local_tile_map or not local_tile_map[coord].is_available()
-        )
-
-        # Track progress for loading + reprojecting + merging
-        total_steps = (
-            len(tiles_needed_coords) * 2 + 1
-        )  # load+reproject per tile, then merge
-        current_step = num_missing if auto_download else 0
-
-        def update_progress(status: str):
-            nonlocal current_step
-            current_step += 1
-            if progress_callback:
-                progress_callback(current_step, total_steps, status)
-
-        # Load all tiles from embeddings_dir and reproject to target CRS
-        reprojected_memfiles = []
-
-        for tile_lon, tile_lat in tiles_needed_coords:
-            # Get Tile object from local storage
-            tile = local_tile_map.get((tile_lon, tile_lat))
-            if tile is None or not tile.is_available():
-                self.logger.warning(
-                    f"Tile ({tile_lon:.2f}, {tile_lat:.2f}) not available after download, skipping"
-                )
-                continue
-
-            update_progress(f"Loading tile ({tile_lon:.2f}, {tile_lat:.2f})")
-
-            try:
-                # Load embedding from Tile (handles both NPY and GeoTIFF formats)
-                embedding = tile.load_embedding()
-                src_crs = tile.crs
-                src_transform = tile.transform
-
-                # Get source dimensions and bounds
-                src_height, src_width = embedding.shape[:2]
-                src_bounds = array_bounds(src_height, src_width, src_transform)
-
-                # Calculate destination transform and dimensions
-                dst_transform, dst_width, dst_height = calculate_default_transform(
-                    src_crs, target_crs, src_width, src_height, *src_bounds
-                )
-
-                # Ensure dimensions are valid integers
-                if dst_width is None or dst_height is None:
-                    raise ValueError(
-                        f"Failed to calculate dimensions for tile ({tile_lon}, {tile_lat})"
-                    )
-                dst_width = int(dst_width)
-                dst_height = int(dst_height)
-
-                # Create empty array for reprojected data
-                # rasterio expects (channels, height, width) format
-                reprojected_embedding = np.empty(
-                    (embedding.shape[2], dst_height, dst_width), dtype=embedding.dtype
-                )
-
-                # Reproject each channel
-                for band_idx in range(embedding.shape[2]):
-                    reproject(
-                        source=embedding[:, :, band_idx],
-                        destination=reprojected_embedding[band_idx],
-                        src_transform=src_transform,
-                        src_crs=src_crs,
-                        dst_transform=dst_transform,
-                        dst_crs=target_crs,
-                        resampling=Resampling.bilinear,
-                    )
-
-                # Store in memory file for merging
-                memfile = MemoryFile()
-                with memfile.open(
+        if len(tiles) != len(required):
+            raise RuntimeError("Some required tiles could not be downloaded")
+        with tempfile.TemporaryDirectory(prefix="geotessera_region_") as temporary:
+            paths = []
+            for i, tile in enumerate(tiles.values()):
+                path = Path(temporary) / f"source_{i}.tif"
+                blocks = iter(tile.iter_blocks())
+                top, first = next(blocks)
+                with rasterio.open(
+                    path,
+                    "w",
                     driver="GTiff",
-                    height=dst_height,
-                    width=dst_width,
-                    count=embedding.shape[2],
-                    dtype=embedding.dtype,
-                    crs=target_crs,
-                    transform=dst_transform,
-                ) as dataset:
-                    dataset.write(reprojected_embedding)
+                    width=tile.width,
+                    height=tile.height,
+                    count=first.shape[-1],
+                    dtype="float32",
+                    nodata=np.nan,
+                    crs=tile.crs,
+                    transform=tile.transform,
+                    tiled=True,
+                ) as dst:
+                    import itertools
 
-                reprojected_memfiles.append(memfile)
-                update_progress(f"Reprojected tile ({tile_lon:.2f}, {tile_lat:.2f})")
-
-            except Exception as e:
-                self.logger.warning(
-                    f"Failed to process tile ({tile_lon:.2f}, {tile_lat:.2f}): {e}"
-                )
-                continue
-
-        if not reprojected_memfiles:
-            raise RuntimeError("No tiles successfully reprojected")
-
-        # Merge all reprojected tiles
-        self.logger.info(f"Merging {len(reprojected_memfiles)} reprojected tiles...")
-        datasets = []
-        try:
-            for memfile in reprojected_memfiles:
-                datasets.append(memfile.open())
-
-            merged_array, mosaic_transform = merge(datasets)
-
-            # Convert from (channels, height, width) to (height, width, channels)
-            mosaic_array = np.transpose(merged_array, (1, 2, 0))
-
-            update_progress("Mosaic merge complete")
-
-        finally:
-            # Clean up
-            for dataset in datasets:
-                dataset.close()
-            for memfile in reprojected_memfiles:
-                memfile.close()
-
-        self.logger.info(
-            f"Mosaic created: shape={mosaic_array.shape}, crs={target_crs}"
-        )
-
-        return mosaic_array, mosaic_transform, target_crs
+                    for top, block in itertools.chain([(top, first)], blocks):
+                        dst.write(
+                            block.transpose(2, 0, 1),
+                            window=rasterio.windows.Window(
+                                0, top, tile.width, block.shape[0]
+                            ),
+                        )
+                paths.append(path)
+            output = Path(temporary) / "mosaic.tif"
+            merge_geotiffs(
+                paths,
+                output,
+                target_crs,
+                progress_callback=progress_callback,
+                bounds=transform_bounds("EPSG:4326", target_crs, *bbox),
+            )
+            with rasterio.open(output) as src:
+                return src.read().transpose(1, 2, 0), src.transform, str(src.crs)
 
     def sample_embeddings_at_points(
         self,
@@ -898,6 +740,8 @@ class GeoTessera:
         include_metadata: bool = False,
         auto_download: bool = True,
         progress_callback: Optional[callable] = None,
+        *,
+        errors: str = "raise",
     ) -> Union[np.ndarray, Tuple[np.ndarray, List[Dict]]]:
         """Sample embedding values at specified point locations from local tiles.
 
@@ -920,6 +764,8 @@ class GeoTessera:
                 If False, operate in offline mode and raise error for missing tiles.
                 Set to False for guaranteed offline operation with no network requests.
             progress_callback: Optional callback(current, total, status)
+            errors: "raise" reports tile read failures; "coerce" leaves failed
+                samples as NaN and includes the error when metadata is requested.
 
         Returns:
             If include_metadata=False:
@@ -969,6 +815,8 @@ class GeoTessera:
                 "pip install pyproj rasterio"
             )
 
+        if errors not in ("raise", "coerce"):
+            raise ValueError("errors must be 'raise' or 'coerce'")
         # Parse points to standardized format: list of (lon, lat) tuples
         parsed_points = self._parse_points_input(points)
         n_points = len(parsed_points)
@@ -996,6 +844,7 @@ class GeoTessera:
         # Initialize result arrays
         result_embeddings = np.full((n_points, 128), np.nan, dtype=np.float32)
         result_metadata = [None] * n_points if include_metadata else None
+        expected_bands = None
 
         if progress_callback:
             progress_callback(
@@ -1032,16 +881,24 @@ class GeoTessera:
                         )
                     raise FileNotFoundError(error_msg)
 
-                # Load embedding and metadata from Tile
-                embedding = tile.load_embedding()
-                crs = tile.crs
-                transform = tile.transform
+                samples = tile.sample_points([parsed_points[i] for i in point_indices])
+                if expected_bands is None:
+                    expected_bands = samples.shape[1]
+                    result_embeddings = np.full(
+                        (n_points, samples.shape[1]), np.nan, np.float32
+                    )
+                elif samples.shape[1] != expected_bands:
+                    raise ValueError("Tiles have inconsistent embedding dimensions")
+                crs, transform = tile.crs, tile.transform
+                if not include_metadata:
+                    result_embeddings[point_indices] = samples
+                    continue
 
                 # Create coordinate transformer from WGS84 to tile's CRS
                 transformer = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
 
                 # Extract embedding values for all points in this tile
-                for original_idx in point_indices:
+                for sample_idx, original_idx in enumerate(point_indices):
                     lon, lat = parsed_points[original_idx]
 
                     # Transform from WGS84 to tile's projected coordinates
@@ -1051,10 +908,10 @@ class GeoTessera:
                     row, col = rasterio.transform.rowcol(transform, x, y)
 
                     # Check if pixel is within bounds
-                    height, width = embedding.shape[:2]
+                    height, width = tile.height, tile.width
                     if 0 <= row < height and 0 <= col < width:
                         # Extract embedding value
-                        result_embeddings[original_idx] = embedding[row, col]
+                        result_embeddings[original_idx] = samples[sample_idx]
 
                         # Store metadata if requested
                         if include_metadata:
@@ -1078,6 +935,10 @@ class GeoTessera:
                             }
 
             except Exception as e:
+                if errors == "raise":
+                    raise RuntimeError(
+                        f"Failed to sample tile ({tile_lon}, {tile_lat}): {e}"
+                    ) from e
                 # If tile fetch/load fails, leave those points as NaN
                 self.logger.warning(
                     f"Failed to process tile ({tile_lon:.2f}, {tile_lat:.2f}): {e}"
@@ -1108,40 +969,9 @@ class GeoTessera:
         Returns:
             List of (lon, lat) tuples
         """
-        # Handle GeoJSON FeatureCollection (a dict is also Iterable, so this must
-        # be checked before the generic list/array fallback below).
-        if isinstance(points, dict):
-            if points.get("type") == "FeatureCollection":
-                result = []
-                for feature in points.get("features", []):
-                    geom = feature.get("geometry", {})
-                    if geom.get("type") == "Point":
-                        coords = geom.get("coordinates", [])
-                        if len(coords) >= 2:
-                            result.append((coords[0], coords[1]))
-                return result
-            raise ValueError(
-                "Dict input must be a GeoJSON FeatureCollection with Point geometries"
-            )
+        from .inputs import parse_points
 
-        # Handle GeoDataFrame (also Iterable, so check before the generic fallback).
-        if isinstance(points, gpd.GeoDataFrame):
-            result = []
-            for geom in points.geometry:
-                if geom.geom_type == "Point":
-                    result.append((geom.x, geom.y))
-                else:
-                    raise ValueError("GeoDataFrame must contain only Point geometries")
-            return result
-
-        # Handle a plain list/tuple/array of (lon, lat) pairs (most common case).
-        if isinstance(points, Iterable):
-            return list(points)
-
-        raise ValueError(
-            "points must be a list of (lon, lat) tuples, GeoJSON FeatureCollection, "
-            "or GeoPandas GeoDataFrame"
-        )
+        return parse_points(points)
 
     def _group_points_by_tile(
         self, points: List[Tuple[float, float]], year: int
@@ -1430,95 +1260,6 @@ class GeoTessera:
 
         return results
 
-    def _reproject_geotiff_file(self, args):
-        """Helper function to reproject a single GeoTIFF file.
-
-        Args:
-            args: Tuple containing (source_file, output_file, target_crs, target_resolution, compress)
-
-        Returns:
-            Tuple of (output_file, None) on success or (None, error_message) on failure
-        """
-        source_file, output_file, target_crs, target_resolution, compress = args
-
-        try:
-            import rasterio
-            from rasterio.warp import (
-                Resampling,
-                aligned_target,
-                calculate_default_transform,
-                reproject,
-            )
-
-            with rasterio.open(source_file) as src:
-                target_crs_obj = rasterio.crs.CRS.from_user_input(target_crs)
-                preserve_grid = src.crs == target_crs_obj and src.res == target_resolution
-                if preserve_grid:
-                    # There is no coordinate conversion to perform.  Retain
-                    # the source grid exactly rather than snapping its origin
-                    # or resampling its values.
-                    transform, width, height = src.transform, src.width, src.height
-                else:
-                    # Calculate transform and dimensions for target CRS.  The
-                    # target resolution is calculated before this helper is
-                    # called, so its units are those of target_crs rather than
-                    # src.crs.
-                    transform, width, height = calculate_default_transform(
-                        src.crs,
-                        target_crs_obj,
-                        src.width,
-                        src.height,
-                        *src.bounds,
-                        resolution=target_resolution,
-                    )
-                    # Snap converted inputs to the same target-CRS pixel grid.
-                    transform, width, height = aligned_target(
-                        transform, width, height, target_resolution
-                    )
-
-                # Create reprojected file
-                with rasterio.open(
-                    output_file,
-                    "w",
-                    driver="GTiff",
-                    height=height,
-                    width=width,
-                    count=src.count,
-                    dtype=src.dtypes[0],
-                    crs=target_crs,
-                    transform=transform,
-                    compress=compress,
-                    tiled=True,
-                    blockxsize=256,
-                    blockysize=256,
-                ) as dst:
-                    # Reproject each band
-                    for band_idx in range(1, src.count + 1):
-                        if preserve_grid:
-                            dst.write(src.read(band_idx), band_idx)
-                        else:
-                            reproject(
-                                source=rasterio.band(src, band_idx),
-                                destination=rasterio.band(dst, band_idx),
-                                src_transform=src.transform,
-                                src_crs=src.crs,
-                                dst_transform=transform,
-                                dst_crs=target_crs_obj,
-                                resampling=Resampling.bilinear,
-                            )
-
-                    # Copy metadata and band descriptions
-                    dst.update_tags(**src.tags())
-                    for band_idx in range(1, src.count + 1):
-                        if src.descriptions and band_idx <= len(src.descriptions):
-                            band_desc = src.descriptions[band_idx - 1]
-                            if band_desc:
-                                dst.set_band_description(band_idx, band_desc)
-
-            return output_file, None
-        except Exception as e:
-            return None, str(e)
-
     def _get_utm_projection_from_landmask(
         self, lon: float, lat: float, refresh: bool = False
     ):
@@ -1585,51 +1326,55 @@ class GeoTessera:
             )
 
         if bands is not None:
-            data = embedding[:, :, bands].copy()
+            data = embedding[:, :, bands]
             band_count = len(bands)
         else:
-            data = embedding.copy()
-            band_count = 128
+            data = embedding
+            band_count = data.shape[2]
 
         height, width = data.shape[:2]
-        with rasterio.open(
-            output_path,
-            "w",
-            driver="GTiff",
-            height=height,
-            width=width,
-            count=band_count,
-            dtype="float32",
-            crs=crs,
-            transform=transform,
-            compress=compress,
-            tiled=True,
-            blockxsize=256,
-            blockysize=256,
-        ) as dst:
-            for i in range(band_count):
-                dst.write(data[:, :, i], i + 1)
+        from .remote import atomic_output
 
-            if bands is not None:
-                for i, band_idx in enumerate(bands):
-                    dst.set_band_description(i + 1, f"Tessera_Band_{band_idx}")
-            else:
-                for i in range(128):
-                    dst.set_band_description(i + 1, f"Tessera_Band_{i}")
+        with atomic_output(output_path, suffix=".tif") as staged:
+            with rasterio.open(
+                staged,
+                "w",
+                driver="GTiff",
+                height=height,
+                width=width,
+                count=band_count,
+                dtype="float32",
+                nodata=np.nan,
+                crs=crs,
+                transform=transform,
+                compress=compress,
+                tiled=True,
+                blockxsize=256,
+                blockysize=256,
+            ) as dst:
+                for i in range(band_count):
+                    dst.write(data[:, :, i], i + 1)
 
-            # Record the resolved version path (v1, v1.1, …) and variant so the
-            # dataset provenance is recoverable from the TIFF alone, even if
-            # separated from the tessera_metadata.json sidecar.
-            dst.update_tags(
-                TESSERA_DATASET_VERSION=self.registry._version_norm,
-                TESSERA_DATASET_VERSION_PATH=self.registry._version_path,
-                TESSERA_DATASET_VARIANT=self.dataset_variant,
-                TESSERA_YEAR=str(year),
-                TESSERA_TILE_LAT=f"{lat:.2f}",
-                TESSERA_TILE_LON=f"{lon:.2f}",
-                TESSERA_DESCRIPTION="GeoTessera satellite embedding tile",
-                GEOTESSERA_VERSION=__version__,
-            )
+                if bands is not None:
+                    for i, band_idx in enumerate(bands):
+                        dst.set_band_description(i + 1, f"Tessera_Band_{band_idx}")
+                else:
+                    for i in range(band_count):
+                        dst.set_band_description(i + 1, f"Tessera_Band_{i}")
+
+                # Record the resolved version path (v1, v1.1, …) and variant so the
+                # dataset provenance is recoverable from the TIFF alone, even if
+                # separated from the tessera_metadata.json sidecar.
+                dst.update_tags(
+                    TESSERA_DATASET_VERSION=self.registry._version_norm,
+                    TESSERA_DATASET_VERSION_PATH=self.registry._version_path,
+                    TESSERA_DATASET_VARIANT=self.dataset_variant,
+                    TESSERA_YEAR=str(year),
+                    TESSERA_TILE_LAT=f"{lat:.2f}",
+                    TESSERA_TILE_LON=f"{lon:.2f}",
+                    TESSERA_DESCRIPTION="GeoTessera satellite embedding tile",
+                    GEOTESSERA_VERSION=__version__,
+                )
 
     def export_embedding_geotiff(
         self,
@@ -1782,177 +1527,11 @@ class GeoTessera:
             ImportError: If rasterio is not available
             RuntimeError: If merge fails
         """
-        try:
-            import rasterio
-            from rasterio.merge import merge
-            from rasterio.warp import calculate_default_transform
-            import tempfile
-            import os
-        except ImportError:
-            raise ImportError(
-                "rasterio required for mosaic creation: pip install rasterio"
-            )
+        from .raster import merge_geotiffs
 
-        if not geotiff_paths:
-            raise RuntimeError("No GeoTIFF files provided")
-
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Determine a common resolution in the target CRS.  Passing a source
-        # resolution through to calculate_default_transform is wrong whenever
-        # the CRS changes (for example, 10 metres is not 10 degrees).
-        with rasterio.open(geotiff_paths[0]) as first_src:
-            if first_src.crs is None:
-                raise RuntimeError(
-                    f"Cannot reproject {geotiff_paths[0]} because it has no CRS"
-                )
-
-            target_crs_obj = rasterio.crs.CRS.from_user_input(target_crs)
-            if first_src.crs == target_crs_obj:
-                # Retain the native grid exactly when no CRS conversion is
-                # needed, including non-square pixels.
-                target_resolution = first_src.res
-            else:
-                default_transform, _, _ = calculate_default_transform(
-                    first_src.crs,
-                    target_crs_obj,
-                    first_src.width,
-                    first_src.height,
-                    *first_src.bounds,
-                )
-                target_resolution = (
-                    abs(default_transform.a),
-                    abs(default_transform.e),
-                )
-
-        # Create temporary directory for reprojected files
-        with tempfile.TemporaryDirectory(prefix="geotessera_reproject_") as temp_dir:
-            # Prepare reprojection arguments
-            total_files = len(geotiff_paths)
-            reproject_args = []
-            reprojected_files = []
-
-            for i, geotiff_file in enumerate(geotiff_paths):
-                reprojected_file = os.path.join(temp_dir, f"reprojected_{i}.tif")
-                reprojected_files.append(reprojected_file)
-                reproject_args.append(
-                    (
-                        geotiff_file,
-                        reprojected_file,
-                        target_crs,
-                        target_resolution,
-                        compress,
-                    )
-                )
-
-            if progress_callback:
-                progress_callback(0, total_files * 2 + 2, "Starting reprojection...")
-
-            # Sequential reprojection
-            failed_files = []
-            for i, args in enumerate(reproject_args):
-                if progress_callback:
-                    progress_callback(
-                        i,
-                        total_files * 2 + 2,
-                        f"Reprojecting file {i + 1}/{total_files}...",
-                    )
-
-                _, error = self._reproject_geotiff_file(args)
-
-                if error:
-                    failed_files.append((geotiff_paths[i], error))
-
-            if failed_files:
-                error_msg = f"Failed to reproject {len(failed_files)} files: "
-                error_msg += ", ".join(
-                    [f"{Path(f).name}: {e}" for f, e in failed_files[:3]]
-                )
-                if len(failed_files) > 3:
-                    error_msg += f" and {len(failed_files) - 3} more"
-                raise RuntimeError(error_msg)
-
-            # Filter out any failed reprojections
-            reprojected_files = [f for f in reprojected_files if os.path.exists(f)]
-
-            if progress_callback:
-                progress_callback(
-                    total_files, total_files * 2 + 2, "Opening files for merging..."
-                )
-
-            # Open all reprojected files for merging
-            src_files = [rasterio.open(f) for f in reprojected_files]
-
-            try:
-                if progress_callback:
-                    progress_callback(
-                        total_files + 1, total_files * 2 + 2, "Merging tiles..."
-                    )
-
-                # Merge tiles
-                mosaic_array, mosaic_transform = merge(src_files, method="first")
-
-                # Get metadata from first file
-                first_src = src_files[0]
-                profile = first_src.profile.copy()
-                profile.update(
-                    {
-                        "height": mosaic_array.shape[1],
-                        "width": mosaic_array.shape[2],
-                        "transform": mosaic_transform,
-                        "dtype": mosaic_array.dtype,  # Use mosaic array dtype
-                        "compress": compress,
-                        "tiled": True,
-                        "blockxsize": 512,
-                        "blockysize": 512,
-                    }
-                )
-
-                if progress_callback:
-                    progress_callback(
-                        total_files * 2,
-                        total_files * 2 + 2,
-                        "Writing mosaic to disk...",
-                    )
-
-                # Write mosaic
-                with rasterio.open(output_path, "w", **profile) as dst:
-                    dst.write(mosaic_array)
-
-                    # Copy band descriptions from first file
-                    for band_idx in range(1, mosaic_array.shape[0] + 1):
-                        band_desc = (
-                            first_src.descriptions[band_idx - 1]
-                            if first_src.descriptions
-                            and band_idx <= len(first_src.descriptions)
-                            else None
-                        )
-                        if band_desc:
-                            dst.set_band_description(band_idx, band_desc)
-
-                    # Update metadata
-                    dst.update_tags(
-                        TESSERA_TARGET_CRS=target_crs,
-                        TESSERA_RESOLUTION=",".join(
-                            str(resolution) for resolution in target_resolution
-                        ),
-                        TESSERA_TILE_COUNT=str(len(geotiff_paths)),
-                        TESSERA_DESCRIPTION="GeoTessera satellite embedding mosaic",
-                        GEOTESSERA_VERSION=__version__,
-                    )
-
-                if progress_callback:
-                    progress_callback(
-                        total_files * 2 + 2, total_files * 2 + 2, "Complete"
-                    )
-
-            finally:
-                # Close all source files
-                for src in src_files:
-                    src.close()
-
-        return str(output_path)
+        return merge_geotiffs(
+            geotiff_paths, output_path, target_crs, compress, progress_callback
+        )
 
     def apply_pca_to_embeddings(
         self,
@@ -1979,70 +1558,35 @@ class GeoTessera:
         Raises:
             ImportError: If scikit-learn is not available
         """
-        try:
-            from sklearn.decomposition import PCA
-            from sklearn.preprocessing import StandardScaler
-        except ImportError:
-            raise ImportError(
-                "scikit-learn required for PCA visualization: pip install scikit-learn"
-            )
+        from .projection import fit_projection, transform_block
 
         if not embeddings:
             return []
-
-        pca_results = []
-        total_tiles = len(embeddings)
-
-        if progress_callback:
-            progress_callback(0, total_tiles, "Starting PCA analysis...")
-
-        for i, (year, tile_lon, tile_lat, embedding, crs, transform) in enumerate(
-            embeddings
-        ):
-            if progress_callback:
-                progress_callback(
-                    i,
-                    total_tiles,
-                    f"Processing tile {i + 1}/{total_tiles}: ({tile_lon:.2f}, {tile_lat:.2f})",
+        scaler, pca, _ = fit_projection(
+            [{"data": item[3]} for item in embeddings], n_components, standardize
+        )
+        info = {
+            "explained_variance": pca.explained_variance_ratio_.tolist(),
+            "total_variance": float(pca.explained_variance_ratio_.sum()),
+            "n_components": n_components,
+            "standardized": standardize,
+        }
+        results = []
+        for i, (year, lon, lat, embedding, crs, transform) in enumerate(embeddings):
+            results.append(
+                (
+                    year,
+                    lon,
+                    lat,
+                    transform_block(embedding, scaler, pca),
+                    crs,
+                    transform,
+                    info.copy(),
                 )
-
-            # Reshape for PCA: (height, width, channels) -> (pixels, channels)
-            height, width, n_bands = embedding.shape
-            data_reshaped = embedding.reshape(-1, n_bands)
-
-            # Handle NaN values by replacing with 0
-            data_reshaped = np.nan_to_num(data_reshaped, nan=0.0)
-
-            # Standardize data if requested
-            if standardize:
-                scaler = StandardScaler()
-                data_scaled = scaler.fit_transform(data_reshaped)
-            else:
-                data_scaled = data_reshaped
-
-            # Apply PCA
-            pca = PCA(n_components=n_components)
-            pca_result = pca.fit_transform(data_scaled)
-
-            # Reshape back to image: (pixels, n_components) -> (height, width, n_components)
-            pca_image = pca_result.reshape(height, width, n_components)
-
-            # Create PCA info dictionary
-            pca_info = {
-                "explained_variance": pca.explained_variance_ratio_.tolist(),
-                "total_variance": float(pca.explained_variance_ratio_.sum()),
-                "n_components": n_components,
-                "standardized": standardize,
-            }
-
-            pca_results.append(
-                (year, tile_lon, tile_lat, pca_image, crs, transform, pca_info)
             )
-
-        if progress_callback:
-            progress_callback(total_tiles, total_tiles, "PCA analysis complete")
-
-        return pca_results
+            if progress_callback:
+                progress_callback(i + 1, len(embeddings), "Applying shared PCA")
+        return results
 
     def export_pca_geotiffs(
         self,
@@ -2071,169 +1615,44 @@ class GeoTessera:
         Returns:
             List of paths to created PCA GeoTIFF files
         """
-        try:
-            import rasterio
-            from rasterio.enums import ColorInterp
-        except ImportError:
-            raise ImportError(
-                "rasterio required for GeoTIFF export: pip install rasterio"
-            )
+        import tempfile
+        import shutil
+        from .projection import write_pca_tiles
+        from .tiles import Tile
 
+        tiles_to_fetch = list(tiles_to_fetch)
+        if not tiles_to_fetch:
+            return []
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Phase 1: Fetch embeddings (0-40% progress)
-        def fetch_progress(current, total, status=None):
-            overall_progress = int((current / total) * 40)
-            progress_callback(
-                overall_progress, 100, status or f"Fetching tile {current}/{total}"
+        with tempfile.TemporaryDirectory(prefix="geotessera_pca_") as temporary:
+            raw = self.export_embedding_geotiffs(
+                tiles_to_fetch,
+                Path(temporary) / "raw",
+                progress_callback=progress_callback,
             )
-
-        if progress_callback:
-            progress_callback(0, 100, "Fetching embedding tiles...")
-
-        # Materialise the generator: apply_pca_to_embeddings needs len() and the
-        # results are iterated twice below, so a one-shot generator won't do.
-        embeddings = list(
-            self.fetch_embeddings(
-                tiles_to_fetch, fetch_progress if progress_callback else None
-            )
-        )
-
-        if not embeddings:
-            if progress_callback:
-                progress_callback(100, 100, "No tiles found in bounding box")
-            return []
-
-        # Phase 2: Apply PCA (40-70% progress)
-        def pca_progress(current, total, status=None):
-            overall_progress = int(40 + (current / total) * 30)
-            progress_callback(
-                overall_progress,
-                100,
-                status or f"Applying PCA to tile {current}/{total}",
-            )
-
-        pca_results = self.apply_pca_to_embeddings(
-            embeddings,
-            n_components,
-            standardize,
-            pca_progress if progress_callback else None,
-        )
-
-        # Phase 3: Export GeoTIFFs (70-100% progress)
-        created_files = []
-        if progress_callback:
-            total_tiles = len(pca_results)
-
-        # Calculate global min/max if normalize is True (for consistent scaling across tiles)
-        if normalize:
-            # Global normalization: find min/max across ALL tiles first
-            global_min = [float("inf")] * n_components
-            global_max = [float("-inf")] * n_components
-
-            for _, _, _, pca_img, _, _, _ in pca_results:
-                for j in range(n_components):
-                    comp = pca_img[:, :, j]
-                    global_min[j] = min(global_min[j], np.nanmin(comp))
-                    global_max[j] = max(global_max[j], np.nanmax(comp))
-
-        for i, (
-            year,
-            tile_lon,
-            tile_lat,
-            pca_image,
-            crs,
-            transform,
-            pca_info,
-        ) in enumerate(pca_results):
-            if progress_callback:
-                export_progress = int(70 + (i / total_tiles) * 30)
-                filename = f"grid_{tile_lon:.2f}_{tile_lat:.2f}_{year}_pca.tiff"
-                progress_callback(export_progress, 100, f"Writing {filename}...")
-
-            # Always normalize PCA components to 0-255 for visualization
-            pca_normalized = np.zeros_like(pca_image)
-            for j in range(n_components):
-                component = pca_image[:, :, j]
-
-                if normalize:
-                    # Use global min/max for consistent scaling across tiles
-                    comp_min, comp_max = global_min[j], global_max[j]
-                else:
-                    # Use local min/max for per-tile normalization
-                    comp_min, comp_max = np.nanmin(component), np.nanmax(component)
-
-                if comp_max > comp_min:
-                    pca_normalized[:, :, j] = (component - comp_min) / (
-                        comp_max - comp_min
-                    )
-                else:
-                    pca_normalized[:, :, j] = 0
-
-            # Always convert to uint8 for visualization output
-            output_data = (np.clip(pca_normalized, 0, 1) * 255).astype(np.uint8)
-            dtype = "uint8"
-
-            # Create filename and path
-            filename = f"grid_{tile_lon:.2f}_{tile_lat:.2f}_{year}_pca.tiff"
-            output_path = output_dir / filename
-
-            # Get dimensions
-            height, width = output_data.shape[:2]
-
-            # Write PCA GeoTIFF
-            with rasterio.open(
-                output_path,
-                "w",
-                driver="GTiff",
-                height=height,
-                width=width,
-                count=n_components,
-                dtype=dtype,
-                crs=crs,
-                transform=transform,
+            if not raw:
+                return []
+            sources = [Tile.from_geotiff(Path(path)) for path in raw]
+            files = write_pca_tiles(
+                sources,
+                Path(temporary) / "pca",
+                n_components,
+                standardize,
+                percentile_range=(0, 100),
                 compress=compress,
-                tiled=True,
-                blockxsize=256,
-                blockysize=256,
-            ) as dst:
-                # Write each component as a band
-                for band_idx in range(n_components):
-                    dst.write(output_data[:, :, band_idx], band_idx + 1)
-
-                    # Set band description with explained variance
-                    variance_pct = pca_info["explained_variance"][band_idx] * 100
-                    dst.set_band_description(
-                        band_idx + 1, f"PC{band_idx + 1} ({variance_pct:.1f}% variance)"
-                    )
-
-                # Set color interpretation for RGB visualization
-                if n_components >= 3 and normalize:
-                    dst.colorinterp = [
-                        ColorInterp.red,
-                        ColorInterp.green,
-                        ColorInterp.blue,
-                    ][:n_components]
-
-                # Add metadata
-                dst.update_tags(
-                    TESSERA_YEAR=str(year),
-                    TESSERA_TILE_LON=str(tile_lon),
-                    TESSERA_TILE_LAT=str(tile_lat),
-                    PCA_COMPONENTS=str(n_components),
-                    PCA_TOTAL_VARIANCE=f"{pca_info['total_variance']:.3f}",
-                    PCA_EXPLAINED_VARIANCE=json.dumps(pca_info["explained_variance"]),
-                    PCA_STANDARDIZED=str(standardize),
-                    PCA_NORMALIZED=str(normalize),
-                    GEOTESSERA_VERSION=__version__,
-                )
-
-            created_files.append(str(output_path))
-
-        if progress_callback:
-            progress_callback(
-                100, 100, f"Created {len(created_files)} PCA GeoTIFF files"
+                local_scaling=not normalize,
+                progress_callback=progress_callback,
             )
+            outputs = []
+            for source, path in zip(sources, files):
+                output = (
+                    output_dir
+                    / f"grid_{source.lon:.2f}_{source.lat:.2f}_{source.year}_pca.tiff"
+                )
+                from .remote import atomic_output
 
-        return created_files
+                with atomic_output(output, suffix=".tiff") as staged:
+                    shutil.copyfile(path, staged)
+                outputs.append(str(output))
+        return outputs

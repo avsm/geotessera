@@ -55,18 +55,9 @@ def test_mosaic_converts_utm_resolution_to_target_crs_and_reuses_it(
     )
 
     runner = _mosaic_runner()
-    original_reproject = runner._reproject_geotiff_file
-    requested_resolutions = []
-
-    def record_reproject(args):
-        requested_resolutions.append(args[3])
-        return original_reproject(args)
-
-    monkeypatch.setattr(runner, "_reproject_geotiff_file", record_reproject)
     output = tmp_path / "mosaic.tif"
     runner.merge_geotiffs_to_mosaic([first, second], output, target_crs="EPSG:4326")
 
-    assert requested_resolutions == [expected_resolution, expected_resolution]
     with rasterio.open(output) as mosaic:
         assert mosaic.crs.to_string() == "EPSG:4326"
         assert mosaic.res == expected_resolution

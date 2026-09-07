@@ -2,8 +2,7 @@
 
 from typing import Tuple, Optional, List, Dict, Callable
 import geopandas as gpd
-import zipfile
-import os
+import pooch
 from pathlib import Path
 import difflib
 
@@ -25,12 +24,7 @@ class CountryLookup:
         if cache_dir:
             self._cache_dir = Path(cache_dir)
         else:
-            # Use platform-appropriate cache directory
-            if os.name == "nt":
-                base = Path(os.environ.get("LOCALAPPDATA", "~")).expanduser()
-            else:
-                base = Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")).expanduser()
-            self._cache_dir = base / "geotessera"
+            self._cache_dir = Path(pooch.os_cache("geotessera"))
 
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         self._countries_gdf: Optional[gpd.GeoDataFrame] = None
@@ -39,61 +33,18 @@ class CountryLookup:
 
     def _get_countries_data_path(self) -> Path:
         """Download and extract Natural Earth countries data, return path to GeoJSON."""
-        # Check if data already exists
-        extract_dir = self._cache_dir / "natural-earth-data"
-        geojson_path = (
-            extract_dir
-            / "natural-earth-vector-5.1.2"
-            / "geojson"
-            / "ne_110m_admin_0_countries.geojson"
+        if self._progress_callback:
+            self._progress_callback(0, 100, "Loading country boundaries...")
+        path = pooch.retrieve(
+            "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/"
+            "v5.1.2/geojson/ne_110m_admin_0_countries.geojson",
+            known_hash="sha256:6866c877d39cba9c357620878839b336d569f8c662d3cfab4cb1dbe2d39c977f",
+            path=self._cache_dir,
+            fname="ne_110m_admin_0_countries-v5.1.2.geojson",
         )
-
-        if geojson_path.exists():
-            if self._progress_callback:
-                self._progress_callback(100, 100, "Country data already cached")
-            return geojson_path
-
-        # Report download starting
-        if self._progress_callback:
-            self._progress_callback(0, 100, "Downloading country boundaries...")
-
-        from .registry import download_file_to_temp
-
-        url = "https://github.com/nvkelso/natural-earth-vector/archive/refs/tags/v5.1.2.zip"
-        archive_path = self._cache_dir / "natural-earth-v5.1.2.zip"
-
-        # Downloading is the first half of this task's 0-100 scale and
-        # extraction the second. GitHub often omits Content-Length, so fall
-        # back to the archive's usual ~18 MB as the denominator.
-        progress_adapter = None
-        if self._progress_callback:
-            estimated_total = 18 * 1024 * 1024
-
-            def progress_adapter(downloaded, total, status):
-                denom = total or estimated_total
-                pct = min(50, int(downloaded / denom * 50))
-                self._progress_callback(pct, 100, status)
-
-        download_file_to_temp(
-            url, progress_callback=progress_adapter, cache_path=archive_path
-        )
-
-        # Extract the specific GeoJSON file we need
-        if self._progress_callback:
-            self._progress_callback(50, 100, "Extracting country data...")
-
-        extract_dir.mkdir(exist_ok=True)
-        with zipfile.ZipFile(archive_path, "r") as zip_ref:
-            # Extract only the file we need
-            zip_ref.extract(
-                "natural-earth-vector-5.1.2/geojson/ne_110m_admin_0_countries.geojson",
-                extract_dir,
-            )
-
         if self._progress_callback:
             self._progress_callback(100, 100, "Country data ready")
-
-        return geojson_path
+        return Path(path)
 
     def _load_countries_data(self) -> gpd.GeoDataFrame:
         """Load countries data from Natural Earth GeoJSON."""
@@ -196,6 +147,7 @@ class CountryLookup:
         countries = self._load_countries_data()
         return sorted(countries["NAME_EN"].dropna().tolist())
 
+
 # Global instance for convenience
 _country_lookup = None
 
@@ -222,5 +174,3 @@ def get_country_bbox(
         progress_callback: Optional callback for progress updates when downloading data
     """
     return get_country_lookup(progress_callback).get_bbox(country_name)
-
-
