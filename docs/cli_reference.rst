@@ -3,6 +3,48 @@ CLI Reference
 
 GeoTessera provides a comprehensive command-line interface for downloading, visualizing, and serving Tessera embeddings.
 
+Streaming regions
+-----------------
+
+``download`` defaults to Zarr streaming for TIFF output. It writes one native
+UTM GeoTIFF per intersecting zone, named ``tessera_YEAR_utmNN.tif``. Use
+``--source tiles`` for the original tile layout; NPY output selects tiles
+automatically. ``--registry-dir`` also selects the tile backend in auto mode.
+
+::
+
+    geotessera download --bbox '-3.0,53.4,-2.9,53.5' --year 2024 --output region/
+    geotessera download --source zarr --store-url /data/tessera.zarr --bbox '-3.0,53.4,-2.9,53.5' --year 2024 --output region/
+    geotessera webmap --bbox '-3.0,53.4,-2.9,53.5' --year 2024 --bands 0,1,2 --output map/
+
+Both streaming workflows accept ``--tile``, ``--region-file`` or ``--country``
+instead of ``--bbox``, and support ``--dataset-version``, ``--dataset-variant``,
+``--store-url``, ``--cache-dir``, ``--bands`` and ``--depth``. Country and file
+selectors use their bounding boxes, not a polygon clip. Split antimeridian
+regions into separate west/east requests. ``--depth`` selects a published
+matryoshka prefix; band indices are zero-based within that prefix.
+
+``download --dry-run`` reads metadata and reports uncompressed output size;
+it does not estimate physical chunk transfer or compressed file size. Streaming
+downloads write float32 values with NaN nodata and source provenance, replacing
+each file atomically. They do not reuse an existing file merely by name.
+
+``webmap`` accepts either an existing RGB GeoTIFF positional argument or a
+region selector. Region mode streams three bands and normalizes their colors
+together. Matching completed mosaics and tiles are reused using JSON completion
+records in the output directory. Changing zoom levels rebuilds only tiles;
+``--force`` refreshes the streamed mosaic too. Interrupted tile generation can
+reuse a completed mosaic; interrupted mosaic generation must stream again.
+Sources are assumed immutable: use ``--force`` for updates at the same URL.
+``--cache-dir`` persists metadata but byte-range reads remain in memory.
+Serve any existing output without streaming using
+``uv run geotessera serve tessera_webmap --port 8001 --html viewer.html``.
+``--serve`` reserves the requested port before processing and fails if occupied. The existing GDAL tool
+dependency for web tile generation remains. Both GDAL backends use TMS tile
+numbering, matching the generated Folium viewer.
+
+The individual-tile examples below explicitly use ``--source tiles``.
+
 Global Options
 --------------
 
@@ -50,11 +92,11 @@ Control where the Parquet manifest is cached:
 .. code-block:: bash
 
     # Use custom cache directory for the per-version manifest
-    geotessera download --cache-dir /path/to/cache ...
+    geotessera download --source tiles --cache-dir /path/to/cache ...
 
     # Use locally-supplied manifests (e.g. a checked-in offline copy);
     # the directory should hold manifest.parquet and landmasks.parquet
-    geotessera download --registry-dir /path/to/manifest-dir ...
+    geotessera download --source tiles --registry-dir /path/to/manifest-dir ...
 
     # Default cache locations (if not specified):
     # - Linux/macOS: ~/.cache/geotessera/{v1,v1.1-cam,...}/manifest.parquet
@@ -74,7 +116,7 @@ Download embeddings for a region in numpy or GeoTIFF format.
 
 **Usage**::
 
-    geotessera download [OPTIONS]
+    geotessera download --source tiles [OPTIONS]
 
 **Required Options**:
 
@@ -122,21 +164,21 @@ The progress bar reflects only remaining work.
 **Examples**::
 
     # Download as GeoTIFF (georeferenced, for GIS)
-    geotessera download \
+    geotessera download --source tiles \
         --bbox "-0.2,51.4,0.1,51.6" \
         --year 2024 \
         --output ./london_tiffs
     # Next step: geotessera visualize ./london_tiffs pca_mosaic.tif
 
     # Download as numpy arrays (for analysis)
-    geotessera download \
+    geotessera download --source tiles \
         --bbox "-0.2,51.4,0.1,51.6" \
         --format npy \
         --year 2024 \
         --output ./london_arrays
 
     # Download specific bands only
-    geotessera download \
+    geotessera download --source tiles \
         --bbox "-0.2,51.4,0.1,51.6" \
         --bands "0,1,2,10,20,30" \
         --year 2024 \
@@ -144,14 +186,14 @@ The progress bar reflects only remaining work.
     # Next step: geotessera visualize ./london_subset pca_mosaic.tif
 
     # Download by country name
-    geotessera download \
+    geotessera download --source tiles \
         --country "United Kingdom" \
         --year 2024 \
         --output ./uk_tiles
     # Next step: geotessera visualize ./uk_tiles pca_mosaic.tif
 
     # Download using a region file
-    geotessera download \
+    geotessera download --source tiles \
         --region-file cambridge.geojson \
         --format tiff \
         --year 2024 \
@@ -159,7 +201,7 @@ The progress bar reflects only remaining work.
     # Next step: geotessera visualize ./cambridge_tiles pca_mosaic.tif
 
     # Download v1.1 / cambridge embeddings (recommended for new work)
-    geotessera download \
+    geotessera download --source tiles \
         --dataset-version v1.1 \
         --dataset-variant cambridge \
         --region-file cambridge.geojson \
@@ -495,7 +537,7 @@ Complete workflow from coverage check to web visualization::
     geotessera coverage --year 2024 --output coverage.png
 
     # 2. Download data
-    geotessera download \
+    geotessera download --source tiles \
         --bbox "-0.2,51.4,0.1,51.6" \
         --year 2024 \
         --output ./london_data
@@ -515,7 +557,7 @@ Download for analysis purposes::
     geotessera coverage --bbox "-0.1,52.0,0.1,52.2" --year 2024
 
     # 2. Download as numpy arrays
-    geotessera download \
+    geotessera download --source tiles \
         --bbox "-0.1,52.0,0.1,52.2" \
         --format npy \
         --year 2024 \
@@ -525,7 +567,7 @@ Download for analysis purposes::
     python your_analysis_script.py
 
     # 4. Export results as GeoTIFF for visualization
-    geotessera download \
+    geotessera download --source tiles \
         --bbox "-0.1,52.0,0.1,52.2" \
         --format tiff \
         --year 2024 \
@@ -544,7 +586,7 @@ Prepare data for GIS software::
     geotessera coverage --region-file study_area.geojson
 
     # 2. Download with specific bands for analysis
-    geotessera download \
+    geotessera download --source tiles \
         --region-file study_area.geojson \
         --bands "10,20,30,40,50" \
         --format tiff \
@@ -605,7 +647,7 @@ Getting Help
 For additional help::
 
     # Command-specific help
-    geotessera download --help
+    geotessera download --source tiles --help
     geotessera visualize --help
 
     # Version information

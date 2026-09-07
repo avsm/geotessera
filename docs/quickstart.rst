@@ -53,14 +53,14 @@ the map.
 For a specific region (recommended)::
 
     geotessera coverage --region-file study_area.geojson
-    # Next step: geotessera download --region-file study_area.geojson --output tiles/
+    # Next step: geotessera download --source tiles --region-file study_area.geojson --output tiles/
     
     # You can also use remote URLs directly:
     geotessera coverage --region-file https://example.com/region.geojson
 
     # Or check coverage for a specific country (with precise boundary outline):
     geotessera coverage --country "United Kingdom"
-    # Next step: geotessera download --country "United Kingdom" --output tiles/
+    # Next step: geotessera download --source tiles --country "United Kingdom" --output tiles/
 
 For a specific year::
 
@@ -88,7 +88,7 @@ Download as GeoTIFF (Recommended for GIS)
 
 Download embeddings for London as GeoTIFF files::
 
-    geotessera download \
+    geotessera download --source tiles \
         --bbox "-0.2,51.4,0.1,51.6" \
         --year 2024 \
         --output ./london_tiles
@@ -98,7 +98,7 @@ This downloads all 128 bands with LZW compression.
 
 Download specific bands only::
 
-    geotessera download \
+    geotessera download --source tiles \
         --bbox "-0.2,51.4,0.1,51.6" \
         --bands "0,1,2" \
         --year 2024 \
@@ -107,14 +107,14 @@ Download specific bands only::
 
 Download by country name::
 
-    geotessera download \
+    geotessera download --source tiles \
         --country "United Kingdom" \
         --year 2024 \
         --output ./uk_tiles
     # Next step: geotessera visualize ./uk_tiles pca_mosaic.tif
 
     # Or use short country codes
-    geotessera download \
+    geotessera download --source tiles \
         --country "GB" \
         --year 2024 \
         --output ./uk_tiles
@@ -132,7 +132,7 @@ Download using a region file::
     }
     EOF
     
-    geotessera download \
+    geotessera download --source tiles \
         --region-file cambridge.json \
         --year 2024 \
         --output ./cambridge_tiles
@@ -143,7 +143,7 @@ Download as NumPy Arrays (For Analysis)
 
 Download quantized numpy arrays with scales and landmask TIFFs::
 
-    geotessera download \
+    geotessera download --source tiles \
         --bbox "-0.2,51.4,0.1,51.6" \
         --format npy \
         --year 2024 \

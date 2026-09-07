@@ -96,18 +96,18 @@ Check data availability first::
 Download embeddings in your preferred format::
 
     # Download as GeoTIFF (default, georeferenced, ready for GIS)
-    geotessera download --bbox "-0.2,51.4,0.1,51.6" --year 2024 --output ./london_tiffs --bands 1,2,3
+    geotessera download --source tiles --bbox "-0.2,51.4,0.1,51.6" --year 2024 --output ./london_tiffs --bands 1,2,3
 
     # Download as quantized numpy arrays (for analysis, includes scales and landmask TIFFs)
-    geotessera download --bbox "-0.2,51.4,0.1,51.6" --format npy --year 2024 --output ./london_arrays
+    geotessera download --source tiles --bbox "-0.2,51.4,0.1,51.6" --format npy --year 2024 --output ./london_arrays
     # NPY format includes: quantized .npy, _scales.npy, and landmask .tiff files
 
     # Download by country name with precise boundary filtering
-    geotessera download --country "United Kingdom" --year 2024 --output ./uk_tiles
+    geotessera download --source tiles --country "United Kingdom" --year 2024 --output ./uk_tiles
 
     # Download tiles from a region file (supports GeoJSON, Shapefile, or URLs)
-    geotessera download --region-file example/CB.geojson --year 2024 --output ./cambridge
-    geotessera download --region-file https://example.com/region.geojson --year 2024 --output ./remote_region
+    geotessera download --source tiles --region-file example/CB.geojson --year 2024 --output ./cambridge
+    geotessera download --source tiles --region-file https://example.com/region.geojson --year 2024 --output ./remote_region
 
 
 Python API usage::
@@ -346,7 +346,7 @@ Specifying version + variant
 **CLI** — every data-fetching command (``download``, ``coverage``, ``info``)
 accepts both flags::
 
-    geotessera download \
+    geotessera download --source tiles \
         --dataset-version v1.1 \
         --dataset-variant cambridge \
         --region-file area.geojson \
@@ -441,7 +441,7 @@ manifest for its dataset directory and filters by ``dataset_variant`` on
 load. Landmasks are a property of the 0.1° grid, so they stay keyed by
 plain version (``landmasks/v1.1/`` serves every 1.1 variant).
 
-**Local Mirror Structure** (when downloading via ``geotessera download``)::
+**Local Mirror Structure** (when downloading via ``geotessera download --source tiles``)::
 
     output_dir/
     ├── tessera_metadata.json                        # version/variant provenance
@@ -496,10 +496,10 @@ Control where the Parquet registry is cached::
 Or via CLI::
 
     # Specify custom cache directory
-    geotessera download --cache-dir /path/to/cache ...
+    geotessera download --source tiles --cache-dir /path/to/cache ...
 
     # Use default cache location
-    geotessera download ...
+    geotessera download --source tiles ...
 
 Default cache locations (when not specified):
 

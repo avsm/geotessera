@@ -37,6 +37,72 @@ grid — and is the recommended interface for analysis. The
 [tile download interface](#python-api) fetches embeddings as NPY or GeoTIFF
 files for offline work and GIS export.
 
+### Stream regions to GeoTIFF or a web map
+
+TIFF downloads now stream directly from Zarr by default. Only the requested
+region and bands are materialized; raw NPY tiles are not downloaded first.
+
+```bash
+geotessera download --bbox '-3.0,53.4,-2.9,53.5' --year 2024 --output region/
+geotessera webmap --bbox '-3.0,53.4,-2.9,53.5' --year 2024 --bands 0,1,2 --output map/
+```
+
+Downloads create `tessera_2024_utm30.tif` (one file per intersecting UTM zone),
+with float32 embeddings, NaN nodata, band descriptions and store provenance.
+The windows enclose the selected bounds on each native UTM grid; geometries
+and countries select their bounding boxes. No embedding resampling occurs
+until rendering a web map. West must be less than east: split regions crossing
+the antimeridian into two requests.
+
+Use `--store-url /path/to/store` for a local Zarr store, `--cache-dir cache/`
+to cache metadata on disk and byte-range reads within the process, or `--dataset-version v2 --depth 16` for a
+published matryoshka prefix. `--bands` indexes the chosen depth from zero.
+Transferred bytes depend on physical chunk layout even when fewer bands are
+requested. `--dry-run` reads metadata and estimates **uncompressed output**,
+not network transfer size.
+
+For the original individual-tile layout and resumable raw downloads, use
+`--source tiles`. `--format npy` also selects that path automatically.
+`--registry-dir` selects the tile path under the default `--source auto`;
+explicit Zarr mode uses `--store-url` instead. Streaming exports replace each
+destination atomically rather than skipping existing files, so changing bands
+or source cannot silently reuse an old export. A failure in a later zone can
+leave earlier completed zone files; rerunning safely replaces them.
+
+`webmap existing_rgb.tif --output map/` remains supported. Region-based web
+maps use three selected embedding bands with shared min/max scaling; they
+reuse completed RGB mosaics and tiles when the request matches. Changing
+zoom levels rebuilds tiles without streaming again; `--force` refreshes both
+stages. Keep the output directory, including its JSON completion records.
+Interrupted tile generation resumes from the completed RGB mosaic; interrupted
+RGB generation must stream again. Remote data is assumed immutable, so use
+`--force` if a store changes at the same URL. Older outputs without completion
+records can be served directly without regeneration:
+
+```bash
+uv run geotessera serve tessera_webmap --port 8001 --html viewer.html
+```
+
+`--serve` reserves the requested port before processing and fails if it is
+occupied, including by an IPv6 listener. `--cache-dir` is not a persistent
+cache of the byte ranges used to stream sharded Zarr embeddings; keep the
+completed map output to avoid subsequent downloads. For PCA maps, run `visualize`
+on exported files. PCA uses a reproducible sample of up to 100,000 valid
+pixels across all inputs and one shared model/color mapping, with windowed
+transformation. Colors may differ from earlier per-tile/full-data fits.
+Batch fetching and point sampling now raise on read failures. For explicitly
+best-effort sampling, use `errors="coerce"` (and `include_metadata=True` to
+inspect errors). Points outside coverage still return NaN.
+
+The equivalent Python export is:
+
+```python
+from geotessera import GeoTesseraZarr
+
+gt = GeoTesseraZarr()
+files = gt.export_geotiffs((-3.0, 53.4, -2.9, 53.5), 2024, "region/", bands=[0, 1, 2])
+```
+
 ![Coverage map](https://github.com/ucam-eo/tessera-coverage-map/blob/main/map.png)
 
 ### Request missing embeddings
@@ -271,27 +337,27 @@ Download embeddings as either numpy arrays or GeoTIFF files:
 
 ```bash
 # Download as GeoTIFF (default, with georeferencing)
-geotessera download \
+geotessera download --source tiles \
   --bbox "-0.2,51.4,0.1,51.6" \
   --year 2024 \
   --output ./london_tiffs
 
 # Download as raw numpy arrays (with metadata JSON)
-geotessera download \
+geotessera download --source tiles \
   --bbox "-0.2,51.4,0.1,51.6" \
   --format npy \
   --year 2024 \
   --output ./london_arrays
 
 # Download using a GeoJSON/Shapefile region
-geotessera download \
+geotessera download --source tiles \
   --region-file cambridge.geojson \
   --format tiff \
   --year 2024 \
   --output ./cambridge_tiles
 
 # Download specific bands only
-geotessera download \
+geotessera download --source tiles \
   --bbox "-0.2,51.4,0.1,51.6" \
   --bands "0,1,2" \
   --year 2024 \
@@ -435,7 +501,7 @@ visualize_global_coverage(
 Download embeddings for a region in your preferred format:
 
 ```bash
-geotessera download [OPTIONS]
+geotessera download --source tiles [OPTIONS]
 
 Options:
   -o, --output PATH         Output directory [required]
@@ -459,10 +525,10 @@ Options:
 Single tile examples:
 ```bash
 # Download a single tile containing a specific point
-geotessera download --tile "0.17,52.23" --year 2024 -o ./single_tile
+geotessera download --source tiles --tile "0.17,52.23" --year 2024 -o ./single_tile
 
 # Same result using --bbox with 2 coordinates
-geotessera download --bbox "0.17,52.23" --year 2024 -o ./single_tile
+geotessera download --source tiles --bbox "0.17,52.23" --year 2024 -o ./single_tile
 ```
 
 Output formats:
@@ -764,10 +830,10 @@ gt = GeoTessera()
 
 ```bash
 # Specify custom cache directory
-geotessera download --cache-dir /path/to/cache ...
+geotessera download --source tiles --cache-dir /path/to/cache ...
 
 # Use default cache location
-geotessera download ...
+geotessera download --source tiles ...
 ```
 
 ### Default Cache Locations

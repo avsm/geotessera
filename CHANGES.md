@@ -1,5 +1,29 @@
 ## v0.10.3
 
+- Web maps reuse completed matching RGB and tile stages, with `--force` to
+  refresh. Serving reserves the exact port before processing and reports
+  occupied IPv4/IPv6 ports as errors.
+
+- TIFF downloads now stream Zarr regions by default, with native-zone output,
+  band/depth selection, source metadata and atomic writes. `--source tiles`
+  retains the original tile workflow; NPY and local-registry downloads use it
+  automatically. `webmap` can stream a region directly without prior exports.
+- Raster operations share windowed Rasterio virtual warps and preserve valid
+  zeros and nodata. RGB selection happens before merging. Point sampling reads
+  only selected pixels, respects input CRS and recognizes local GeoTIFFs.
+- Zarr patches beyond coverage retain their requested position instead of
+  snapping to the nearest stored pixel. Region window selection is shared.
+- PCA visualizations share a deterministic bounded-sample fit and transform
+  raster windows, replacing per-tile fits and full-region pixel stacking.
+- Simple web viewers use Folium with relative tile URLs and consistent TMS
+  numbering. Country boundaries use a checksummed Pooch download. Region input
+  handling is shared, the local server no longer changes cwd, and coverage
+  textures use integer pixel indexing.
+- Batch fetch failures now raise rather than silently omitting tiles; incomplete
+  NPY CLI downloads exit unsuccessfully instead of reporting full success.
+  Point sampling also raises on read failures by default; use `errors="coerce"`
+  to keep failed samples as NaN. Locations outside coverage still return NaN.
+
 - Zarr scalar and batch point sampling now agree at exact pixel midpoints,
   consistently resolving ties north/west. NaN and infinite query coordinates
   now return `outside` from `probe()` and NaN embeddings from sampling.

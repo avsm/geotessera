@@ -295,8 +295,8 @@ First check coverage, then export as georeferenced GeoTIFF files::
     year = 2024
     
     # Step 2: Download via CLI (preferred) or Python API
-    # CLI: geotessera download --bbox "-0.2,51.4,0.1,51.6" --year 2024 --output ./london_full
-    # CLI: geotessera download --bbox "-0.2,51.4,0.1,51.6" --year 2024 --bands "30,60,90" --output ./london_rgb
+    # CLI: geotessera download --source tiles --bbox "-0.2,51.4,0.1,51.6" --year 2024 --output ./london_full
+    # CLI: geotessera download --source tiles --bbox "-0.2,51.4,0.1,51.6" --year 2024 --bands "30,60,90" --output ./london_rgb
     
     # Or using Python API:
     # Export all bands
@@ -425,7 +425,7 @@ When working with large regions, use CLI for efficient processing::
     # geotessera coverage --bbox "-3.0,50.0,2.0,53.0" --year 2024
 
     # Step 2: Download in smaller chunks or use selective bands
-    # geotessera download --bbox "-3.0,50.0,2.0,53.0" --year 2024 --bands "0,10,20,30,40" --output ./southern_england
+    # geotessera download --source tiles --bbox "-3.0,50.0,2.0,53.0" --year 2024 --bands "0,10,20,30,40" --output ./southern_england
 
     # Step 3: Create PCA visualization (handles large datasets efficiently)
     # geotessera visualize ./southern_england pca_southern_england.tif --n-components 5
@@ -448,7 +448,7 @@ When working with large regions, use CLI for efficient processing::
         total_tiles = len(tiles_to_fetch)
 
         print(f"Processing {total_tiles} tiles...")
-        print("Consider using CLI: geotessera download + geotessera visualize for large regions")
+        print("Consider using CLI: geotessera download --source tiles + geotessera visualize for large regions")
 
         # Step 2: Fetch tiles as generator (one at a time, memory efficient)
         tiles = gt.fetch_embeddings(tiles_to_fetch)
@@ -511,9 +511,9 @@ Export multiple regions efficiently using CLI commands::
     
     # Download regions
     echo "Downloading regions..."
-    geotessera download --bbox "-0.3,51.3,0.2,51.7" --year 2024 --bands "10,20,30,40,50" --output ./batch_exports/london
-    geotessera download --bbox "-0.2,52.0,0.3,52.3" --year 2024 --output ./batch_exports/cambridge
-    geotessera download --bbox "-1.4,51.6,-1.1,51.9" --year 2024 --bands "0,1,2" --output ./batch_exports/oxford
+    geotessera download --source tiles --bbox "-0.3,51.3,0.2,51.7" --year 2024 --bands "10,20,30,40,50" --output ./batch_exports/london
+    geotessera download --source tiles --bbox "-0.2,52.0,0.3,52.3" --year 2024 --output ./batch_exports/cambridge
+    geotessera download --source tiles --bbox "-1.4,51.6,-1.1,51.9" --year 2024 --bands "0,1,2" --output ./batch_exports/oxford
     
     # Create PCA visualizations
     echo "Creating PCA visualizations..."
@@ -537,7 +537,7 @@ Export multiple regions efficiently using CLI commands::
         
         for region_name, config in regions_config.items():
             print(f"Processing region: {region_name}")
-            print(f"Recommend using CLI: geotessera download --bbox '{','.join(map(str, config['bbox']))}' --year {config['year']} --output ./batch_exports/{region_name}")
+            print(f"Recommend using CLI: geotessera download --source tiles --bbox '{','.join(map(str, config['bbox']))}' --year {config['year']} --output ./batch_exports/{region_name}")
             
             output_dir = Path(base_output_dir) / region_name
             output_dir.mkdir(parents=True, exist_ok=True)
