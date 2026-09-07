@@ -1,19 +1,24 @@
-## Unreleased
-
-- Global preview initialization now resumes incomplete pyramids and publishes
-  complete metadata in one write, retrying Windows file-sharing conflicts
-  during concurrent initialization, including metadata and coordinate reads
-  that report only EACCES. Incompatible local pyramids now raise an error
-  instead of being deleted automatically.
-
-- Zarr shard discovery now handles Windows path separators, allowing local
-  fills to resume and statistics rebuilds to include completed shards.
-  Opening groups through `StoreLocation` now uses the same URL adapter as
-  other store operations, preserving Windows file URLs and storage options.
+## v0.10.3
 
 - Zarr scalar and batch point sampling now agree at exact pixel midpoints,
   consistently resolving ties north/west. NaN and infinite query coordinates
   now return `outside` from `probe()` and NaN embeddings from sampling.
+
+- Global preview initialization now resumes incomplete pyramids and publishes
+  complete metadata in one write.
+
+- Zarr shard discovery now handles Windows path separators correctly.
+  Opening groups through `StoreLocation` now uses the same URL adapter as
+  other store operations, preserving Windows file URLs and storage options.
+
+## v0.10.2 (2026-09-04)
+
+- Fix the Zarr store URL for 1.1, which remaps to 1.1-cam on source.coop
+  until embeddings generation completes for the full store. This workaround
+  lets 'v1.1' work until that happens! (#394 @maawoo @avsm)
+
+- Improve the error message when Zarr store opening fails (#394 @maawoo @avsm)
+
 
 ## v0.10.1 (2026-08-27)
 
