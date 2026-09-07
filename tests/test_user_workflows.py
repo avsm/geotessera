@@ -94,6 +94,16 @@ def test_merge_preserves_valid_zero_and_nodata(tmp_path):
     assert np.all(data[:, 1:, 1:] == 0)
 
 
+def test_far_outside_patch_keeps_requested_location():
+    gt, _ = fake_region()
+    lon, lat = -2.8, 52.05
+    patch, transform, crs = gt.read_patch(lon, lat, 2024, 4)
+    assert np.isnan(patch).all()
+    e, n = Transformer.from_crs(4326, crs, always_xy=True).transform(lon, lat)
+    actual_e, actual_n = transform * (2.5, 2.5)
+    assert abs(actual_e - e) <= 5.01 and abs(actual_n - n) <= 5.01
+
+
 def test_generator_with_progress(monkeypatch):
     gt = GeoTessera.__new__(GeoTessera)
     gt.logger = logging.getLogger("test")
@@ -102,6 +112,75 @@ def test_generator_with_progress(monkeypatch):
     )
     result = list(gt.fetch_embeddings(iter([(2024, 0.05, 52.05)]), lambda *args: None))
     assert len(result) == 1
+
+
+def test_streamed_export_selected_bands_and_provenance(tmp_path):
+    gt, bbox = fake_region()
+    files = gt.export_geotiffs(bbox, 2024, tmp_path, bands=[3, 1], strip_rows=2)
+    assert len(files) == 1
+    with rasterio.open(files[0]) as src:
+        assert src.count == 2 and src.crs.to_epsg() == 32630
+        assert np.isnan(src.nodata)
+        assert src.tags()["TESSERA_SOURCE"] == "fake://"
+        np.testing.assert_array_equal(src.read()[:, 0, 0], [4, 2])
+    assert len(discover_tiles(tmp_path)) == 1
+
+
+def test_stream_export_dry_run_does_not_read_chunks(tmp_path):
+    gt, bbox = fake_region()
+    gt._root = object()  # Any attempt to read a Zarr chunk fails.
+    estimate = gt.export_geotiffs(bbox, 2024, tmp_path / "absent", dry_run=True)
+    assert estimate[0]["uncompressed_bytes"] > 0
+    assert not (tmp_path / "absent").exists()
+
+
+def test_stream_export_crosses_zones(tmp_path):
+    gt = _fake_store({30: _seam_zone(32630, True), 31: _seam_zone(32631, False)})
+    files = gt.export_geotiffs(
+        (-0.001, 51.999, 0.001, 52.001), 2024, tmp_path, bands=[0]
+    )
+    assert len(files) == 2
+    zones = set()
+    for path in files:
+        with rasterio.open(path) as src:
+            zones.add(src.crs.to_epsg())
+    assert zones == {32630, 32631}
+
+
+def test_stream_failure_keeps_previous_export(tmp_path):
+    gt, bbox = fake_region()
+    output = tmp_path / "tessera_2024_utm30.tif"
+    output.write_bytes(b"previous export")
+
+    class BrokenScales:
+        def __getitem__(self, key):
+            raise OSError("interrupted read")
+
+    gt._root = {
+        "utm30": {
+            "embeddings": gt._root["utm30"]["embeddings"],
+            "scales": BrokenScales(),
+        }
+    }
+    with pytest.raises(OSError, match="interrupted"):
+        gt.export_geotiffs(bbox, 2024, tmp_path)
+    assert output.read_bytes() == b"previous export"
+    assert list(tmp_path.iterdir()) == [output]
+
+
+def test_stream_export_reads_selected_depth(tmp_path):
+    gt, bbox = fake_region()
+    group = gt._root["utm30"]
+    data = group["embeddings"][:, :2, :, :]
+    group.create_array("embeddings_d2", data=data)
+    gt._cache[30]["embeddings_d2"] = (
+        gt._cache[30]["embeddings"].isel(band=slice(0, 2)).rename(band="band_d2")
+    )
+    gt.depths[2] = "embeddings_d2"
+    files = gt.export_geotiffs(bbox, 2024, tmp_path, depth=2)
+    with rasterio.open(files[0]) as src:
+        assert src.count == 2
+        np.testing.assert_array_equal(src.read()[:, 0, 0], [1, 2])
 
 
 def test_fetch_failure_is_not_silently_skipped(monkeypatch):
@@ -134,6 +213,20 @@ def test_sampling_has_explicit_failure_policy(monkeypatch):
     )
     assert np.isnan(values).all()
     assert "corrupt tile" in metadata[0]["error"]
+
+
+def test_patch_rejects_geographic_resolution_units():
+    gt, _ = fake_region()
+    with pytest.raises(ValueError, match="metre"):
+        gt.read_patch(-2.95, 52.05, 2024, 4, dst_crs="EPSG:4326")
+
+
+@pytest.mark.parametrize("kwargs", [{"bands": [-1]}, {"bands": [4]}, {"strip_rows": 0}])
+def test_stream_export_validates_before_writing(tmp_path, kwargs):
+    gt, bbox = fake_region()
+    with pytest.raises(ValueError):
+        gt.export_geotiffs(bbox, 2024, tmp_path, **kwargs)
+    assert not list(tmp_path.iterdir())
 
 
 def test_folium_viewer_uses_relative_tile_path(tmp_path):
