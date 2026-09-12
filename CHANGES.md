@@ -1,34 +1,15 @@
-## v0.10.3
+## v0.10.3 (2026-09-12)
 
-- TIFF downloads now read from Zarr by default and write one float32 GeoTIFF
-  per UTM zone, with NaN nodata and source metadata. Band selection, published
-  embedding depths, local stores, and size estimates are supported.
-  `--source tiles` retains individual tile downloads. NPY output and local
-  manifests select tiles automatically.
-- Web maps can read a region directly from Zarr and reuse matching completed
-  mosaics and tiles. `--force` refreshes the output. Serving reports occupied
-  IPv4 and IPv6 ports before processing, including on Windows.
-- Raster exports preserve valid zeros and missing data, process large inputs
-  in windows, and support BigTIFF. PCA visualizations use one reproducible
-  sample and color scale across the inputs. Python PCA tile exports retain
-  additional components as data bands.
-- Batch fetching and tile sampling report read failures. Sampling accepts
-  `errors="coerce"` to return NaN for failed reads and reports errors in
-  optional metadata. Incomplete NPY downloads return a nonzero exit status.
-- Point sampling respects a GeoDataFrame's CRS and reads local GeoTIFFs.
-  Missing values remain NaN. Zarr patches retain their requested position
-  beyond coverage, and custom patch projections require metre units.
-
-- Zarr scalar and batch point sampling now agree at exact pixel midpoints,
-  consistently resolving ties north/west. NaN and infinite query coordinates
-  now return `outside` from `probe()` and NaN embeddings from sampling.
-
-- Global preview initialization now resumes incomplete pyramids and publishes
-  complete metadata in one write.
-
-- Zarr shard discovery now handles Windows path separators correctly.
-  Opening groups through `StoreLocation` now uses the same URL adapter as
-  other store operations, preserving Windows file URLs and storage options.
+- `download` now streams Zarr to native UTM GeoTIFFs with band and depth
+  selection. `--source tiles` retains individual tile downloads.
+- `webmap` can stream regions and reuse completed output. `--force` refreshes it.
+- Raster exports use bounded memory, preserve nodata and support BigTIFF.
+  PCA uses one reproducible fit across tiles.
+- Point sampling and patches handle CRS and coverage edges consistently.
+  Tile read failures now raise; sampling supports `errors="coerce"` to return NaN.
+- Zarr fills, year extensions, statistics and previews recover from interrupted runs.
+- Windows store paths and web server port conflicts are handled correctly.
+- CLI help and documentation now describe these workflows concisely.
 
 ## v0.10.2 (2026-09-04)
 
