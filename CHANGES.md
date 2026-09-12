@@ -2,7 +2,7 @@
 
 - Web maps reuse completed matching RGB and tile stages, with `--force` to
   refresh. Serving reserves the exact port before processing and reports
-  occupied IPv4/IPv6 ports as errors.
+  occupied IPv4/IPv6 ports as errors, including Windows exclusive binding.
 
 - TIFF downloads now stream Zarr regions by default, with native-zone output,
   band/depth selection, source metadata, BigTIFF support and atomic writes.

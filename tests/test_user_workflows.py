@@ -523,11 +523,19 @@ def test_webmap_retries_failed_tiles_without_streaming(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("ipv6", [False, True])
 def test_occupied_port_fails_before_streaming(tmp_path, monkeypatch, ipv6):
+    import http.server
     import socket
     import geotessera.workflows as workflows
 
     if ipv6 and not socket.has_dualstack_ipv6():
         pytest.skip("IPv6 unavailable")
+    # A broken bind check must fail this regression, never start an endless
+    # server loop inside CliRunner (which previously hung Windows CI).
+    monkeypatch.setattr(
+        http.server.ThreadingHTTPServer,
+        "serve_forever",
+        lambda *args, **kwargs: pytest.fail("Started a server on an occupied port"),
+    )
     monkeypatch.setattr(workflows, "open_stream", lambda *args: pytest.fail("streamed"))
     with socket.socket(socket.AF_INET6 if ipv6 else socket.AF_INET) as listener:
         listener.bind(("::1" if ipv6 else "127.0.0.1", 0))
@@ -548,3 +556,12 @@ def test_occupied_port_fails_before_streaming(tmp_path, monkeypatch, ipv6):
             assert result.exit_code != 0
             assert "Cannot bind web server" in result.output
             assert not (tmp_path / "rgb_mosaic.tif").exists()
+
+
+def test_web_server_accepts_connections_on_a_free_port(tmp_path):
+    import socket
+    from geotessera.cli import _bind_web_server
+
+    with _bind_web_server(tmp_path, 0) as server:
+        with socket.create_connection(("127.0.0.1", server.server_port), timeout=2):
+            pass

@@ -2074,6 +2074,10 @@ def _bind_web_server(directory, port):
         address_family = socket.AF_INET6 if dual_stack else socket.AF_INET
 
         def server_bind(self):
+            # Windows otherwise lets a wildcard listener share a port already
+            # bound on loopback, even with SO_REUSEADDR disabled.
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
             if dual_stack:
                 self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
             super().server_bind()
