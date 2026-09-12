@@ -520,7 +520,7 @@ Options:
   -v, --verbose            Verbose output
 ```
 
-**Resume behaviour**: Both TIFF and NPY downloads automatically skip files that already exist on disk, so interrupted downloads can be resumed by re-running the same command.
+**Resume behaviour**: With `--source tiles`, TIFF and NPY downloads skip files that already exist on disk. Zarr streaming replaces each completed zone file atomically on rerun.
 
 Single tile examples:
 ```bash

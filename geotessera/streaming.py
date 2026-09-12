@@ -103,6 +103,7 @@ def export_region(
                 blockxsize=256,
                 blockysize=256,
                 compress=compress,
+                BIGTIFF="IF_SAFER",
             ) as dst:
                 for top in range(window.y0, window.y1, rows):
                     end = min(top + rows, window.y1)

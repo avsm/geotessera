@@ -102,6 +102,7 @@ def merge_geotiffs(
                     tiled=True,
                     blockxsize=512,
                     blockysize=512,
+                    BIGTIFF="IF_SAFER",
                 ),
             )
             with rasterio.open(temporary, "r+") as dst:
@@ -142,7 +143,13 @@ def create_rgb(
                             min(low[i], valid.min()),
                             max(high[i], valid.max()),
                         )
-            profile = dict(src.profile, dtype="uint8", nodata=None, photometric="RGB")
+            profile = dict(
+                src.profile,
+                dtype="uint8",
+                nodata=None,
+                photometric="RGB",
+                BIGTIFF="IF_SAFER",
+            )
             with atomic_output(output_path, suffix=".tif") as staged:
                 with rasterio.open(staged, "w", **profile) as dst:
                     for _, window in src.block_windows(1):

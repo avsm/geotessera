@@ -879,7 +879,9 @@ def create_pca_mosaic(
             atomic_output(output_path, suffix=".tif") as staged,
         ):
             with rasterio.open(
-                staged, "w", **dict(src.profile, dtype="uint8", nodata=None)
+                staged,
+                "w",
+                **dict(src.profile, dtype="uint8", nodata=None, BIGTIFF="IF_SAFER"),
             ) as dst:
                 for _, window in src.block_windows(1):
                     data = src.read(window=window, masked=True)

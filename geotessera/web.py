@@ -46,7 +46,14 @@ def prepare_mosaic_for_web(
             resampling=rasterio.enums.Resampling.bilinear,
         ) as vrt:
             with atomic_output(output_path, suffix=".tif") as staged:
-                copy_raster(vrt, staged, driver="GTiff", compress="lzw", tiled=True)
+                copy_raster(
+                    vrt,
+                    staged,
+                    driver="GTiff",
+                    compress="lzw",
+                    tiled=True,
+                    BIGTIFF="IF_SAFER",
+                )
     if progress_callback:
         progress_callback(100, 100, "Mosaic prepared for web visualization")
     return str(output_path)

@@ -94,13 +94,14 @@ class Tile:
             return np.transpose(src.read(), (1, 2, 0))
 
     def iter_blocks(self, rows=128):
-        """Yield (row offset, HWC float32 block) with bounded row reads."""
+        """Yield HWC float32 strips, capped for wide regional exports too."""
         import rasterio
 
         if rows <= 0:
             raise ValueError("rows must be positive")
         if self._format == "geotiff":
             with rasterio.open(self._geotiff_path) as src:
+                rows = min(rows, max(1, 64 * 1024**2 // (src.width * src.count * 8)))
                 for top in range(0, src.height, rows):
                     window = rasterio.windows.Window(
                         0, top, src.width, min(rows, src.height - top)
@@ -117,6 +118,7 @@ class Tile:
 
             emb = np.load(self._embedding_path, mmap_mode="r")
             scales = np.load(self._scales_path, mmap_mode="r")
+            rows = min(rows, max(1, 64 * 1024**2 // (emb.shape[1] * emb.shape[2] * 8)))
             for top in range(0, emb.shape[0], rows):
                 section = slice(top, top + rows)
                 yield (
@@ -316,7 +318,9 @@ class Tile:
         factors = scales[rows, cols] if scales.ndim >= 2 else scales
         if scales.ndim == 2:
             factors = factors[:, None]
-        result[idx] = quantized[rows, cols].astype(np.float32) * factors
+        from .core import dequantize_embedding
+
+        result[idx] = dequantize_embedding(quantized[rows, cols], factors)
         return result
 
     def to_dict(self) -> Dict:

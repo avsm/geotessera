@@ -5,16 +5,19 @@
   occupied IPv4/IPv6 ports as errors.
 
 - TIFF downloads now stream Zarr regions by default, with native-zone output,
-  band/depth selection, source metadata and atomic writes. `--source tiles`
-  retains the original tile workflow; NPY and local-registry downloads use it
-  automatically. `webmap` can stream a region directly without prior exports.
+  band/depth selection, source metadata, BigTIFF support and atomic writes.
+  `--source tiles` retains the original tile workflow; NPY and local-registry
+  downloads use it automatically. `webmap` can stream a region directly
+  without prior exports.
 - Raster operations share windowed Rasterio virtual warps and preserve valid
   zeros and nodata. RGB selection happens before merging. Point sampling reads
   only selected pixels, respects input CRS and recognizes local GeoTIFFs.
+  Sparse NPY sampling preserves the same nonfinite-scale nodata as full reads.
 - Zarr patches beyond coverage retain their requested position instead of
   snapping to the nearest stored pixel. Region window selection is shared.
 - PCA visualizations share a deterministic bounded-sample fit and transform
-  raster windows, replacing per-tile fits and full-region pixel stacking.
+  raster windows sized for the input width, replacing per-tile fits and
+  full-region pixel stacking. Additional components retain data-band metadata.
 - Simple web viewers use Folium with relative tile URLs and consistent TMS
   numbering. Country boundaries use a checksummed Pooch download. Region input
   handling is shared, the local server no longer changes cwd, and coverage

@@ -133,6 +133,8 @@ def write_pca_tiles(
                 dtype="uint8",
                 compress=compress,
                 tiled=True,
+                BIGTIFF="IF_SAFER",
+                photometric="MINISBLACK",
             ) as dst:
                 for top, block in blocks(source):
                     projected = transform_block(block, scaler, pca)

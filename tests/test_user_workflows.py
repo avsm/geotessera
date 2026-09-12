@@ -58,6 +58,55 @@ def test_projected_point_inputs_and_sparse_tiff_sampling(tmp_path, monkeypatch):
     assert tile_for_coord(tmp_path, -2.95, 52.05, 2024) is not None
 
 
+@pytest.mark.parametrize("per_band", [False, True])
+def test_sparse_npy_sampling_matches_dense_nodata(tmp_path, per_band):
+    tile = Tile.from_geotiff(write_tile(tmp_path / "grid_-2.95_52.05_2024.tif"))
+    tile._format = "npy"
+    tile._embedding_path = tmp_path / "embedding.npy"
+    tile._scales_path = tmp_path / "scales.npy"
+    values = np.arange(400, dtype=np.int8).reshape(10, 10, 4)
+    scales = np.ones((10, 10, 4) if per_band else (10, 10), np.float32)
+    scales[1, 2], scales[3, 4], scales[5, 6] = np.inf, -np.inf, np.nan
+    np.save(tile._embedding_path, values)
+    np.save(tile._scales_path, scales)
+    rows, cols = [1, 3, 5, 7], [2, 4, 6, 8]
+    xs, ys = rasterio.transform.xy(tile.transform, rows, cols)
+    lon, lat = Transformer.from_crs(tile.crs, 4326, always_xy=True).transform(xs, ys)
+    samples = tile.sample_points(list(zip(lon, lat)))
+    np.testing.assert_allclose(
+        samples, tile.load_embedding()[rows, cols], equal_nan=True
+    )
+    assert np.isnan(samples[:3]).all()
+
+
+def test_wide_geotiffs_keep_visualization_strips_small(tmp_path):
+    path = tmp_path / "grid_0.05_52.05_2024.tif"
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        width=12000,
+        height=128,
+        count=32,
+        dtype="float32",
+        crs=32631,
+        transform=from_origin(500000, 5800000, 10, 10),
+        nodata=np.nan,
+        tiled=True,
+        compress="lzw",
+        SPARSE_OK=True,
+    ):
+        pass
+    blocks = Tile.from_geotiff(path).iter_blocks()
+    try:
+        top, data = next(blocks)
+        assert top == 0 and data.shape[1:] == (12000, 32)
+        assert data.nbytes <= 64 * 1024**2
+        assert np.isnan(data).all()
+    finally:
+        blocks.close()
+
+
 def test_geojson_rejects_nonpoints_without_dropping_rows():
     with pytest.raises(ValueError, match="Point"):
         parse_points(
@@ -166,6 +215,60 @@ def test_stream_failure_keeps_previous_export(tmp_path):
         gt.export_geotiffs(bbox, 2024, tmp_path)
     assert output.read_bytes() == b"previous export"
     assert list(tmp_path.iterdir()) == [output]
+
+
+@pytest.mark.parametrize("operation", ["stream", "merge"])
+def test_large_compressed_outputs_use_bigtiff(tmp_path, monkeypatch, operation):
+    from types import SimpleNamespace
+    import geotessera.streaming as streaming
+
+    original_open = rasterio.open
+    transform = from_origin(500000, 5800000, 10, 10)
+    source = tmp_path / "large-source.tif"
+    with original_open(
+        source,
+        "w",
+        driver="GTiff",
+        width=3300,
+        height=3300,
+        count=128,
+        dtype="float32",
+        crs=32630,
+        transform=transform,
+        tiled=True,
+        compress="lzw",
+        SPARSE_OK=True,
+        BIGTIFF="YES",
+    ):
+        pass
+    headers = []
+
+    class StopBeforePixelReads(Exception):
+        pass
+
+    def inspect_writer(path, mode="r", **kwargs):
+        if mode == "w":
+            # Create the actual large-layout header without allocating its pixels.
+            with original_open(path, mode, SPARSE_OK=True, **kwargs):
+                pass
+            with open(path, "rb") as file:
+                headers.append(file.read(4))
+            raise StopBeforePixelReads
+        return original_open(path, mode, **kwargs)
+
+    monkeypatch.setattr(rasterio, "open", inspect_writer)
+    with pytest.raises(StopBeforePixelReads):
+        if operation == "stream":
+            gt, bbox = fake_region()
+            gt.n_bands = 128
+            window = SimpleNamespace(x0=0, x1=3300, y0=0, y1=3300, transform=transform)
+            monkeypatch.setattr(
+                streaming, "region_windows", lambda *args: [(30, gt._cache[30], window)]
+            )
+            gt.export_geotiffs(bbox, 2024, tmp_path / "output")
+        else:
+            merge_geotiffs([source], tmp_path / "merged.tif", 32630)
+    assert headers == [b"II+\x00"] or headers == [b"MM\x00+"]
 
 
 def test_stream_export_reads_selected_depth(tmp_path):
@@ -333,6 +436,23 @@ def test_pca_shared_basis_and_nan_mask(tmp_path):
         np.testing.assert_array_equal(a.read(), b.read())
         assert a.dataset_mask()[0, 0] == 0
         assert a.dataset_mask()[1, 1] == 255
+
+
+def test_four_pca_components_do_not_mark_data_as_alpha(tmp_path):
+    from geotessera.projection import write_pca_tiles
+
+    source = dict(
+        data=np.random.default_rng(42).normal(size=(10, 10, 4)).astype(np.float32),
+        width=10,
+        height=10,
+        crs=32630,
+        transform=from_origin(500000, 5800000, 10, 10),
+    )
+    paths = write_pca_tiles([source], tmp_path, n_components=4)
+    with rasterio.open(paths[0]) as src:
+        assert src.count == 4
+        assert rasterio.enums.ColorInterp.alpha not in src.colorinterp
+        assert np.all(src.dataset_mask() == 255)
 
 
 def test_webmap_reuses_completed_stages(tmp_path, monkeypatch):
