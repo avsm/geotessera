@@ -1,6 +1,6 @@
 # GeoTessera
 
-Python library for accessing and working with Tessera geospatial foundation model embeddings.
+GeoTessera is a Python library for reading, exporting, and displaying Tessera embeddings.
 
 > ## 🚀 TESSERA v2 is here
 >
@@ -30,78 +30,37 @@ representation maps at 10m resolution. These embeddings compress a full year of
 temporal-spectral features into dense representations optimized for downstream
 geospatial analysis tasks. Read more details about [the model](https://github.com/ucam-eo/tessera).
 
-The library offers two access paths. The [zarr backend](#cloud-native-zarr-access)
-streams embeddings directly from the public cloud store — no downloads, queries
-routed to the correct UTM zone, values returned dequantised on their native 10m
-grid — and is the recommended interface for analysis. The
-[tile download interface](#python-api) fetches embeddings as NPY or GeoTIFF
-files for offline work and GIS export.
+The [Zarr API](#cloud-native-zarr-access) reads selected points and regions
+from the cloud store and returns dequantized values on their native UTM
+grid. The [tile API](#python-api) downloads individual NPY or GeoTIFF files
+for offline use.
 
 ### Stream regions to GeoTIFF or a web map
 
-TIFF downloads now stream directly from Zarr by default. Only the requested
-region and bands are materialized; raw NPY tiles are not downloaded first.
+`download` reads from Zarr by default and writes one GeoTIFF per UTM zone.
+`webmap` reads three embedding bands and creates an RGB web map.
 
 ```bash
 geotessera download --bbox '-3.0,53.4,-2.9,53.5' --year 2024 --output region/
-geotessera webmap --bbox '-3.0,53.4,-2.9,53.5' --year 2024 --bands 0,1,2 --output map/
+geotessera webmap --bbox '-3.0,53.4,-2.9,53.5' --year 2024 --output map/ --serve
 ```
 
-Downloads create `tessera_2024_utm30.tif` (one file per intersecting UTM zone),
-with float32 embeddings, NaN nodata, band descriptions and store provenance.
-The windows enclose the selected bounds on each native UTM grid; geometries
-and countries select their bounding boxes. No embedding resampling occurs
-until rendering a web map. West must be less than east: split regions crossing
-the antimeridian into two requests.
+GeoTIFFs contain float32 embeddings on the native grid, with NaN nodata.
+Use `--bands` to select zero-based bands, `--depth` to select a published
+embedding prefix, or `--store-url` to read another Zarr store.
+Country and vector regions select their bounding boxes.
 
-Use `--store-url /path/to/store` for a local Zarr store, `--cache-dir cache/`
-to cache metadata on disk and byte-range reads within the process, or `--dataset-version v2 --depth 16` for a
-published matryoshka prefix. `--bands` indexes the chosen depth from zero.
-Transferred bytes depend on physical chunk layout even when fewer bands are
-requested. `--dry-run` reads metadata and estimates **uncompressed output**,
-not network transfer size.
+Rerunning a Zarr export replaces its completed files. Use `--source tiles`
+for individual tiles that skip existing files on rerun. `--format npy`
+also selects individual tiles.
 
-For the original individual-tile layout and resumable raw downloads, use
-`--source tiles`. `--format npy` also selects that path automatically.
-`--registry-dir` selects the tile path under the default `--source auto`;
-explicit Zarr mode uses `--store-url` instead. Streaming exports replace each
-destination atomically rather than skipping existing files, so changing bands
-or source cannot silently reuse an old export. A failure in a later zone can
-leave earlier completed zone files; rerunning safely replaces them.
+Web maps reuse matching completed mosaics and tiles. Keep the output
+directory and its JSON completion files. Use `--force` to refresh a map
+when the source changes at the same URL, or `geotessera serve map/` to
+view an existing map without regenerating it.
 
-`webmap existing_rgb.tif --output map/` remains supported. Region-based web
-maps use three selected embedding bands with shared min/max scaling; they
-reuse completed RGB mosaics and tiles when the request matches. Changing
-zoom levels rebuilds tiles without streaming again; `--force` refreshes both
-stages. Keep the output directory, including its JSON completion records.
-Interrupted tile generation resumes from the completed RGB mosaic; interrupted
-RGB generation must stream again. Remote data is assumed immutable, so use
-`--force` if a store changes at the same URL. Older outputs without completion
-records can be served directly without regeneration:
-
-```bash
-uv run geotessera serve tessera_webmap --port 8001 --html viewer.html
-```
-
-`--serve` reserves the requested port before processing and fails if it is
-occupied, including by an IPv6 listener. `--cache-dir` is not a persistent
-cache of the byte ranges used to stream sharded Zarr embeddings; keep the
-completed map output to avoid subsequent downloads. For PCA maps, run `visualize`
-on exported files. PCA uses a reproducible sample of up to 100,000 valid
-pixels across all inputs and one shared model/color mapping, with windowed
-transformation. Colors may differ from earlier per-tile/full-data fits.
-Batch fetching and point sampling now raise on read failures. For explicitly
-best-effort sampling, use `errors="coerce"` (and `include_metadata=True` to
-inspect errors). Points outside coverage still return NaN.
-
-The equivalent Python export is:
-
-```python
-from geotessera import GeoTesseraZarr
-
-gt = GeoTesseraZarr()
-files = gt.export_geotiffs((-3.0, 53.4, -2.9, 53.5), 2024, "region/", bands=[0, 1, 2])
-```
+See the [CLI reference](https://geotessera.readthedocs.io/en/latest/cli_reference.html)
+for options, output files, and restart behavior.
 
 ![Coverage map](https://github.com/ucam-eo/tessera-coverage-map/blob/main/map.png)
 
@@ -138,7 +97,7 @@ Please note that if the artifacts you observe are slanted, this is not a bug in 
 
 ## Installation
 
-Requires Python 3.12 or later.
+GeoTessera requires Python 3.12 or later.
 
 ```bash
 pip install geotessera
@@ -156,10 +115,9 @@ plain `pip install geotessera` pulls in neither.
 
 ## Cloud-Native Zarr Access
 
-The zarr backend streams embeddings directly from the public store. Nothing is
-downloaded up front: each query is routed to the UTM zone that holds it, and
-the values return dequantised as float32 on their native 10m UTM grid, never
-resampled. This is the recommended interface for analysis.
+The Zarr API reads selected pixels from the public store and returns
+dequantized float32 embeddings. Point and region reads use the native UTM
+grid. Patches can combine pixels across zone boundaries.
 
 ```python
 from geotessera import GeoTesseraZarr
@@ -186,31 +144,28 @@ for block, transform, crs in gt.iter_region(bbox, year=2024, strip_rows=512):
     predictions = model.predict(block.reshape(-1, 128))
 ```
 
+Export a region without holding the full array in memory:
+
+```python
+files = gt.export_geotiffs(bbox, 2024, "region/", bands=[0, 1, 2])
+```
+
 Other dataset versions are selected by store URL. v2 stores also publish
-matryoshka prefixes of each embedding, so `depth=16` reads the first 16
-dimensions for an eighth of the bytes:
+matryoshka prefixes. `depth=16` reads the first 16 dimensions; the bytes
+transferred depend on the store's chunk layout:
 
 ```python
 from geotessera.registry import zarr_store_url
 
 gt = GeoTesseraZarr(zarr_store_url("v2"))
-X16 = gt.sample_points(coords, year=2024, depth=16)  # (N, 16)
+X16 = gt.sample_points([(0.12, 52.20)], year=2024, depth=16)  # (N, 16)
 ```
 
-HTTP reads retry with exponential backoff, so a transient server error costs
-one chunk rather than the whole read. The constructor also accepts any
-`zarr.abc.store.Store`, so the store can be wrapped — for example in zarr's
-experimental `CacheStore`, which keeps fetched chunks for reuse across
-queries:
+Set `cache_dir` to persist Zarr metadata between runs. Byte-range reads
+of sharded embeddings are cached within the process.
 
 ```python
-from zarr.experimental.cache_store import CacheStore
-from zarr.storage import MemoryStore
-from geotessera.store import DEFAULT_STORE, zarr_store
-
-store = CacheStore(zarr_store(DEFAULT_STORE), cache_store=MemoryStore(),
-                   max_size=2 * 1024**3)
-gt = GeoTesseraZarr(store)
+gt = GeoTesseraZarr(cache_dir="tessera-cache")
 ```
 
 For direct access to one UTM zone, `gt.open_zone(lon=0.15)` returns an xarray
@@ -275,7 +230,8 @@ where they persist for re-use:
    - Data type: float32
    - Contains scale factors for dequantization
 
-3. **Dequantization**: `final_embedding = quantized_embedding * scales`
+3. Use `geotessera.dequantize_embedding(quantized_embedding, scales)` to
+   dequantize arrays. The helper handles scale broadcasting and missing values.
 
 4. **Persistent Storage**: Files are downloaded into your chosen output
    directory and skipped on rerun, so interrupted downloads resume cleanly
@@ -333,7 +289,7 @@ geotessera coverage --year 2024 --tile-color blue --tile-alpha 0.3
 
 ### Download Embeddings
 
-Download embeddings as either numpy arrays or GeoTIFF files:
+Download individual tiles as NumPy arrays or GeoTIFF files:
 
 ```bash
 # Download as GeoTIFF (default, with georeferencing)
@@ -342,7 +298,7 @@ geotessera download --source tiles \
   --year 2024 \
   --output ./london_tiffs
 
-# Download as raw numpy arrays (with metadata JSON)
+# Download quantized arrays with scales and landmasks.
 geotessera download --source tiles \
   --bbox "-0.2,51.4,0.1,51.6" \
   --format npy \
@@ -496,128 +452,64 @@ visualize_global_coverage(
 
 ## CLI Reference
 
+Use `geotessera COMMAND --help` for command options. The
+[command reference](https://geotessera.readthedocs.io/en/latest/cli_reference.html)
+describes output formats, region selection, caching, and repeated runs.
+
 ### download
 
-Download embeddings for a region in your preferred format:
+Export a region from Zarr as GeoTIFFs. Add `--source tiles` for individual
+GeoTIFF tiles, or `--format npy` for quantized arrays with scales and landmasks.
 
 ```bash
-geotessera download --source tiles [OPTIONS]
-
-Options:
-  -o, --output PATH         Output directory [required]
-  --bbox TEXT              Bounding box: 'lon,lat' (single tile) or 'min_lon,min_lat,max_lon,max_lat'
-  --tile TEXT              Single tile by any point within it: 'lon,lat'
-  --region-file PATH       GeoJSON/Shapefile to define region
-  --country TEXT           Country name (e.g., 'United Kingdom', 'UK', 'GB')
-  -f, --format TEXT        Output format: 'tiff' or 'npy' (default: tiff)
-  --year INT               Year of embeddings (default: 2024)
-  --dataset-version TEXT   Tessera dataset version (e.g. v1, v1.1)
-  --dataset-variant TEXT   Tessera dataset variant (default: the version's default variant; list with `geotessera info`)
-  --bands TEXT             Comma-separated band indices (default: all 128)
-  --compress TEXT          Compression for TIFF format (default: lzw)
-  --dry-run                Calculate total download size without downloading
-  --list-files             List all created files with details
-  -v, --verbose            Verbose output
+geotessera download --bbox '-3.0,53.4,-2.9,53.5' --bands 0,1,2 --output region/
 ```
-
-**Resume behaviour**: With `--source tiles`, TIFF and NPY downloads skip files that already exist on disk. Zarr streaming replaces each completed zone file atomically on rerun.
-
-Single tile examples:
-```bash
-# Download a single tile containing a specific point
-geotessera download --source tiles --tile "0.17,52.23" --year 2024 -o ./single_tile
-
-# Same result using --bbox with 2 coordinates
-geotessera download --source tiles --bbox "0.17,52.23" --year 2024 -o ./single_tile
-```
-
-Output formats:
-- **tiff**: Georeferenced GeoTIFF files with UTM projection
-- **npy**: Raw numpy arrays with metadata.json file
 
 ### visualize
 
-Create PCA visualization from multiband GeoTIFF or NPY format embeddings:
+Create a PCA mosaic from a GeoTIFF file or a directory of GeoTIFF or NPY
+tiles. One sampled PCA model and color scale are applied across the inputs.
+The output contains display-scaled uint8 components; use the original
+embeddings for analysis.
 
 ```bash
-geotessera visualize INPUT_PATH OUTPUT_FILE [OPTIONS]
-
-Options:
-  --n-components INT       Number of PCA components (default: 3)
-  --crs TEXT               Target CRS for reprojection (default: EPSG:3857)
-  --balance TEXT            RGB balance method: histogram, percentile, or adaptive
-  --percentile-low FLOAT   Lower percentile for percentile balance (default: 2.0)
-  --percentile-high FLOAT  Upper percentile for percentile balance (default: 98.0)
+geotessera visualize region/ pca.tif
 ```
 
 ### webmap
 
-Create web tiles and interactive viewer from a PCA mosaic:
+Create web tiles and a viewer from an RGB GeoTIFF or a Zarr region.
+Tile generation requires the GDAL command-line tools.
 
 ```bash
-geotessera webmap RGB_MOSAIC [OPTIONS]
-
-Options:
-  -o, --output PATH        Output directory
-  --min-zoom INT           Min zoom for web tiles (default: 8)
-  --max-zoom INT           Max zoom for web tiles (default: 15)
-  --serve/--no-serve       Start web server immediately
-  -p, --port INT           Port for web server (default: 8000)
-  --region-file PATH       GeoJSON/Shapefile boundary to overlay
-  --force/--no-force       Force regeneration of tiles
+geotessera webmap pca.tif --output map/ --serve
+geotessera webmap --bbox '-3.0,53.4,-2.9,53.5' --output region_map/
 ```
 
 ### coverage
 
-Generate a world map showing data availability:
+Show data availability as a PNG map and HTML globe. Use `--by-source`
+to compare dataset versions and variants.
 
 ```bash
-geotessera coverage [OPTIONS]
-
-Options:
-  -o, --output PATH        Output PNG file, or a directory to also receive the
-                           coverage.json/globe.html (default: tessera_coverage.png)
-  --year INT               Specific year to visualize
-  --bbox TEXT              Bounding box: 'lon,lat' (single tile) or 'min_lon,min_lat,max_lon,max_lat'
-  --tile TEXT              Single tile by any point within it: 'lon,lat'
-  --by-source              Render each (version, variant) source in a distinct colour
-  --dataset-version TEXT   Tessera dataset version (e.g. v1, v1.1; or 'all' with --by-source)
-  --dataset-variant TEXT   Tessera dataset variant (default: the version's default variant; or 'all' with --by-source)
-  --region-file PATH       GeoJSON/Shapefile to focus on specific region
-  --country TEXT           Country name to focus on (e.g., 'United Kingdom')
-  --tile-color TEXT        Color for tiles (default: red)
-  --tile-alpha FLOAT       Transparency 0-1 (default: 0.6)
-  --tile-size FLOAT        Size multiplier (default: 1.0)
-  --width INT              Output image width in pixels (default: 2000)
-  --no-countries           Don't show country boundaries
-  --no-multi-year-colors   Disable multi-year color coding
+geotessera coverage --country 'United Kingdom' --year 2024
 ```
 
 ### serve
 
-Serve web visualizations locally:
+Serve an existing map directory over HTTP. An occupied port causes an error.
 
 ```bash
-geotessera serve DIRECTORY [OPTIONS]
-
-Options:
-  -p, --port INT           Port number (default: 8000)
-  --open/--no-open         Auto-open browser (default: open)
-  --html TEXT              Specific HTML file to serve
+geotessera serve map/ --port 8001 --html viewer.html
 ```
 
 ### info
 
-Display information about GeoTIFF files or the library:
+List known datasets or inspect local GeoTIFF and NPY files.
 
 ```bash
-geotessera info [OPTIONS]
-
-Options:
-  --tiles PATH             Analyze tile files/directory (GeoTIFF or NPY format)
-  --dataset-version TEXT   Tessera dataset version (e.g. v1, v1.1)
-  --dataset-variant TEXT   Tessera dataset variant (default: the version's default variant; list with `geotessera info`)
-  -v, --verbose            Verbose output
+geotessera info
+geotessera info --tiles region/
 ```
 
 ## Registry System
@@ -812,7 +704,10 @@ Remote Server (https://data.source.coop/tessera/tessera)
 
 ## Cache Configuration
 
-GeoTessera caches only the per-dataset Parquet manifests (tens to a couple of hundred MB each). Embedding and landmask tiles are downloaded into the output directory you specify and persist there for re-use across runs.
+Tile workflows cache manifests and write embedding and landmask files to
+the output directory for reuse. Zarr reads persist metadata in `cache_dir`
+and cache byte ranges within the process. Keep exported files or completed
+web map directories to reuse their data between runs.
 
 ### Python API
 

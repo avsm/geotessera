@@ -101,7 +101,7 @@ def point_to_tile_bbox(lon: float, lat: float) -> tuple:
 
 app = typer.Typer(
     name="geotessera",
-    help=f"GeoTessera v{__version__}: Download satellite embedding tiles as GeoTIFFs",
+    help=f"GeoTessera v{__version__}: Read, export, and display Tessera embeddings.",
     add_completion=False,
     rich_markup_mode="rich",
 )
@@ -191,39 +191,37 @@ def info(
     tiles_dir: Annotated[
         Optional[Path],
         typer.Option(
-            "--tiles", help="Analyze tile files/directory (GeoTIFF or NPY format)"
+            "--tiles", help="Inspect a local GeoTIFF or NPY file or directory."
         ),
     ] = None,
     geotiffs: Annotated[
         Optional[Path],
         typer.Option(
             "--geotiffs",
-            help="(Deprecated: use --tiles) Analyze GeoTIFF files/directory",
+            help="Use the deprecated alias for --tiles.",
         ),
     ] = None,
     dataset_version: Annotated[
         str,
         typer.Option(
             "--dataset-version",
-            help="Tessera dataset version (e.g. v1, v1.1, v2; default v1)",
+            help="Select the dataset version. Run geotessera info to list datasets.",
         ),
     ] = "v1",
     dataset_variant: Annotated[
         Optional[str],
         typer.Option(
             "--dataset-variant",
-            help="Tessera dataset variant (default: the version's default "
-            "variant, e.g. vultr for v1, cambridge for v1.1, 2B-L~beta1 "
-            "for v2). Run 'geotessera info' to list available datasets.",
+            help="Select the dataset variant. If omitted, use the version's default variant.",
         ),
     ] = None,
     verbose: Annotated[
-        bool, typer.Option("--verbose", "-v", help="Verbose output")
+        bool, typer.Option("--verbose", "-v", help="Print additional details.")
     ] = False,
 ):
-    """Show information about tile files or library.
+    """Show library information and available datasets.
 
-    Supports both GeoTIFF and NPY format tiles (auto-detected).
+    Use --tiles to inspect local GeoTIFF or NPY files.
     """
 
     # Support both --tiles and --geotiffs for backwards compatibility
@@ -406,138 +404,110 @@ def coverage(
         typer.Option(
             "--output",
             "-o",
-            help="Output PNG file path (JSON and HTML will be created in same directory)",
+            help="Write the PNG here, with JSON and HTML files in the same directory.",
         ),
     ] = Path("tessera_coverage.png"),
     year: Annotated[
         Optional[int],
         typer.Option(
             "--year",
-            help="Specific year to visualize (e.g., 2024). If not specified, shows multi-year analysis.",
+            help="Show one year. If omitted, show all available years.",
         ),
     ] = None,
     region_file: Annotated[
         Optional[str],
         typer.Option(
             "--region-file",
-            help="GeoJSON/Shapefile to focus coverage map on specific region (file path or URL)",
+            help="Limit the PNG map to a vector region from a file or URL.",
         ),
     ] = None,
     country: Annotated[
         Optional[str],
         typer.Option(
             "--country",
-            help="Country name to focus coverage map on (e.g., 'United Kingdom', 'UK', 'GB')",
+            help="Select a country by name or code, such as United Kingdom or GB.",
         ),
     ] = None,
     bbox: Annotated[
         Optional[str],
         typer.Option(
             "--bbox",
-            help="Bounding box: 'lon,lat' (single tile) or 'min_lon,min_lat,max_lon,max_lat'",
+            help="Select WGS84 bounds as west,south,east,north, or one tile as lon,lat.",
         ),
     ] = None,
     tile: Annotated[
         Optional[str],
-        typer.Option("--tile", help="Single tile by any point within it: 'lon,lat'"),
+        typer.Option("--tile", help="Select the 0.1-degree tile containing lon,lat."),
     ] = None,
     tile_color: Annotated[
         str,
         typer.Option(
             "--tile-color",
-            help="Color for tile rectangles (when not using multi-year colors)",
+            help="Set the tile color when year-based colors are disabled.",
         ),
     ] = "red",
     tile_alpha: Annotated[
-        float, typer.Option("--tile-alpha", help="Transparency of tiles (0.0-1.0)")
+        float, typer.Option("--tile-alpha", help="Set tile opacity from 0 to 1.")
     ] = 0.6,
     tile_size: Annotated[
         float,
         typer.Option(
-            "--tile-size", help="Size multiplier for tiles (1.0 = actual size)"
+            "--tile-size",
+            help="Set the tile size multiplier. Use 1 for the actual size.",
         ),
     ] = 1.0,
     width_pixels: Annotated[
-        int, typer.Option("--width", help="Output image width in pixels")
+        int, typer.Option("--width", help="Set the PNG width in pixels.")
     ] = 2000,
     no_countries: Annotated[
-        bool, typer.Option("--no-countries", help="Don't show country boundaries")
+        bool, typer.Option("--no-countries", help="Hide country boundaries.")
     ] = False,
     no_multi_year_colors: Annotated[
         bool,
-        typer.Option("--no-multi-year-colors", help="Disable multi-year color coding"),
+        typer.Option("--no-multi-year-colors", help="Disable year-based tile colors."),
     ] = False,
     by_source: Annotated[
         bool,
         typer.Option(
             "--by-source",
-            help="Render each (version, variant) source in a distinct colour. "
-            "When set without an explicit --dataset-version/--dataset-variant, "
-            "downloads every known version's manifest and renders all sources.",
+            help="Show each dataset in a separate color. Omitted version and variant options select all datasets.",
         ),
     ] = False,
     dataset_version: Annotated[
         Optional[str],
         typer.Option(
             "--dataset-version",
-            help="Tessera dataset version (e.g. v1, v1.1, v2). Defaults to v1 "
-            "for the single-source view; with --by-source, omitting this "
-            "flag means 'all known versions'. Pass 'all' explicitly to "
-            "force the multi-version view.",
+            help="Select a version, or all. The default is v1, or all with --by-source.",
         ),
     ] = None,
     dataset_variant: Annotated[
         Optional[str],
         typer.Option(
             "--dataset-variant",
-            help="Tessera dataset variant. Defaults to the version's "
-            "default variant for the single-source view; with --by-source, "
-            "omitting this means 'all variants'. Pass 'all' explicitly to "
-            "force the multi-variant view. Run 'geotessera info' to list "
-            "available datasets.",
+            help="Select a variant, or all. The default is the version's default variant, or all with --by-source.",
         ),
     ] = None,
     cache_dir: Annotated[
-        Optional[Path], typer.Option("--cache-dir", help="Cache directory")
+        Optional[Path],
+        typer.Option(
+            "--cache-dir", help="Cache downloaded manifests in this directory."
+        ),
     ] = None,
     registry_dir: Annotated[
         Optional[Path],
         typer.Option(
             "--registry-dir",
-            help="Directory containing registry.parquet and landmasks.parquet files",
+            help="Read manifest.parquet and landmasks.parquet from this directory.",
         ),
     ] = None,
     verbose: Annotated[
-        bool, typer.Option("--verbose", "-v", help="Verbose output")
+        bool, typer.Option("--verbose", "-v", help="Print additional details.")
     ] = False,
 ):
-    """Generate coverage visualizations showing Tessera embedding availability.
+    """Show embedding availability as a PNG map and HTML globe.
 
-    This command generates multiple outputs in one pass:
-    1. PNG map - Static visualization with tiles overlaid on world map
-    2. coverage.json + coverage_YYYY.json - Split JSON data (metadata + per-year tile lists)
-    3. coverage_texture.png - Pre-rendered coverage texture for the globe
-    4. globe.html - Interactive 3D globe visualization
-
-    The PNG map supports regional filtering, year selection, and customization.
-    The HTML globe shows global multi-year coverage with interactive hover tooltips.
-
-    For PNG maps, when no specific year is requested, uses three colors:
-    - Green: All available years present for this tile
-    - Blue: Only the latest year available for this tile
-    - Orange: Partial years coverage (some combination of years)
-
-    Examples:
-        # Generate coverage visualizations for a region
-        geotessera coverage --region-file study_area.geojson
-        # Creates: tessera_coverage.png, coverage.json, coverage_YYYY.json, globe.html
-
-        # Specify output location
-        geotessera coverage --country "Colombia" -o maps/colombia.png
-        # Creates: maps/colombia.png, maps/coverage.json, maps/coverage_YYYY.json, maps/globe.html
-
-        # Customize PNG visualization
-        geotessera coverage --region-file area.geojson --tile-alpha 0.3 --width 3000
+    Region selectors limit the PNG map; the globe shows global coverage.
+    Supporting JSON files and textures are written beside the PNG.
     """
     from .visualization import visualize_global_coverage
     from rich.progress import BarColumn, TextColumn, TimeRemainingColumn
@@ -939,31 +909,32 @@ def download(
         typer.Option(
             "--output",
             "-o",
-            help="Output directory (required for actual downloads, optional for --dry-run)",
+            help="Write files to this directory. This option is required unless --dry-run is set.",
         ),
     ] = None,
     bbox: Annotated[
         Optional[str],
         typer.Option(
             "--bbox",
-            help="Bounding box: 'lon,lat' (single tile) or 'min_lon,min_lat,max_lon,max_lat'",
+            help="Select WGS84 bounds as west,south,east,north, or one tile as lon,lat.",
         ),
     ] = None,
     tile: Annotated[
         Optional[str],
-        typer.Option("--tile", help="Single tile by any point within it: 'lon,lat'"),
+        typer.Option("--tile", help="Select the 0.1-degree tile containing lon,lat."),
     ] = None,
     region_file: Annotated[
         Optional[str],
         typer.Option(
             "--region-file",
-            help="GeoJSON/Shapefile to define region (file path or URL)",
+            help="Select a vector region from a file or URL. Zarr uses its bounding box.",
         ),
     ] = None,
     country: Annotated[
         Optional[str],
         typer.Option(
-            "--country", help="Country name (e.g., 'United Kingdom', 'UK', 'GB')"
+            "--country",
+            help="Select a country by name or code, such as United Kingdom or GB.",
         ),
     ] = None,
     format: Annotated[
@@ -971,74 +942,95 @@ def download(
         typer.Option(
             "--format",
             "-f",
-            help="Output format: 'tiff' (georeferenced) or 'npy' (raw arrays)",
+            help="Write GeoTIFFs (tiff) or download quantized arrays with scales and landmasks (npy).",
         ),
     ] = "tiff",
-    year: Annotated[int, typer.Option("--year", help="Year of embeddings")] = 2024,
+    year: Annotated[
+        int, typer.Option("--year", help="Select the embedding year.")
+    ] = 2024,
     bands: Annotated[
         Optional[str],
-        typer.Option("--bands", help="Comma-separated band indices (default: all 128)"),
+        typer.Option(
+            "--bands",
+            help="Select comma-separated, zero-based bands for TIFF output. The default is all bands at the selected depth.",
+        ),
     ] = None,
     compress: Annotated[
-        str, typer.Option("--compress", help="Compression method (tiff format only)")
+        str, typer.Option("--compress", help="Set the GeoTIFF compression method.")
     ] = "lzw",
     list_files: Annotated[
-        bool, typer.Option("--list-files", help="List all created files with details")
+        bool,
+        typer.Option("--list-files", help="List tile output files with their sizes."),
     ] = False,
     dataset_version: Annotated[
         str,
         typer.Option(
             "--dataset-version",
-            help="Tessera dataset version (e.g. v1, v1.1, v2; default v1)",
+            help="Select the dataset version. Run geotessera info to list datasets.",
         ),
     ] = "v1",
     dataset_variant: Annotated[
         Optional[str],
         typer.Option(
             "--dataset-variant",
-            help="Tessera dataset variant (default: the version's default "
-            "variant, e.g. vultr for v1, cambridge for v1.1, 2B-L~beta1 "
-            "for v2). Run 'geotessera info' to list available datasets.",
+            help="Select the dataset variant. If omitted, use the version's default variant.",
         ),
     ] = None,
     cache_dir: Annotated[
-        Optional[Path], typer.Option("--cache-dir", help="Cache directory")
+        Optional[Path],
+        typer.Option(
+            "--cache-dir",
+            help="Set the metadata cache directory. Zarr byte-range reads are cached within the process.",
+        ),
     ] = None,
     registry_dir: Annotated[
         Optional[Path],
         typer.Option(
             "--registry-dir",
-            help="Directory containing manifest.parquet and landmasks.parquet files",
+            help="Read local manifests from this directory. This selects tiles in auto mode.",
         ),
     ] = None,
     verbose: Annotated[
-        bool, typer.Option("--verbose", "-v", help="Verbose output")
+        bool, typer.Option("--verbose", "-v", help="Print additional details.")
     ] = False,
     dry_run: Annotated[
         bool,
         typer.Option(
-            "--dry-run", help="Calculate total download size without downloading"
+            "--dry-run",
+            help="Report the size without reading embeddings. Zarr reports uncompressed output; tiles use manifest estimates.",
         ),
     ] = False,
     source: Annotated[
         DownloadSource,
         typer.Option(
-            "--source", help="auto: Zarr for TIFF, tiles for NPY; or zarr/tiles"
+            "--source",
+            help="Select the source. Auto uses Zarr for TIFF and tiles for NPY or --registry-dir.",
         ),
     ] = DownloadSource.auto,
     store_url: Annotated[
-        Optional[str], typer.Option("--store-url", help="Zarr URL or local store path")
+        Optional[str],
+        typer.Option(
+            "--store-url",
+            help="Read Zarr from this URL or local path, overriding the dataset options.",
+        ),
     ] = None,
     depth: Annotated[
-        Optional[int], typer.Option("--depth", help="Matryoshka embedding depth")
+        Optional[int],
+        typer.Option(
+            "--depth",
+            help="Read a published Zarr embedding prefix. If omitted, read the full embedding.",
+        ),
     ] = None,
 ):
-    """Stream a region to GeoTIFFs, or download original NPY/GeoTIFF tiles.
+    """Export a region as GeoTIFFs or download individual tiles.
 
-    TIFF output defaults to Zarr and writes tessera_YEAR_utmNN.tif per zone.
-    --source tiles preserves the original individual-tile layout and resume
-    behavior. NPY output and --registry-dir select tiles automatically.
-    --dry-run in Zarr mode estimates uncompressed output from metadata.
+    Specify one of --bbox, --tile, --region-file, or --country. Zarr exports
+    write tessera_YEAR_utmNN.tif on each native UTM grid with float32 values
+    and NaN nodata. Country and vector selectors use their bounding boxes.
+
+    Rerunning replaces each completed Zarr file. Individual tile downloads
+    skip existing files; use a new output directory when changing the
+    dataset or bands. --store-url and --depth apply to Zarr only.
     """
 
     # Validate output parameter
@@ -1559,79 +1551,56 @@ def download(
 @app.command()
 def visualize(
     input_path: Annotated[
-        Path, typer.Argument(help="Input GeoTIFF or NPY file directory")
+        Path,
+        typer.Argument(
+            help="Read a GeoTIFF file or a directory of GeoTIFF or NPY tiles."
+        ),
     ],
-    output_file: Annotated[Path, typer.Argument(help="Output PCA mosaic file (.tif)")],
+    output_file: Annotated[
+        Path, typer.Argument(help="Write the PCA mosaic to this GeoTIFF file.")
+    ],
     target_crs: Annotated[
-        str, typer.Option("--crs", help="Target CRS for reprojection")
+        str, typer.Option("--crs", help="Set the output coordinate reference system.")
     ] = "EPSG:3857",
     n_components: Annotated[
         int,
         typer.Option(
             "--n-components",
             min=1,
-            help="Number of PCA components. Only first 3 used for RGB visualization - increase for analysis/research.",
+            help="Set the number of PCA components to fit. Only the first three are written.",
         ),
     ] = 3,
     balance_method: Annotated[
         BalanceMethod,
         typer.Option(
             "--balance",
-            help="RGB balance method: histogram (default), percentile, or adaptive",
+            help="Set the color scaling method.",
         ),
     ] = BalanceMethod.histogram,
     percentile_low: Annotated[
         float,
         typer.Option(
-            "--percentile-low", help="Lower percentile for percentile balance method"
+            "--percentile-low",
+            help="Set the lower clipping percentile with --balance percentile.",
         ),
     ] = 2.0,
     percentile_high: Annotated[
         float,
         typer.Option(
-            "--percentile-high", help="Upper percentile for percentile balance method"
+            "--percentile-high",
+            help="Set the upper clipping percentile with --balance percentile.",
         ),
     ] = 98.0,
 ):
-    """Create PCA visualization from GeoTIFF or NPY format embeddings.
+    """Create a PCA mosaic from GeoTIFF or NPY embeddings.
 
-    This command combines all embedding data across tiles, applies a single PCA
-    transformation to the combined dataset, then creates a unified RGB mosaic.
-    This ensures consistent principal components across the entire region,
-    eliminating tiling artifacts.
+    Read one GeoTIFF or a directory of GeoTIFF or NPY tiles. Fit one PCA
+    model to a reproducible sample of up to 100,000 valid pixels and apply
+    it across all inputs. Missing pixels remain masked.
 
-    Supports two input formats:
-    - GeoTIFF format: Directory containing *.tif/*.tiff files
-    - NPY format: Directory with global_0.1_degree_representation/{year}/grid_{lon}_{lat}/*.npy structure
-
-    The first 3 principal components are mapped to RGB channels for visualization.
-    Additional components can be computed for research/analysis purposes.
-
-    Examples:
-        # Create PCA visualization from GeoTIFF tiles
-        geotessera visualize tiles/ pca_mosaic.tif
-
-        # Create PCA visualization from NPY format tiles
-        geotessera visualize npy_tiles/ pca_mosaic.tif
-
-        # Use histogram equalization for maximum contrast
-        geotessera visualize tiles/ pca_balanced.tif --balance histogram
-
-        # Use adaptive scaling based on variance
-        geotessera visualize tiles/ pca_adaptive.tif --balance adaptive
-
-        # Custom percentile range for outlier-robust scaling
-        geotessera visualize tiles/ pca_custom.tif --percentile-low 5 --percentile-high 95
-
-        # Use custom projection
-        geotessera visualize tiles/ pca_mosaic.tif --crs EPSG:4326
-
-        # PCA for research - compute more components for analysis
-        # (still only uses first 3 for RGB, but saves variance info)
-        geotessera visualize tiles/ pca_research.tif --n-components 10
-
-        # Then create web visualization
-        geotessera webmap pca_mosaic.tif --serve
+    The output contains the first three components as a display-scaled uint8
+    image, or fewer bands if fewer components are requested. Use the
+    original embeddings for analysis.
     """
 
     # Validate output file extension
@@ -1730,70 +1699,141 @@ def visualize(
 def webmap(
     rgb_mosaic: Annotated[
         Optional[Path],
-        typer.Argument(help="Existing RGB GeoTIFF; omit to stream a region from Zarr"),
+        typer.Argument(help="Read this RGB GeoTIFF. Omit it to stream a Zarr region."),
     ] = None,
     output: Annotated[
-        Path, typer.Option("--output", "-o", help="Output directory")
+        Path,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Write map files here. The default is tessera_webmap for a region or <image_stem>_webmap for an image.",
+        ),
     ] = None,
     min_zoom: Annotated[
-        int, typer.Option("--min-zoom", help="Min zoom for web tiles")
+        int,
+        typer.Option(
+            "--min-zoom", help="Set the lowest tile zoom level, from 0 to 24."
+        ),
     ] = 8,
     max_zoom: Annotated[
-        int, typer.Option("--max-zoom", help="Max zoom for web tiles")
+        int,
+        typer.Option(
+            "--max-zoom", help="Set the highest tile zoom level, from 0 to 24."
+        ),
     ] = 15,
     initial_zoom: Annotated[
-        int, typer.Option("--initial-zoom", help="Initial zoom level")
+        int, typer.Option("--initial-zoom", help="Set the initial viewer zoom level.")
     ] = 10,
     force_regenerate: Annotated[
         bool,
         typer.Option(
             "--force/--no-force",
-            help="Regenerate the mosaic and tiles even when the request matches",
+            help="Rebuild the streamed RGB mosaic and tiles. Use --force when a store changes at the same URL.",
         ),
     ] = False,
     serve_immediately: Annotated[
-        bool, typer.Option("--serve/--no-serve", help="Start web server immediately")
+        bool,
+        typer.Option(
+            "--serve/--no-serve",
+            help="Start the server and open a browser after processing. Reserve the port before processing.",
+        ),
     ] = False,
     port: Annotated[
-        int, typer.Option("--port", "-p", help="Port for web server")
+        int,
+        typer.Option(
+            "--port",
+            "-p",
+            help="Set the web server port. An occupied port causes an error.",
+        ),
     ] = 8000,
     region_file: Annotated[
         Optional[str],
         typer.Option(
             "--region-file",
-            help="GeoJSON/Shapefile boundary to overlay (file path or URL)",
+            help="Overlay a vector boundary from a file or URL. In Zarr mode, also select its bounding box.",
         ),
     ] = None,
     use_gdal_raster: Annotated[
         bool,
         typer.Option(
             "--use-gdal-raster/--use-gdal2tiles",
-            help="Use newer gdal raster tile (faster but less stable) vs gdal2tiles (default, stable)",
+            help="Generate tiles with gdal raster tile or gdal2tiles. The selected tool must be on PATH.",
         ),
     ] = False,
     bbox: Annotated[
         Optional[str],
-        typer.Option("--bbox", help="Stream west,south,east,north from Zarr"),
+        typer.Option(
+            "--bbox",
+            help="Select WGS84 bounds as west,south,east,north, or one tile as lon,lat.",
+        ),
     ] = None,
     tile: Annotated[
-        Optional[str], typer.Option("--tile", help="Stream the tile containing lon,lat")
+        Optional[str],
+        typer.Option("--tile", help="Select the 0.1-degree tile containing lon,lat."),
     ] = None,
-    country: Annotated[Optional[str], typer.Option("--country")] = None,
-    year: Annotated[int, typer.Option("--year")] = 2024,
-    dataset_version: Annotated[str, typer.Option("--dataset-version")] = "v1",
-    dataset_variant: Annotated[Optional[str], typer.Option("--dataset-variant")] = None,
-    store_url: Annotated[Optional[str], typer.Option("--store-url")] = None,
-    cache_dir: Annotated[Optional[Path], typer.Option("--cache-dir")] = None,
+    country: Annotated[
+        Optional[str],
+        typer.Option(
+            "--country",
+            help="Select a country by name or code, such as United Kingdom or GB.",
+        ),
+    ] = None,
+    year: Annotated[
+        int, typer.Option("--year", help="Select the embedding year.")
+    ] = 2024,
+    dataset_version: Annotated[
+        str,
+        typer.Option(
+            "--dataset-version",
+            help="Select the dataset version. Run geotessera info to list datasets.",
+        ),
+    ] = "v1",
+    dataset_variant: Annotated[
+        Optional[str],
+        typer.Option(
+            "--dataset-variant",
+            help="Select the dataset variant. If omitted, use the version's default variant.",
+        ),
+    ] = None,
+    store_url: Annotated[
+        Optional[str],
+        typer.Option(
+            "--store-url",
+            help="Read Zarr from this URL or local path, overriding the dataset options.",
+        ),
+    ] = None,
+    cache_dir: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--cache-dir",
+            help="Set the metadata cache directory. Zarr byte-range reads are cached within the process.",
+        ),
+    ] = None,
     bands: Annotated[
-        str, typer.Option("--bands", help="Three zero-based embedding bands for RGB")
+        str,
+        typer.Option(
+            "--bands",
+            help="Select three comma-separated, zero-based embedding bands for a Zarr region.",
+        ),
     ] = "0,1,2",
-    depth: Annotated[Optional[int], typer.Option("--depth")] = None,
+    depth: Annotated[
+        Optional[int],
+        typer.Option(
+            "--depth",
+            help="Read a published Zarr embedding prefix. If omitted, read the full embedding.",
+        ),
+    ] = None,
 ):
-    """Create a web map from an RGB GeoTIFF or a streamed Zarr region.
+    """Create web tiles and a viewer from an RGB image or Zarr region.
 
-    Omit RGB_MOSAIC and specify --bbox/--tile/--region-file/--country to
-    stream three embedding bands, normalize them together, and generate
-    tiles. Existing RGB mosaics remain supported as a positional argument.
+    Supply a three-band RGB GeoTIFF, or omit it and select one region with
+    --bbox, --tile, --region-file, or --country. Region mode scales three
+    embedding bands to RGB. Use visualize first for PCA maps.
+
+    Matching completed mosaics and tiles are reused. Changing the zoom
+    range rebuilds only tiles. Keep the output directory and its JSON
+    completion files to reuse completed work. GDAL command-line tools are
+    required to generate tiles.
     """
     if not 0 <= min_zoom <= max_zoom <= 24:
         raise typer.BadParameter("Zoom levels must satisfy 0 <= min <= max <= 24")
@@ -2029,25 +2069,30 @@ def webmap(
 @app.command()
 def serve(
     directory: Annotated[
-        Path, typer.Argument(help="Directory containing web visualization files")
+        Path, typer.Argument(help="Serve all files in this directory.")
     ],
     port: Annotated[
-        int, typer.Option("--port", "-p", help="Port number for web server")
+        int,
+        typer.Option(
+            "--port",
+            "-p",
+            help="Set the web server port. An occupied port causes an error.",
+        ),
     ] = 8000,
     open_browser: Annotated[
-        bool, typer.Option("--open/--no-open", help="Automatically open browser")
+        bool, typer.Option("--open/--no-open", help="Open the viewer in a browser.")
     ] = True,
     html_file: Annotated[
         Optional[str],
         typer.Option(
-            "--html", help="Specific HTML file to serve (relative to directory)"
+            "--html", help="Open this HTML file relative to the served directory."
         ),
     ] = None,
 ):
-    """Start a web server to serve visualization files.
+    """Serve an existing map directory over HTTP.
 
-    This is needed for leaflet-based web visualizations to work properly
-    since they require HTTP access to load tiles and other resources.
+    Serve all files in DIRECTORY without regenerating the map. An occupied
+    port causes an error. Press Ctrl+C to stop the server.
     """
     if not directory.exists():
         rprint(f"[red]Error: Directory {directory} does not exist[/red]")

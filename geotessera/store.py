@@ -930,10 +930,42 @@ class GeoTesseraZarr:
         return f"GeoTesseraZarr({self.url!r}, years={self.years})"
 
     def export_geotiffs(self, bbox, year, output_dir, **kwargs):
-        """Stream a WGS84 region to native-zone GeoTIFFs.
+        """Export a WGS84 region as one GeoTIFF per intersecting UTM zone.
 
-        See :func:`geotessera.streaming.export_region` for band selection,
-        matryoshka depth, strip sizing, and metadata-only dry runs.
+        Files are named ``tessera_YEAR_utmNN.tif`` and contain float32
+        embeddings on the native grid, with NaN nodata and source metadata.
+        Each completed file replaces its destination. Rerunning repeats
+        the export, including files completed before a failure.
+
+        Args:
+            bbox: WGS84 bounds in west, south, east, north order. Split
+                regions crossing the antimeridian into two requests.
+            year: Select the embedding year.
+            output_dir: Write the GeoTIFF files to this directory.
+            **kwargs: Accept the keyword options described below.
+
+        Keyword Args:
+            bands: Select zero-based band indices in the given order.
+                The default is all bands at the selected depth.
+            depth: Select a published embedding prefix. The default is
+                the full embedding. Band indices refer to this prefix.
+            strip_rows: Limit rows processed at a time. The default is 128.
+            compress: Set GeoTIFF compression. The default is ``"lzw"``.
+            progress_callback: Call ``callback(current, total, status)``
+                after each strip is written.
+            dry_run: Return size estimates without reading embeddings
+                or creating files. The default is ``False``.
+
+        Returns:
+            A list of output paths. With ``dry_run=True``, return a list
+            of dictionaries with ``zone``, ``width``, ``height``, and
+            ``uncompressed_bytes``. Estimates describe uncompressed
+            output, not network transfer or compressed file size.
+
+        Raises:
+            ValueError: If the bounds, bands, or strip size are invalid,
+                no available zone grid intersects the region, or the requested
+                year or depth is unavailable.
         """
         from .streaming import export_region
 

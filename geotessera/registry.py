@@ -356,7 +356,7 @@ def parse_grid_name(filename: str) -> Tuple[Optional[float], Optional[float]]:
     """Extract tile coordinates from a grid filename.
 
     Args:
-        filename: Grid filename like "grid_-50.55_-20.65"
+        filename: Supply a grid filename such as ``grid_-50.55_-20.65``.
 
     Returns:
         tuple: (lon, lat) as floats, or (None, None) if parsing fails
@@ -390,7 +390,7 @@ def tile_to_grid_name(lon: float, lat: float) -> str:
         lat: Tile center latitude
 
     Returns:
-        str: Grid name like "grid_-50.55_-20.65"
+        A grid name such as ``grid_-50.55_-20.65``.
     """
     return f"grid_{lon:.2f}_{lat:.2f}"
 

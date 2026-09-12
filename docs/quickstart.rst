@@ -1,9 +1,10 @@
 Quick Start Guide
 =================
 
-This guide covers the tile-download interface: fetching embeddings to
-disk and exporting them for GIS use. To stream embeddings without
-downloading files, start with the :doc:`zarr_quickstart` instead.
+This guide covers individual tile downloads with ``--source tiles``.
+The default ``download`` command exports regions from Zarr. See
+:doc:`cli_reference` for Zarr exports and direct web maps, or
+:doc:`zarr_quickstart` for the Python streaming API.
 
 .. tip::
 
@@ -20,7 +21,7 @@ downloading files, start with the :doc:`zarr_quickstart` instead.
 Installation
 ------------
 
-Requires Python 3.12 or later. Install GeoTessera using pip::
+GeoTessera requires Python 3.12 or later. Install GeoTessera using pip::
 
     pip install geotessera
 
@@ -31,7 +32,7 @@ Verify the installation::
 Step 1: Check Data Availability
 --------------------------------
 
-Before downloading embeddings, we recommend check what data is available for your region of interest.
+Check which years and tiles are available for your region.
 
 Generate coverage visualizations (PNG map, JSON data, and interactive HTML globe)::
 
@@ -77,8 +78,11 @@ Step 2: Download Embeddings
 
 GeoTessera supports two output formats:
 
-- **tiff**: Georeferenced GeoTIFF files (default, best for GIS) - fully dequantized and ready to use
-- **npy**: Quantized numpy arrays with scales and landmask TIFFs (for advanced analysis and storage efficiency)
+``tiff`` writes dequantized embeddings as georeferenced GeoTIFF files.
+``npy`` downloads quantized NumPy arrays with scales and landmask GeoTIFFs.
+Tile downloads skip existing files. Rerun the same command to continue an
+interrupted download, and use a new output directory when changing datasets
+or exported bands.
 
 For cloud-native zarr access without downloading files, see
 :ref:`zarr-access` below.
@@ -155,7 +159,9 @@ This creates the registry directory structure:
 - ``global_0.1_degree_representation/{year}/grid_{lon}_{lat}/grid_{lon}_{lat}_scales.npy`` - Scale factors (float32)
 - ``global_0.1_degree_tiff_all/grid_{lon}_{lat}.tiff`` - Landmask TIFF with CRS and transform
 
-To dequantize: ``dequantized = quantized.astype(np.float32) * scales``
+Use ``geotessera.dequantize_embedding(quantized, scales)`` to dequantize
+arrays. The helper handles scale broadcasting and returns NaN for
+nonfinite scale values.
 
 Step 3: Work with the Data
 ---------------------------
@@ -198,7 +204,11 @@ Fetch multiple tiles in a bounding box::
         mean_values = np.mean(embedding_array, axis=(0, 1))  # Mean per channel
         print(f"  Mean of first 5 channels: {mean_values[:5]}")
 
-Sample embeddings at specific points::
+Sample embeddings at specific points. Read failures raise an exception;
+points outside coverage return NaN. See :ref:`sampling-errors` to handle
+read failures explicitly.
+
+::
 
     # Define points of interest (lon, lat tuples)
     points = [(0.15, 52.05), (0.25, 52.15), (-0.05, 51.55)]
@@ -280,7 +290,10 @@ From GeoTIFF files, create a PCA visualization::
     geotessera visualize ./london_tiles pca_mosaic.tif
     # Next step: geotessera webmap pca_mosaic.tif --serve
 
-This combines all embedding data across tiles, applies PCA transformation, and creates a unified RGB mosaic from the first 3 principal components. This eliminates tiling artifacts and provides consistent visualization across the region.
+The command fits one PCA model to a reproducible sample of up to 100,000
+valid pixels and applies it across the input tiles. It writes the first
+three components as a uint8 RGB image and preserves missing pixels as a
+mask. Use the original embeddings for analysis.
 
 Customize the PCA visualization::
 
@@ -291,10 +304,7 @@ Customize the PCA visualization::
     geotessera visualize ./london_tiles pca_adaptive.tif --balance adaptive
 
     # Custom percentile range for outlier-robust scaling
-    geotessera visualize ./london_tiles pca_custom.tif --percentile-low 5 --percentile-high 95
-
-    # Compute more components for research (still uses first 3 for RGB)
-    geotessera visualize ./london_tiles pca_research.tif --n-components 10
+    geotessera visualize ./london_tiles pca_custom.tif --balance percentile --percentile-low 5 --percentile-high 95
 
 Create Interactive Web Maps
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -303,11 +313,9 @@ Generate web tiles and viewer from your PCA mosaic::
 
     geotessera webmap pca_mosaic.tif --serve
 
-This automatically:
-1. Reprojects the mosaic for web viewing if needed
-2. Generates web tiles at multiple zoom levels
-3. Creates an HTML viewer
-4. Starts a local web server and opens in your browser
+The command generates web tiles and a viewer, then starts a server and
+opens the map in a browser. Tile generation requires the GDAL command-line
+tools. Matching completed tiles are reused on subsequent runs.
 
 Customize web tile generation::
 

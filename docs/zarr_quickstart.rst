@@ -1,141 +1,170 @@
 Zarr Quick Start
 ================
 
-The zarr store streams Tessera embeddings from the public cloud store.
-Nothing is downloaded up front, queries are routed to the correct UTM
-zone, and values return dequantised as float32 on their native 10m UTM
-grid. This is the recommended interface for most work; the
-:doc:`quickstart` covers the tile-download interface for offline use.
-
-Requires Python 3.12 or later::
+``GeoTesseraZarr`` reads embeddings from a local or remote Zarr store.
+Queries select the required UTM zones and return dequantized float32 values.
+GeoTessera requires Python 3.12 or later::
 
     pip install geotessera
 
 Read one embedding
 ------------------
 
-Tessera publishes a 128-dimensional embedding for every 10m pixel of
-land, for every year since 2017::
+Create a client and inspect the available years::
 
     from geotessera import GeoTesseraZarr
 
     gt = GeoTesseraZarr()
-    print(gt.years)                     # [2017, ..., 2025]
+    print(gt.years)
+
+Read an embedding at a WGS84 longitude and latitude::
 
     vec, status = gt.probe(0.12, 52.20, year=2024)
-    print(status)                       # 'valid'
-    print(vec.shape)                    # (128,)
+    print(status)
+    print(vec.shape)
 
-``probe`` reports why when there is no value: ``water`` for open water,
-``nodata`` for a pixel never written, ``outside`` for a point beyond the
-store. ``sample_at`` returns the vector alone, with NaN for all three.
+``probe`` returns ``valid`` for an available embedding, ``water`` for open
+water, ``nodata`` for an unwritten pixel, and ``outside`` beyond coverage.
+``sample_at`` returns only the vector, with NaN values for missing embeddings.
 
 Sample points
 -------------
 
-``sample_points`` reads a list of lon/lat points in one bulk request per
-UTM zone::
+``sample_points`` reads a sequence of WGS84 longitude and latitude pairs
+and returns an array with one row per input point::
 
     coords = [(0.12, 52.20), (-2.97, 53.44)]
-    X = gt.sample_points(coords, year=2024)   # (2, 128) float32
+    embeddings = gt.sample_points(coords, year=2024)
 
-Points without an embedding return NaN rows. Points on a UTM zone seam
-are served by the neighbouring zone when their own lacks them.
+Points without an embedding return NaN rows. Points at a UTM zone boundary
+can use the neighbouring zone when their own zone lacks coverage.
 
 Read a region
 -------------
 
-``read_region`` takes a lon/lat bounding box and returns the mosaic on
-the zone's native UTM grid, with its transform and CRS::
+``read_region`` takes WGS84 bounds in west, south, east, north order.
+It returns an array, affine transform, and CRS on one native UTM grid::
 
     bbox = (0.05, 52.15, 0.20, 52.25)
     mosaic, transform, crs = gt.read_region(bbox, year=2024)
-    print(mosaic.shape, crs)            # (1152, 1069, 128) EPSG:32631
 
-Nothing is resampled: the bounding box selects the window, and the
-pixels come back on the grid they were produced on. Classify or cluster
-on this grid, and reproject only the result.
+The bounding box selects a pixel window without resampling. Use
+``export_geotiffs`` to export all intersecting zones when a region spans
+more than one UTM zone.
 
 Stream a large region
 ---------------------
 
-A dequantised region costs four bytes per value, so a large one may not
-fit in memory. ``iter_region`` yields the same pixels as row strips,
-downloading the next strip while the caller works on the current one::
+``iter_region`` yields the same pixels as row strips, so the full region
+does not need to fit in memory::
 
     for block, transform, crs in gt.iter_region(bbox, year=2024, strip_rows=512):
-        predictions = model.predict(block.reshape(-1, 128))
+        print(block.shape)
 
-``read_region_quantized`` is the other route to a large window: it
-returns the int8 values and their scales without dequantising, a
-quarter of the bytes, for dequantisation a block of rows at a time.
+``read_region_quantized`` returns int8 embeddings and their scale arrays.
+Use it when the quantized representation is preferable to a float32 array.
+
+Export GeoTIFFs
+---------------
+
+``export_geotiffs`` writes one file per intersecting UTM zone and returns
+the output paths::
+
+    files = gt.export_geotiffs(bbox, 2024, "region/", bands=[0, 1, 2])
+
+Files are named ``tessera_YEAR_utmNN.tif`` and contain float32 embeddings,
+NaN nodata, the native grid, band descriptions, and source metadata.
+Output windows enclose the bounds within the available zone grids.
+Each completed file replaces its destination. Rerunning repeats the export.
+
+Omit ``bands`` to export all bands. Use ``depth`` to select a published
+embedding prefix; band indices are zero-based within that prefix.
+``compress`` selects GeoTIFF compression and defaults to ``"lzw"``.
+``strip_rows`` limits the rows processed at a time and defaults to 128.
+
+Set ``dry_run=True`` to return a list of estimates containing ``zone``,
+``width``, ``height``, and ``uncompressed_bytes`` without reading embeddings::
+
+    estimates = gt.export_geotiffs(bbox, 2024, "region/", dry_run=True)
+    print(sum(item["uncompressed_bytes"] for item in estimates))
+
+These estimates describe uncompressed output, not network transfer or
+compressed file size. Split bounds that cross the antimeridian into two
+requests.
+
+The CLI provides the same export and can also create a web map directly::
+
+    geotessera download --bbox '0.05,52.15,0.20,52.25' --year 2024 --output region/
+    geotessera webmap --bbox '0.05,52.15,0.20,52.25' --year 2024 --output map/ --serve
+
+See :doc:`cli_reference` for band selection, caching, and restart behavior.
 
 Read a patch
 ------------
 
-``read_patch`` returns a fixed-size square centred on a point, the
-shape a training pipeline consumes::
+``read_patch`` returns a fixed-size square centred on a point::
 
     patch, transform, crs = gt.read_patch(0.12, 52.20, year=2024, size_px=256)
-    print(patch.shape)                  # (256, 256, 128)
 
-The point falls in the centre pixel. A patch inside one UTM zone is
-sliced from the native grid unresampled; one crossing a zone boundary
-is merged onto a transverse Mercator grid centred on the patch, and its
-CRS is returned as named WKT since no EPSG code exists for it.
+The point falls in pixel ``[size_px // 2, size_px // 2]``. A patch within one
+UTM zone uses the native grid. A patch across a zone boundary uses a local
+transverse Mercator grid and nearest-neighbour resampling by default.
+The returned CRS describes the output grid.
+
+A patch extending beyond the stored grid retains its requested position,
+with NaN for uncovered pixels. Set ``dst_crs`` to use a particular projected
+CRS; its units must be metres.
 
 Matryoshka depths
 -----------------
 
-The v2 model orders its dimensions by importance, and v2 stores carry
-prefix arrays alongside the full embeddings. ``depth=`` reads them::
+Stores for v2 can contain prefix arrays alongside the full embeddings.
+Select a published prefix with ``depth``::
 
     from geotessera.registry import zarr_store_url
 
     gt2 = GeoTesseraZarr(zarr_store_url("v2"))
-    X16 = gt2.sample_points(coords, year=2024, depth=16)   # (2, 16)
+    embeddings16 = gt2.sample_points(coords, year=2024, depth=16)
 
-Sixteen dimensions arrive for an eighth of the bytes of 128, and equal
-the first sixteen of the full embedding exactly. A store without the
-requested depth raises and lists the depths it has.
+The prefix equals the first dimensions of the full embedding. A store
+without the requested depth reports an error and lists available depths.
+Selecting fewer dimensions reduces the output size; transferred bytes
+depend on the physical chunk layout.
 
-Embedding releases
-------------------
+Select a store
+--------------
 
-Releases sit side by side in the store, so trialling a model is a
-one-line change::
+Use ``zarr_store_url`` to select another dataset version, or pass a local
+store path::
 
-    gt = GeoTesseraZarr(zarr_store_url("v1"))    # the default
-    gt = GeoTesseraZarr(zarr_store_url("v2"))    # the v2 beta
+    gt = GeoTesseraZarr(zarr_store_url("v1.1"))
+    local = GeoTesseraZarr("/data/tessera.zarr")
 
-Do not mix embeddings from different releases in one analysis; the
-feature spaces are independently learned. See :ref:`dataset-versions`.
+Use one version and variant per analysis because their embedding spaces
+are independently learned. See :ref:`dataset-versions`.
 
-Caching and store wrapping
---------------------------
+Caching
+-------
 
-Reads retry failed requests with exponential backoff, so a dropped
-response from a busy server costs one chunk rather than the read.
-Pass ``cache_dir`` to persist reads locally.  Each store caches under
-its own subdirectory (``tessera-cache/v1/``,
-``tessera-cache/v2-2B-L_beta1/``), so dataset versions never mix::
+Set ``cache_dir`` to persist metadata between runs. Byte-range reads of
+sharded embeddings are cached within the process. Each store uses a
+separate cache subdirectory::
 
     gt = GeoTesseraZarr(cache_dir="tessera-cache")
 
-    # or with a size bound on the cache:
+Set ``cache_max_size`` to bound the cache in bytes::
+
     gt = GeoTesseraZarr(
         cache_dir="tessera-cache", cache_max_size=2 * 1024**3
     )
 
-To layer other behaviour over the transport, wrap the store from
-:func:`~geotessera.store.zarr_store` and pass it in.
+Keep exported GeoTIFFs or completed web map directories for reuse between
+runs. The read cache does not provide a persistent copy of the embeddings.
 
-Under the hood
---------------
+See also
+--------
 
-The store layout, quantisation, and seam handling are described in
-:doc:`architecture`. The
-`geotessera-examples <https://github.com/ucam-eo/geotessera-examples>`_
-repository carries runnable pipelines built on this interface, including
-a five-step teaching tour that ends by reading the store with plain
-``xarray`` and ``zarr``.
+:doc:`quickstart` covers individual tile downloads.
+:doc:`architecture` describes the Zarr layout and quantization.
+The `examples repository <https://github.com/ucam-eo/geotessera-examples>`_
+contains analysis workflows using this API.

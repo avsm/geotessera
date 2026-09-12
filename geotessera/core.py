@@ -101,41 +101,20 @@ class GeoTessera:
         registry_path: Optional[Union[str, Path]] = None,
         registry_dir: Optional[Union[str, Path]] = None,
     ):
-        """Initialize GeoTessera with Parquet registry.
+        """Initialize a client for downloading and reading individual tiles.
 
         Args:
-            dataset_version: Tessera dataset version. Accepts ``"v1"`` /
-                ``"1.0"`` or ``"v1.1"`` / ``"1.1"`` (the repository uses
-                ``v1/`` for the 1.0 series).
-            dataset_variant: Variant of the embeddings to load. Defaults to
-                the version's published variant (``"vultr"`` for v1,
-                ``"cambridge"`` for v1.1). Variants are produced by different
-                model runs and are selected by filtering the manifest.
-            cache_dir: Directory for caching registry files only (not embedding data)
-            embeddings_dir: Directory containing pre-downloaded embedding tiles.
-                Defaults to current working directory if not specified.
-
-                To populate embeddings_dir, use one of these approaches:
-
-                1. Download specific tiles using the CLI:
-                   $ geotessera download --lat 52.05 --lon 0.15 --year 2024 --output ./embeddings
-
-                2. Download tiles for a region using the CLI:
-                   $ geotessera download --region region.geojson --year 2024 --output ./embeddings
-
-                Expected directory structure:
-                    embeddings_dir/
-                    ├── global_0.1_degree_representation/
-                    │   └── 2024/
-                    │       ├── grid_0.15_52.05.npy
-                    │       ├── grid_0.15_52.05_scales.npy
-                    │       └── ...
-                    └── global_0.1_degree_tiff_all/
-                        ├── grid_0.15_52.05.tiff
-                        └── ...
-            registry_url: URL to download Parquet registry from (default: remote)
-            registry_path: Local path to existing Parquet registry file
-            registry_dir: Directory containing registry.parquet and landmasks.parquet files
+            dataset_version: Select the dataset version. The default is ``v1``.
+            dataset_variant: Select a variant within the version. The default
+                is the version's published default variant.
+            cache_dir: Cache manifests in this directory.
+            embeddings_dir: Read and write embedding tiles in this directory.
+                The default is the current working directory. Populate it with
+                ``geotessera download --source tiles`` or the download methods.
+            registry_url: Read the manifest from this URL.
+            registry_path: Read an existing local manifest file.
+            registry_dir: Read ``manifest.parquet`` and ``landmasks.parquet``
+                from this directory.
         """
         self.dataset_version = dataset_version
 
@@ -433,9 +412,11 @@ class GeoTessera:
         tiles_to_fetch: Iterable[Tuple[int, float, float]],
         progress_callback: Optional[callable] = None,
     ) -> Generator[Tuple[int, float, float, np.ndarray, object, object], None, None]:
-        """Lazily fetches all requested tiles with CRS information.
-        Use as a generator to process tiles one at a time in a memory-efficient manner.
-        The list of tiles to fetch can be obtained by registry.load_blocks_for_region().
+        """Yield requested tiles with their CRS and transform.
+
+        Process one tile at a time. A failed fetch raises ``RuntimeError``
+        and stops iteration. Use ``registry.load_blocks_for_region()`` to
+        find tiles for a region.
 
         Args:
             tiles_to_fetch: List of tiles to fetch as (year, tile_lon, tile_lat) tuples
@@ -745,13 +726,10 @@ class GeoTessera:
     ) -> Union[np.ndarray, Tuple[np.ndarray, List[Dict]]]:
         """Sample embedding values at specified point locations from local tiles.
 
-        This method efficiently extracts embedding values at arbitrary lon/lat
-        coordinates by:
-        1. Grouping points by which tile they fall into
-        2. Optionally downloading missing tiles if auto_download=True
-        3. Loading tiles from self.embeddings_dir
-        4. Extracting all point values from each tile
-        5. Returning results in original point order
+        Read selected pixels from local GeoTIFF or NPY tiles and return
+        samples in input order. Tuple and GeoJSON coordinates use WGS84.
+        GeoDataFrames must declare their CRS and contain nonempty points;
+        coordinates are transformed to WGS84 before sampling.
 
         Args:
             points: Point coordinates as:
@@ -764,8 +742,10 @@ class GeoTessera:
                 If False, operate in offline mode and raise error for missing tiles.
                 Set to False for guaranteed offline operation with no network requests.
             progress_callback: Optional callback(current, total, status)
-            errors: "raise" reports tile read failures; "coerce" leaves failed
-                samples as NaN and includes the error when metadata is requested.
+            errors: Use ``"raise"`` to report tile read failures, or
+                ``"coerce"`` to return NaN for failed reads and include
+                the error in requested metadata. Invalid inputs and missing
+                files in offline mode still raise.
 
         Returns:
             If include_metadata=False:
@@ -778,7 +758,9 @@ class GeoTessera:
                 - crs: Coordinate reference system of tile
 
         Raises:
-            FileNotFoundError: If auto_download=False and required tiles are missing
+            FileNotFoundError: If offline mode requires files that are missing.
+            RuntimeError: If a tile cannot be read and ``errors="raise"``.
+            ValueError: If the points or error policy are invalid.
 
         Examples:
             >>> # Auto-download mode (default): downloads tiles as needed
@@ -1540,23 +1522,29 @@ class GeoTessera:
         standardize: bool = True,
         progress_callback: Optional[callable] = None,
     ) -> List[Tuple[int, float, float, np.ndarray, object, object, Dict]]:
-        """Apply PCA to embedding tiles for visualization.
+        """Apply one sampled PCA model to a collection of embedding tiles.
+
+        Missing pixels remain NaN. The returned arrays contain float32
+        component scores, with one shared model fitted to a reproducible
+        sample of up to 100,000 valid pixels across the inputs.
 
         Args:
-            embeddings: List of (year, tile_lon, tile_lat, embedding_array, crs, transform) tuples
-            n_components: Number of principal components to extract (default: 3 for RGB)
-            standardize: Whether to standardize features before PCA
-            progress_callback: Optional callback function(current, total, status) for progress tracking
+            embeddings: Supply ``(year, lon, lat, array, crs, transform)``
+                tuples, with arrays shaped ``(height, width, bands)``.
+            n_components: Set the number of components. The default is 3.
+            standardize: Standardize features before fitting PCA. The default
+                is ``True``.
+            progress_callback: Call ``callback(current, total, status)``
+                after each tile is transformed.
 
         Returns:
-            List of tuples with PCA-transformed data:
-                (year, tile_lon, tile_lat, pca_array, crs, transform, pca_info)
-            where pca_info contains:
-                - explained_variance: Explained variance ratio for each component
-                - total_variance: Total explained variance
+            A list of ``(year, lon, lat, pca_array, crs, transform, pca_info)``
+            tuples. ``pca_info`` contains ``explained_variance``,
+            ``total_variance``, ``n_components``, and ``standardized``.
 
         Raises:
-            ImportError: If scikit-learn is not available
+            ValueError: If there are too few valid pixels or input bands
+                for the requested component count.
         """
         from .projection import fit_projection, transform_block
 
@@ -1600,20 +1588,24 @@ class GeoTessera:
     ) -> List[str]:
         """Export PCA-transformed embeddings as GeoTIFF files.
 
-        This method fetches embeddings, applies PCA transformation, and exports
-        the results as GeoTIFF files suitable for RGB visualization.
+        Fit one PCA model to a reproducible sample across the requested
+        tiles and write display-scaled uint8 components. Three components
+        produce RGB images; other counts produce data bands. Missing pixels
+        remain masked. Use ``apply_pca_to_embeddings`` for component scores.
 
         Args:
-            tiles_to_fetch: List of tiles as (year, tile_lon, tile_lat) tuples
-            output_dir: Directory to save PCA GeoTIFF files
-            n_components: Number of principal components (default: 3 for RGB)
-            standardize: Whether to standardize features before PCA
-            compress: Compression method for GeoTIFF
-            normalize: Whether to use global normalization across tiles (vs per-tile)
-            progress_callback: Optional callback function(current, total, status)
+            tiles_to_fetch: Supply ``(year, tile_lon, tile_lat)`` tuples.
+            output_dir: Write the PCA GeoTIFF files to this directory.
+            n_components: Set the number of output components. The default is 3.
+            standardize: Standardize features before PCA. The default is ``True``.
+            compress: Set GeoTIFF compression. The default is ``"lzw"``.
+            normalize: Use a shared display scale across tiles. The default is
+                ``True``. Set ``False`` to scale each tile separately.
+            progress_callback: Report progress through
+                ``callback(current, total, status)``.
 
         Returns:
-            List of paths to created PCA GeoTIFF files
+            Return the paths of the created PCA GeoTIFF files.
         """
         import tempfile
         import shutil

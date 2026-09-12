@@ -22,7 +22,7 @@ The library follows a layered architecture:
 .. code-block::
 
     User Interface Layer
-    ├── CLI Commands (geotessera download --source tiles, visualize, etc.)
+    ├── CLI Commands (geotessera download, visualize, webmap, etc.)
     └── Python API (GeoTessera class)
             ↓
     Core Processing Layer

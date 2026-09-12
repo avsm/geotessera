@@ -213,6 +213,31 @@ The ``sample_embeddings_at_points()`` method provides an efficient way to extrac
         print(f"  Std: {np.std(embeddings[i]):.3f}")
         print(f"  First 5 channels: {embeddings[i][:5]}")
 
+.. _sampling-errors:
+
+Handle Sampling Errors
+~~~~~~~~~~~~~~~~~~~~~~
+
+``sample_embeddings_at_points`` returns samples in input order and raises
+on tile read failures by default. Points outside coverage return NaN.
+GeoDataFrame inputs must declare their CRS and contain nonempty points;
+coordinates are transformed to WGS84 before sampling. Local GeoTIFF and NPY
+tiles are both supported.
+
+Use ``errors="coerce"`` to keep NaN rows for failed reads. Request metadata
+to inspect each error::
+
+    embeddings, metadata = gt.sample_embeddings_at_points(
+        points, year=2024, errors="coerce", include_metadata=True
+    )
+    for item in metadata:
+        if item and "error" in item:
+            print(item["error"])
+
+This option handles tile read errors. Invalid inputs and missing files in
+offline mode still raise. ``fetch_embeddings`` also raises if a requested
+tile cannot be fetched.
+
 Get Metadata About Samples
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -347,40 +372,35 @@ Check the georeferencing information::
 Create PCA Visualization
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
-Create a PCA visualization from the exported tiles::
+Create a PCA image from the exported embeddings::
 
-    # Using CLI:
-    # geotessera visualize ./london_rgb pca_rgb_mosaic.tif
-    # geotessera visualize ./london_full pca_full_mosaic.tif --n-components 5
-    
-    # This creates a PCA-based RGB mosaic that:
-    # 1. Combines all embedding data across tiles
-    # 2. Applies PCA transformation for dimensionality reduction
-    # 3. Maps first 3 principal components to RGB channels
-    # 4. Eliminates tiling artifacts through consistent PCA across region
-    
-    print("PCA mosaic created")
-    print("Next step: geotessera webmap pca_rgb_mosaic.tif --serve")
+    geotessera visualize ./london_full pca_mosaic.tif
+
+One PCA model is fitted to a reproducible sample of up to 100,000 valid
+pixels across the inputs. The same model and color scale are applied to
+all tiles in windows. Missing pixels remain masked. The output is a
+three-band uint8 visualization; use the original embeddings for analysis.
+
+Set ``--balance percentile`` with ``--percentile-low`` and
+``--percentile-high`` to change the display range. See :doc:`cli_reference`
+for the available options.
 
 Generate Web Tiles and Viewer
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Create interactive web tiles from the PCA mosaic::
+Create web tiles and serve the PCA image::
 
-    # Using CLI:
-    # geotessera webmap pca_rgb_mosaic.tif --serve
-    
-    # This command automatically:
-    # 1. Reprojects mosaic for web viewing if needed
-    # 2. Generates web tiles at multiple zoom levels
-    # 3. Creates HTML viewer with Leaflet map
-    # 4. Starts web server and opens in browser
-    
-    # For custom options:
-    # geotessera webmap pca_rgb_mosaic.tif --min-zoom 6 --max-zoom 18 --output webmap/ --serve
-    
-    print("Web tiles and viewer created")
-    print("Interactive map should open in your browser")
+    geotessera webmap pca_mosaic.tif --output map/ --serve
+
+Matching completed tiles are reused on repeated runs. Keep the output
+directory and its JSON completion files. Use ``--force`` to regenerate
+the tiles, or serve the existing output directly::
+
+    geotessera serve map/ --html viewer.html
+
+The map directory can be moved or served elsewhere because the viewer
+uses relative tile paths. Tile generation requires the GDAL command-line
+tools.
 
 QGIS Integration
 ~~~~~~~~~~~~~~~~
