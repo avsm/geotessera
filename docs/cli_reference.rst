@@ -1,68 +1,15 @@
 CLI Reference
 =============
 
-GeoTessera provides a comprehensive command-line interface for downloading, visualizing, and serving Tessera embeddings.
+``geotessera`` reads, exports, and displays Tessera embeddings.
 
-Global Options
---------------
+Synopsis
+--------
 
-Data-fetching commands (``download``, ``coverage``, ``info``) share the
-dataset-selection options::
+::
 
-    --dataset-version TEXT    Tessera dataset version (default: v1).
-                              Accepts v1, 1.0, v1.0, v1.1, 1.1 etc.
-    --dataset-variant TEXT    Tessera dataset variant (default: the
-                              version's default variant: vultr for 1.0,
-                              cambridge for 1.1, 2B-L~beta1 for 2.0). Run
-                              'geotessera info' to list all datasets.
-    --verbose, -v             Enable verbose output
-    --help                    Show help message
-
-The ``download`` and ``coverage`` commands additionally accept manifest
-location overrides (``info`` does not)::
-
-    --cache-dir PATH          Custom cache directory for the manifest
-    --registry-dir PATH       Directory containing manifest.parquet + landmasks.parquet
-
-To point at a single local manifest file from Python, use the
-``GeoTessera(registry_path=...)`` parameter (there is no equivalent CLI flag).
-
-.. note::
-
-   **Dataset versions and variants**: several Tessera datasets now live on
-   the Source Cooperative repository — ``1.0/vultr`` (default), ``1.1/
-   cambridge``, and the ``2.0/2B-L~beta1`` beta, with a complete-global
-   ``1.1/dclimate`` run reserved as *coming soon*. **To list them, run
-   ``geotessera info``** — its "Known Datasets" table shows every
-   (version, variant) pair, its repository directory, its availability,
-   and which variant is each version's default. Prefer ``1.1`` /
-   ``cambridge`` for new work — the legacy 1.0 line is frozen but remains
-   the default as the only version with full global coverage. **Never mix
-   versions or variants within the same downstream task** — they are
-   independently learned feature spaces and not interchangeable. See
-   :ref:`dataset-versions` in the main index for the full picture.
-
-Cache Configuration
--------------------
-
-Control where the Parquet manifest is cached:
-
-.. code-block:: bash
-
-    # Use custom cache directory for the per-version manifest
-    geotessera download --cache-dir /path/to/cache ...
-
-    # Use locally-supplied manifests (e.g. a checked-in offline copy);
-    # the directory should hold manifest.parquet and landmasks.parquet
-    geotessera download --registry-dir /path/to/manifest-dir ...
-
-    # Default cache locations (if not specified):
-    # - Linux/macOS: ~/.cache/geotessera/{v1,v1.1-cam,...}/manifest.parquet
-    # - Windows:     %LOCALAPPDATA%/geotessera/{v1,v1.1-cam,...}/manifest.parquet
-
-Note: Embedding tiles land in the user-supplied ``--output`` directory and
-persist there for reuse. Only the per-version manifest + landmasks parquet
-(~a few MB each) is kept in the cache directory.
+    geotessera COMMAND [OPTIONS]
+    geotessera COMMAND --help
 
 Commands
 --------
@@ -70,561 +17,417 @@ Commands
 download
 ~~~~~~~~
 
-Download embeddings for a region in numpy or GeoTIFF format.
+::
 
-**Usage**::
+    geotessera download [OPTIONS] --output DIRECTORY
 
-    geotessera download [OPTIONS]
+Export a region as GeoTIFF files or download individual embedding tiles.
+Specify one region selector from :ref:`cli-regions`.
 
-**Required Options**:
+``--source auto|zarr|tiles``
+    Select the data source. The default, ``auto``, uses Zarr for TIFF
+    output and individual tiles for NPY output or ``--registry-dir``.
+    Zarr supports TIFF output only.
 
-* ``-o, --output PATH`` - Output directory [required]
+``-o, --output DIRECTORY``
+    Write files to this directory. This option is required unless
+    ``--dry-run`` is set.
 
-**Region Definition** (one required):
+``-f, --format tiff|npy``
+    Select the output format. The default is ``tiff``. NPY downloads
+    contain quantized embeddings, scale arrays, and landmask GeoTIFFs.
 
-* ``--bbox TEXT`` - Bounding box: 'min_lon,min_lat,max_lon,max_lat'
-* ``--region-file PATH`` - GeoJSON/Shapefile to define region (supports local files or URLs)
-* ``--country TEXT`` - Country name (e.g., 'United Kingdom', 'UK', 'GB')
+``--year INTEGER``
+    Select the embedding year. The default is 2024.
 
-**Format Options**:
+``--bands LIST``
+    Select comma-separated, zero-based embedding bands in the given order.
+    The default is all bands at the selected depth. This option applies
+    to TIFF output.
 
-* ``-f, --format TEXT`` - Output format: 'tiff' or 'npy' (default: tiff)
-* ``--bands TEXT`` - Comma-separated band indices (default: all 128)
-* ``--compress TEXT`` - Compression for TIFF format (default: lzw)
+``--depth INTEGER``
+    Read a published matryoshka prefix from Zarr. The default is the full
+    embedding. Band indices refer to the selected prefix. A store without
+    the requested depth reports an error.
 
-**Data Selection**:
+``--compress TEXT``
+    Set the GeoTIFF compression method. The default is ``lzw``.
 
-* ``--year INT`` - Year of embeddings (default: 2024)
-* ``--dataset-version TEXT`` - Tessera dataset version (``v1`` / ``1.0`` /
-  ``v1.1`` / ``1.1``; default ``v1``). Pick **once per project**.
-* ``--dataset-variant TEXT`` - Tessera dataset variant (default: the version's
-  default variant). Run ``geotessera info`` to list all datasets.
+``--dry-run``
+    Read metadata and report the size without downloading embeddings.
+    Zarr mode reports uncompressed output bytes. NPY mode totals the source embedding, scale,
+    and landmask file sizes. Tile TIFF mode estimates output size from the
+    source metadata. Compressed GeoTIFF sizes and Zarr transfer sizes depend
+    on the data and chunk layout.
 
-**Other Options**:
+``--list-files``
+    List individual tile output files with their sizes. Zarr exports
+    always print the output paths.
 
-* ``--list-files`` - List all created files with details
-* ``-v, --verbose`` - Verbose output
+``-v, --verbose``
+    Print additional tile download details.
 
-.. warning::
+Dataset, store, and cache options are described in :ref:`cli-data-source`.
 
-   Re-running ``download`` into a directory that already contains a different
-   ``(version, variant)`` will silently mix tiles — the local layout is the
-   same regardless of variant. Always use a fresh ``--output`` dir per
-   ``(version, variant)`` and check the ``tessera_metadata.json`` sidecar
-   if you're unsure which run produced the contents.
+Output and repeated runs
+^^^^^^^^^^^^^^^^^^^^^^^^
 
-**Resume Behaviour**:
+Zarr exports write ``tessera_YEAR_utmNN.tif`` for each intersecting UTM zone.
+Each file contains dequantized float32 values on the native grid, with NaN
+nodata, band descriptions, and source metadata. Output windows enclose the
+requested bounds within the available zone grid. Large outputs use BigTIFF
+when needed.
 
-Both TIFF and NPY downloads automatically skip files that already exist on
-disk, so interrupted downloads can be resumed by re-running the same command.
-The progress bar reflects only remaining work.
+Each destination is replaced only after the new Zarr export file is complete.
+Rerunning repeats the export, including zones completed before a failure.
+Use a separate output directory for each region and dataset to keep their
+files separate.
 
-**Examples**::
+Individual tile downloads use the
+``global_0.1_degree_representation/YEAR/grid_LON_LAT/`` layout. NPY scale
+files accompany the embedding arrays, and landmasks are stored under
+``global_0.1_degree_tiff_all/``. ``tessera_metadata.json`` records the dataset
+version and variant.
 
-    # Download as GeoTIFF (georeferenced, for GIS)
-    geotessera download \
-        --bbox "-0.2,51.4,0.1,51.6" \
-        --year 2024 \
-        --output ./london_tiffs
-    # Next step: geotessera visualize ./london_tiffs pca_mosaic.tif
+Tile downloads skip existing files. Rerun the same command to continue an
+interrupted download. Use a new output directory when changing the dataset
+or exported bands, since existing tiles are reused by filename.
 
-    # Download as numpy arrays (for analysis)
-    geotessera download \
-        --bbox "-0.2,51.4,0.1,51.6" \
-        --format npy \
-        --year 2024 \
-        --output ./london_arrays
+Examples
+^^^^^^^^
 
-    # Download specific bands only
-    geotessera download \
-        --bbox "-0.2,51.4,0.1,51.6" \
-        --bands "0,1,2,10,20,30" \
-        --year 2024 \
-        --output ./london_subset
-    # Next step: geotessera visualize ./london_subset pca_mosaic.tif
+Export three embedding bands from Zarr::
 
-    # Download by country name
-    geotessera download \
-        --country "United Kingdom" \
-        --year 2024 \
-        --output ./uk_tiles
-    # Next step: geotessera visualize ./uk_tiles pca_mosaic.tif
+    geotessera download --bbox '-3.0,53.4,-2.9,53.5' \
+        --year 2024 --bands 0,1,2 --output region/
 
-    # Download using a region file
-    geotessera download \
-        --region-file cambridge.geojson \
-        --format tiff \
-        --year 2024 \
-        --output ./cambridge_tiles
-    # Next step: geotessera visualize ./cambridge_tiles pca_mosaic.tif
+Export from a local Zarr store::
 
-    # Download v1.1 / cambridge embeddings (recommended for new work)
-    geotessera download \
-        --dataset-version v1.1 \
-        --dataset-variant cambridge \
-        --region-file cambridge.geojson \
-        --year 2024 \
-        --output ./cambridge_v11
-    # Note the tessera_metadata.json sidecar dropped alongside the tiles —
-    # it records the (version, variant) provenance for this output dir.
+    geotessera download --store-url /data/tessera.zarr \
+        --bbox '-3.0,53.4,-2.9,53.5' --year 2024 --output region/
 
-**Output Formats**:
+Estimate an export from a published prefix::
 
-**TIFF Format** (``--format tiff``):
-    - Creates georeferenced GeoTIFF files with native UTM projections
-    - Each tile preserves its native UTM projection from landmask tiles
-    - Includes accurate CRS and transform metadata
-    - Suitable for GIS software (QGIS, ArcGIS, etc.)
-    - Supports compression (lzw, deflate, none)
-    - Registry directory structure: ``global_0.1_degree_representation/{year}/grid_{lon}_{lat}/grid_{lon}_{lat}_{year}.tiff``
-    - Supports resume: interrupted downloads skip existing files
+    geotessera download --dataset-version v2 --depth 16 \
+        --bbox '-3.0,53.4,-2.9,53.5' --year 2024 --dry-run
 
-**NPY Format** (``--format npy``):
-    - Downloads quantized numpy arrays (.npy) with separate scale files and landmask TIFFs
-    - Registry directory structure: ``global_0.1_degree_representation/{year}/grid_{lon}_{lat}/``
-    - Embedding files: ``grid_{lon}_{lat}.npy`` (int8 quantized)
-    - Scale files: ``grid_{lon}_{lat}_scales.npy`` (float32)
-    - Landmask TIFFs: ``global_0.1_degree_tiff_all/grid_{lon}_{lat}.tiff`` (CRS and transform)
-    - Dequantize with: ``embedding = quantized.astype(np.float32) * scales``
-    - Supports resume: interrupted downloads skip existing files
+Download an individual tile as GeoTIFF or raw NPY files::
+
+    geotessera download --source tiles --tile '0.17,52.23' --output tiles/
+    geotessera download --format npy --tile '0.17,52.23' --output arrays/
 
 visualize
 ~~~~~~~~~
 
-Create PCA visualization from multiband GeoTIFF files.
-
-**Usage**::
+::
 
     geotessera visualize INPUT_PATH OUTPUT_FILE [OPTIONS]
 
-**Required Arguments**:
+Create a PCA mosaic from a GeoTIFF file or a directory of GeoTIFF or NPY
+tiles. NPY input must include its scale arrays and landmask GeoTIFFs.
 
-* ``INPUT_PATH`` - Path to GeoTIFF file or directory containing GeoTIFFs
-* ``OUTPUT_FILE`` - Output PCA mosaic file (.tif)
+The command fits one PCA model to a reproducible sample of up to 100,000
+valid pixels across the inputs. It applies the same model and color scale
+to every input and processes the rasters in windows. Pixels with missing
+values remain masked. Colors may differ from earlier releases that fitted
+PCA separately for each tile or used every pixel.
 
-**PCA Options**:
+The output contains the first three components as a display-scaled uint8
+RGB image, or fewer bands if fewer components are requested. Additional
+components contribute to the variance metadata but are not written to the
+mosaic. Use the original embeddings for analysis.
 
-* ``--n-components INT`` - Number of PCA components (default: 3). Only first 3 used for RGB visualization - increase for analysis/research.
-* ``--crs TEXT`` - Target CRS for reprojection (default: EPSG:3857)
+``--n-components INTEGER``
+    Set the number of PCA components to fit. The default is 3. The count must
+    not exceed the number of input bands or valid sampled pixels.
 
-**RGB Balance Options**:
+``--crs TEXT``
+    Set the output coordinate reference system. The default is
+    ``EPSG:3857``.
 
-* ``--balance TEXT`` - RGB balance method: histogram (default), percentile, or adaptive
-* ``--percentile-low FLOAT`` - Lower percentile for percentile balance method (default: 2.0)
-* ``--percentile-high FLOAT`` - Upper percentile for percentile balance method (default: 98.0)
+``--balance histogram|percentile|adaptive``
+    Set the color scaling method. The default, ``histogram``, equalizes
+    the sampled distribution. ``percentile`` clips to the selected
+    percentiles. ``adaptive`` uses the sampled mean and standard deviation.
 
-**Examples**::
+``--percentile-low FLOAT``, ``--percentile-high FLOAT``
+    Set the lower and upper bounds for percentile scaling. The defaults
+    are 2 and 98. Use these options with ``--balance percentile``.
 
-    # Create PCA visualization (3 components optimal for RGB)
-    geotessera visualize tiles/ pca_mosaic.tif
+Create a PCA image and display it as a web map::
 
-    # Use histogram equalization for maximum contrast
-    geotessera visualize tiles/ pca_balanced.tif --balance histogram
-
-    # Use adaptive scaling based on variance
-    geotessera visualize tiles/ pca_adaptive.tif --balance adaptive
-
-    # Custom percentile range for outlier-robust scaling
-    geotessera visualize tiles/ pca_custom.tif --percentile-low 5 --percentile-high 95
-
-    # Use custom projection
-    geotessera visualize tiles/ pca_mosaic.tif --crs EPSG:4326
-
-    # PCA for research - compute more components for analysis
-    # (still only uses first 3 for RGB, but saves variance info)
-    geotessera visualize tiles/ pca_research.tif --n-components 10
-
-**PCA Visualization Process**:
-
-1. **Data Combination**: Combines all embedding data across tiles
-2. **PCA Transformation**: Applies a single PCA transformation to the combined dataset
-3. **RGB Mosaic**: Creates a unified RGB mosaic from the first 3 principal components
-4. **Consistent Components**: Ensures consistent principal components across the entire region, eliminating tiling artifacts
-
-**Balance Methods**:
-
-* ``histogram`` - Histogram equalization for maximum contrast
-* ``percentile`` - Uses percentile range for outlier-robust scaling
-* ``adaptive`` - Adaptive scaling based on variance
-
-**Next Steps**: After creating PCA visualization, use ``geotessera webmap`` to create interactive web tiles
+    geotessera visualize region/ pca.tif
+    geotessera webmap pca.tif --output map/ --serve
 
 webmap
 ~~~~~~
 
-Create web tiles and viewer from a 3-band RGB mosaic.
+::
 
-**Usage**::
+    geotessera webmap [RGB_MOSAIC] [OPTIONS]
 
-    geotessera webmap RGB_MOSAIC [OPTIONS]
+Create web tiles and ``viewer.html`` from a three-band RGB GeoTIFF.
+Omit ``RGB_MOSAIC`` and specify one region selector to read directly from
+Zarr. Region mode maps three embedding bands to RGB using a common min/max
+scale across the region. Use ``visualize`` first to create a PCA map.
 
-**Required Arguments**:
+Tile generation requires the GDAL command-line tools on ``PATH``. The map
+uses Web Mercator (``EPSG:3857``). Serve the output directory over HTTP to
+view the map.
 
-* ``RGB_MOSAIC`` - 3-band RGB mosaic GeoTIFF file
+``-o, --output DIRECTORY``
+    Write the viewer, tiles, and intermediate rasters to this directory.
+    The default is ``tessera_webmap`` for a region, or
+    ``RGB_MOSAIC_STEM_webmap`` for a local image.
 
-**Options**:
+``--bands LIST``
+    Select exactly three comma-separated, zero-based embedding bands for
+    a Zarr region. The default is ``0,1,2``.
 
-* ``-o, --output PATH`` - Output directory
-* ``--min-zoom INT`` - Min zoom for web tiles (default: 8)
-* ``--max-zoom INT`` - Max zoom for web tiles (default: 15)
-* ``--initial-zoom INT`` - Initial zoom level (default: 10)
-* ``--force/--no-force`` - Force regeneration of tiles even if they exist
-* ``--serve/--no-serve`` - Start web server immediately
-* ``-p, --port INT`` - Port for web server (default: 8000)
-* ``--region-file PATH`` - GeoJSON/Shapefile boundary to overlay (supports local files or URLs)
-* ``--use-gdal-raster/--use-gdal2tiles`` - Use newer gdal raster tile vs gdal2tiles (default: gdal2tiles)
+``--year INTEGER``, ``--depth INTEGER``
+    Select the year and published embedding prefix for a Zarr region.
+    The defaults are 2024 and the full embedding.
 
-**Examples**::
+``--region-file PATH_OR_URL``
+    Read a vector boundary and overlay it on the map. In region mode,
+    this also selects the bounding box to stream. With ``RGB_MOSAIC``,
+    it adds an overlay without changing the image extent.
 
-    # Create web tiles from PCA mosaic and serve immediately
-    geotessera webmap pca_mosaic.tif --serve
+``--min-zoom INTEGER``, ``--max-zoom INTEGER``
+    Set the range of zoom levels to generate, inclusive. The defaults
+    are 8 and 15. Values must satisfy ``0 <= min <= max <= 24``.
 
-    # Create web tiles with custom zoom levels
-    geotessera webmap pca_mosaic.tif --min-zoom 6 --max-zoom 18 --output webmap/
+``--initial-zoom INTEGER``
+    Set the viewer's initial zoom level. The default is 10.
 
-    # Add region boundary overlay
-    geotessera webmap pca_mosaic.tif --region-file study_area.geojson --serve
+``--force/--no-force``
+    Regenerate the streamed RGB mosaic and web tiles. The default is
+    ``--no-force``. Use ``--force`` when data changes at the same store URL.
 
-    # Force regeneration of existing tiles
-    geotessera webmap pca_mosaic.tif --force --serve
+``--serve/--no-serve``
+    Start the web server and open a browser after generating the map.
+    The default is ``--no-serve``. With ``--serve``, an occupied port
+    causes an error before processing starts.
 
-**Process**:
-1. Reprojects mosaic to EPSG:3857 for web viewing if needed
-2. Generates web tiles at specified zoom levels
-3. Creates HTML viewer with Leaflet map
-4. Optionally starts web server for immediate viewing
+``-p, --port INTEGER``
+    Set the web server port. The default is 8000.
 
+``--use-gdal-raster/--use-gdal2tiles``
+    Select the GDAL tile generator. The default is ``--use-gdal2tiles``.
+    ``--use-gdal-raster`` requires a GDAL installation with ``gdal raster tile``.
+
+Region mode also accepts the options in :ref:`cli-regions` and
+:ref:`cli-data-source`, except ``--registry-dir``.
+
+Repeated runs
+^^^^^^^^^^^^^
+
+Matching completed RGB mosaics and tiles are reused. Changing the zoom
+range rebuilds tiles without reading the embeddings again. Interrupted
+tile generation restarts from the completed RGB mosaic; interrupted RGB
+generation reads the region again.
+
+Keep the output directory and its JSON completion files to retain this
+behavior. The Zarr read cache does not replace the completed map output.
+The viewer uses relative tile paths, so the directory can be moved or
+served from another location.
+
+Create a map directly from a region::
+
+    geotessera webmap --bbox '-3.0,53.4,-2.9,53.5' \
+        --year 2024 --bands 0,1,2 --output map/ --serve
+
+Rebuild the tiles at a different zoom range::
+
+    geotessera webmap --bbox '-3.0,53.4,-2.9,53.5' \
+        --year 2024 --bands 0,1,2 --output map/ --min-zoom 6 --max-zoom 16
 
 serve
 ~~~~~
 
-Start a web server to serve visualization files.
-
-**Usage**::
+::
 
     geotessera serve DIRECTORY [OPTIONS]
 
-**Required Arguments**:
+Serve all files in ``DIRECTORY`` over HTTP. This command displays an
+existing web map without regenerating it. An occupied port causes an
+error. Press Ctrl+C to stop the server.
 
-* ``DIRECTORY`` - Directory containing web visualization files
+``-p, --port INTEGER``
+    Set the listening port. The default is 8000.
 
-**Options**:
+``--open/--no-open``
+    Open the viewer in a browser. The default is ``--open``.
 
-* ``-p, --port INT`` - Port number for web server (default: 8000)
-* ``--open/--no-open`` - Auto-open browser (default: open)
-* ``--html TEXT`` - Specific HTML file to serve
+``--html PATH``
+    Select an HTML file relative to ``DIRECTORY``. If omitted, the server
+    looks for ``index.html``, ``viewer.html``, ``map.html``, then
+    ``coverage.html``.
 
-**Examples**::
+Serve an existing map on a different port::
 
-    # Serve web visualization and open browser
-    geotessera serve ./london_web --open
-
-    # Serve on specific port
-    geotessera serve ./london_web --port 8080
-
-    # Serve specific HTML file
-    geotessera serve ./visualizations --html coverage.html
-
-    # Serve without auto-opening browser
-    geotessera serve ./london_web --no-open
-
-**Notes**:
-    - The server automatically finds HTML files (index.html, viewer.html, etc.)
-    - Use Ctrl+C to stop the server
-    - The server serves all files in the directory
-    - Required for viewing Leaflet-based web maps
+    geotessera serve map/ --port 8001 --html viewer.html
 
 coverage
 ~~~~~~~~
 
-Generate a world map showing Tessera embedding coverage.
-
-**Usage**::
+::
 
     geotessera coverage [OPTIONS]
 
-**Output Options**:
+Show embedding availability as a PNG map, JSON coverage files, and an HTML
+globe. Region selectors limit the PNG map and outline vector boundaries;
+the globe shows global coverage.
 
-* ``-o, --output PATH`` - Output PNG file path (default: tessera_coverage.png)
+``-o, --output PATH``
+    Set the PNG filename or output directory. The default is
+    ``tessera_coverage.png``. Supporting JSON files, textures, and
+    ``globe.html`` are written alongside the PNG.
 
-**Data Selection**:
+``--year INTEGER``
+    Show coverage for one year. If omitted, show all available years.
 
-* ``--year INT`` - Specific year to visualize (default: all years)
-* ``--region-file PATH`` - GeoJSON/Shapefile to focus coverage map on specific region (supports local files or URLs)
-* ``--country TEXT`` - Country name to focus coverage map on with precise boundary outline (e.g., 'United Kingdom', 'UK', 'GB')
-* ``--dataset-version TEXT`` - Tessera dataset version. Pass ``all`` with
-  ``--by-source`` to render every known version.
-* ``--dataset-variant TEXT`` - Tessera dataset variant. Pass ``all`` with
-  ``--by-source`` to render every variant.
+``--by-source``
+    Show each dataset version and variant in a separate color, with
+    selectable layers in the globe. Omitted version and variant options
+    select all known datasets in this mode. Otherwise the default is
+    ``v1`` and its default variant.
 
-**Multi-source rendering**:
+``--tile-color TEXT``
+    Set the tile color when year-based colors are disabled. The default
+    is ``red``.
 
-* ``--by-source`` - Render each ``(version, variant)`` in a distinct hue with
-  per-dataset checkboxes in the generated ``globe.html``. Each tile's shade
-  encodes how many years of coverage it has (pale = 1 year, saturated =
-  all years for that dataset). Without ``--dataset-version`` /
-  ``--dataset-variant`` overrides, defaults to ``all`` on both axes —
-  downloads every known version's manifest and renders them side-by-side.
+``--tile-alpha FLOAT``
+    Set tile opacity from 0 to 1. The default is 0.6.
 
-**Visualization Options**:
+``--tile-size FLOAT``
+    Set the tile size multiplier. The default is 1.0.
 
-* ``--tile-color TEXT`` - Color for tile rectangles (default: red)
-* ``--tile-alpha FLOAT`` - Transparency of tiles 0.0-1.0 (default: 0.6)
-* ``--tile-size FLOAT`` - Size multiplier for tiles (default: 1.0)
-* ``--no-multi-year-colors`` - Disable multi-year color coding
+``--width INTEGER``
+    Set the PNG width in pixels. The default is 2000.
 
-**Map Options**:
+``--no-countries``
+    Hide country boundaries.
 
-* ``--width INT`` - Output image width in pixels (default: 2000)
-* ``--no-countries`` - Don't show country boundaries
+``--no-multi-year-colors``
+    Disable the default year-based colors. These colors show tiles with
+    all years in green, only the latest year in blue, and other year
+    combinations in orange.
 
-**Examples**::
+``-v, --verbose``
+    Print additional coverage details.
 
-    # STEP 1: Check coverage for your region (recommended first step)
-    geotessera coverage --region-file study_area.geojson
-    geotessera coverage --region-file colombia_aoi.gpkg
-    geotessera coverage --country "United Kingdom"
-    geotessera coverage --country "Colombia"
+This command accepts :ref:`cli-regions` and the dataset and manifest
+options in :ref:`cli-data-source`. It does not accept ``--store-url``.
 
-    # Check coverage for specific year only
-    geotessera coverage --region-file study_area.shp --year 2024
-    geotessera coverage --country "UK" --year 2024
+Inspect coverage for a region or compare datasets::
 
-    # Global coverage overview (all regions)
-    geotessera coverage
-
-    # Global coverage for specific year
-    geotessera coverage --year 2024
-
-    # Customize visualization
-    geotessera coverage --region-file area.geojson --tile-alpha 0.3
-    geotessera coverage --country "Germany" --tile-alpha 0.3
-
-    # Show every dataset version on one map, with a layer-toggle UI in
-    # globe.html. Each (version, variant) gets a distinct hue family;
-    # within each hue, shade indicates how many years are covered.
-    geotessera coverage --by-source --output ./multi
-    # Output: multi/{tessera_coverage.png, coverage.json,
-    #              coverage_texture_v1_vultr.png, coverage_v1_vultr_*.json,
-    #              coverage_texture_v1.1_cambridge.png, coverage_v1.1_cambridge_*.json,
-    #              globe.html}
-
-    # Focus on a single (version, variant) but still get the per-dataset
-    # legend / by-source coverage.json schema:
-    geotessera coverage --by-source --dataset-version v1.1 \
-        --dataset-variant cambridge --output ./v11_only
-
-**Multi-Year Color Coding** (default when no specific year requested):
-    - **Green**: All available years present for this tile
-    - **Blue**: Only the latest year available for this tile  
-    - **Orange**: Partial years coverage (some combination of years)
-
-**Output**:
-    - High-resolution PNG world map with available tile coverage
-    - Colored rectangles show available tile locations (one per 0.1° × 0.1° tile)
-    - **Boundary Visualization**: Country/region boundaries are precisely outlined when using ``--country`` or ``--region-file``
-    - Global country boundaries are hidden when focusing on specific regions for cleaner visualization
-    - Statistics and next-step hints shown after generation
-
-**Next Steps**: After checking coverage, proceed to download data using the same region file or bounding box
+    geotessera coverage --country 'United Kingdom' --year 2024
+    geotessera coverage --by-source --output coverage/
 
 info
 ~~~~
 
-Display information about GeoTIFF files or the library.
-
-**Usage**::
+::
 
     geotessera info [OPTIONS]
 
-**Options**:
+Show library information and known dataset versions and variants. The
+dataset table lists availability and each version's default variant.
 
-* ``--tiles PATH`` - Analyze tile files/directory (GeoTIFF or NPY format)
-* ``--geotiffs PATH`` - Alias for --tiles (deprecated)
-* ``--dataset-version TEXT`` - Tessera dataset version (default: ``v1``)
-* ``--dataset-variant TEXT`` - Tessera dataset variant (default: the version's default variant)
-* ``-v, --verbose`` - Verbose output
+``--tiles PATH``
+    Inspect a local GeoTIFF or NPY file or directory. Report the files,
+    years, bounds, coordinate reference systems, and band counts.
 
-**Examples**::
+``--geotiffs PATH``
+    Use the deprecated alias for ``--tiles``.
 
-    # Show library information for the default 1.0/vultr line, plus the
-    # "Known Datasets" table listing every (version, variant) pair
-    geotessera info
+``--dataset-version TEXT``, ``--dataset-variant TEXT``
+    Select the dataset for registry information. The defaults are ``v1``
+    and that version's default variant.
 
-    # Inspect v1.1/cambridge — broader 2015–2025 year range, newer model
-    geotessera info --dataset-version v1.1 --dataset-variant cambridge
+``-v, --verbose``
+    Include individual tile details.
 
-    # Analyze downloaded tiles (GeoTIFF or NPY)
-    geotessera info --tiles ./london_tiffs
+Inspect exported files::
 
-    # Analyze single GeoTIFF file
-    geotessera info --tiles ./london_tiffs/grid_51.45_-0.05.tif
+    geotessera info --tiles region/ --verbose
 
-    # Verbose library info
-    geotessera info --verbose
+version
+~~~~~~~
 
-**Output for Library Info**:
-    - GeoTessera version
-    - Available years in dataset
-    - Registry information
-    - Loaded blocks count
-    - **Known Datasets table**: every known (version, variant) pair with
-      its repository directory and status — ``available`` or ``coming
-      soon`` (e.g. the reserved ``1.1/dclimate`` complete-global run) —
-      and a ``(default)`` marker on each version's default variant. This
-      is the way to discover valid ``--dataset-version`` /
-      ``--dataset-variant`` combinations.
+::
 
-**Output for GeoTIFF Analysis**:
-    - Total files analyzed
-    - Years covered
-    - Coordinate reference systems used
-    - Bounding box of all files
-    - Band count statistics
-    - Individual tile information (with ``--verbose``)
-
-Common Workflows
-----------------
-
-Basic Download and View
-~~~~~~~~~~~~~~~~~~~~~~~
-
-Complete workflow from coverage check to web visualization::
-
-    # 1. Check data availability (RECOMMENDED FIRST STEP)
-    geotessera coverage --year 2024 --output coverage.png
-
-    # 2. Download data
-    geotessera download \
-        --bbox "-0.2,51.4,0.1,51.6" \
-        --year 2024 \
-        --output ./london_data
-
-    # 3. Create PCA visualization
-    geotessera visualize ./london_data pca_mosaic.tif
-
-    # 4. Create web tiles and serve
-    geotessera webmap pca_mosaic.tif --serve
-
-Analysis Workflow
-~~~~~~~~~~~~~~~~~
-
-Download for analysis purposes::
-
-    # 1. Check coverage for your analysis region
-    geotessera coverage --bbox "-0.1,52.0,0.1,52.2" --year 2024
-
-    # 2. Download as numpy arrays
-    geotessera download \
-        --bbox "-0.1,52.0,0.1,52.2" \
-        --format npy \
-        --year 2024 \
-        --output ./cambridge_analysis
-
-    # 3. Process in Python
-    python your_analysis_script.py
-
-    # 4. Export results as GeoTIFF for visualization
-    geotessera download \
-        --bbox "-0.1,52.0,0.1,52.2" \
-        --format tiff \
-        --year 2024 \
-        --output ./cambridge_viz
-
-    # 5. Create PCA visualization and web map
-    geotessera visualize ./cambridge_viz pca_analysis.tif
-    geotessera webmap pca_analysis.tif --serve
-
-GIS Workflow
-~~~~~~~~~~~~
-
-Prepare data for GIS software::
-
-    # 1. Check coverage for your region first
-    geotessera coverage --region-file study_area.geojson
-
-    # 2. Download with specific bands for analysis
-    geotessera download \
-        --region-file study_area.geojson \
-        --bands "10,20,30,40,50" \
-        --format tiff \
-        --compress lzw \
-        --year 2024 \
-        --output ./gis_data
-
-    # 3. Create PCA visualization for overview
-    geotessera visualize ./gis_data pca_overview.tif
-
-    # 4. Analyze files before importing to GIS
-    geotessera info --tiles ./gis_data --verbose
-
-    # Files are now ready for QGIS, ArcGIS, etc.
-    # Use pca_overview.tif for quick visual reference
-
-Troubleshooting
----------------
-
-Common Issues and Solutions
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-**"No tiles found in region"**:
-    - Check coverage map first: ``geotessera coverage --year 2024``
-    - Verify bounding box format: ``min_lon,min_lat,max_lon,max_lat``
-    - Try a different year or larger region
-
-**Slow downloads**:
-    - Files are cached after first download
-    - Use ``--verbose`` to see download progress
-    - Check network connection
-
-**Web visualization not working**:
-    - Use ``geotessera serve`` instead of opening HTML directly
-    - Check that tiles directory was created
-    - Try ``--force`` to regenerate tiles
-
-**Memory issues with large regions**:
-    - Download smaller regions at a time
-    - Use ``--bands`` to download only needed channels
-    - Use ``npy`` format for smaller file sizes
-
-**Permission errors**:
-    - Check write permissions for output directory
-    - Try using a different output directory
-    - Set custom cache directory: ``--cache-dir /tmp/geotessera``
-
-**GeoTIFF projection issues**:
-    - Files use native UTM projections (varies by location from landmask tiles)
-    - Each tile preserves its original projection for accuracy
-    - Most GIS software handles reprojection automatically
-    - Use ``geotessera info --tiles`` to check CRS for each tile
-    - Different tiles may have different UTM zones
-
-Getting Help
-~~~~~~~~~~~~
-
-For additional help::
-
-    # Command-specific help
-    geotessera download --help
-    geotessera visualize --help
-
-    # Version information
     geotessera version
 
-    # Library information
-    geotessera info --verbose
+Print the installed GeoTessera version.
 
-**Resources**:
-    - GitHub Issues: https://github.com/ucam-eo/geotessera/issues
-    - Documentation: https://geotessera.readthedocs.io/
-    - Examples: See tutorials section of documentation
+.. _cli-regions:
 
-Maintainer CLI
---------------
+Region selection
+----------------
 
-A second entry point, ``geotessera-registry``, is installed alongside
-``geotessera``. It is used by data maintainers to regenerate the per-version
-``manifest.parquet`` / ``landmasks.parquet`` files (by scanning the Source
-Cooperative repository with ``s3scan``), to checksum and validate local tile
-trees, and to build the Zarr store. End users don't need it — see
-:doc:`maintenance` for the full workflow.
+``--bbox WEST,SOUTH,EAST,NORTH``
+    Select WGS84 longitude and latitude bounds. A two-coordinate value,
+    ``LON,LAT``, selects the containing 0.1-degree tile.
+
+``--tile LON,LAT``
+    Select the 0.1-degree tile containing a WGS84 point.
+
+``--region-file PATH_OR_URL``
+    Read a vector region from a local file or URL. GeoJSON, Shapefile,
+    and GeoPackage are supported. The input must declare its CRS.
+
+``--country TEXT``
+    Select a country by name or code, such as ``United Kingdom`` or ``GB``.
+
+``download`` and region-based ``webmap`` require exactly one selector.
+``coverage`` permits no selector to show the world. Zarr exports use the
+bounding box of a country or vector region; they do not clip to its polygon.
+West must be less than east. Split regions crossing the antimeridian into
+two requests.
+
+.. _cli-data-source:
+
+Dataset and storage options
+---------------------------
+
+``--dataset-version TEXT``
+    Select a dataset version, such as ``v1``, ``v1.1``, or ``v2``. The
+    default is ``v1``. Run ``geotessera info`` to list known datasets.
+
+``--dataset-variant TEXT``
+    Select a variant within the version. If omitted, use the version's
+    default variant. Use one version and variant per analysis; their
+    embedding spaces are independently learned.
+
+``--store-url URL_OR_PATH``
+    Read a Zarr store from this URL or local path. This overrides the
+    store selected by the dataset options. Use it with Zarr downloads
+    or region-based web maps.
+
+``--cache-dir DIRECTORY``
+    Set the read cache directory. Zarr metadata persists between runs,
+    while byte-range reads of sharded embeddings are cached within the
+    process. Tile workflows cache manifests here and write embedding
+    files to ``--output``.
+
+``--registry-dir DIRECTORY``
+    Read ``manifest.parquet`` and ``landmasks.parquet`` from this directory.
+    This option applies to tile downloads and coverage. It selects tiles
+    when ``download --source auto`` is used and conflicts with an explicit
+    ``--source zarr``.
+
+Exit status
+-----------
+
+Commands return zero on success and a nonzero status for invalid arguments
+or processing failures. An incomplete NPY download returns a nonzero status.
+Files completed before a failure may remain in the output directory.
+
+See also
+--------
+
+:doc:`zarr_quickstart` describes the Python streaming API.
+:doc:`quickstart` describes individual tile downloads.
+:doc:`maintenance` describes ``geotessera-registry`` for data maintainers.

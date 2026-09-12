@@ -1,7 +1,7 @@
 geotessera package
 ==================
 
-The GeoTessera package provides streamlined access to Tessera geospatial embeddings through a clean Python API and comprehensive CLI.
+The GeoTessera package reads, exports, and displays Tessera embeddings.
 
 Package Overview
 ----------------
@@ -19,14 +19,10 @@ API Reference
 :mod:`geotessera.core` -- Core Functionality
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The main interface for accessing Tessera embeddings. Contains the primary :class:`~geotessera.GeoTessera` class with methods for fetching embeddings with CRS information and exporting to various formats while preserving native UTM projections.
-
-**Key Features:**
-
-* :meth:`~geotessera.GeoTessera.fetch_embedding` - Fetch a single embedding tile with CRS and transform
-* :meth:`~geotessera.GeoTessera.fetch_embeddings` - Fetch multiple tiles in a bounding box with projection info
-* :meth:`~geotessera.GeoTessera.export_embedding_geotiff` - Export single embedding as GeoTIFF with native UTM
-* :meth:`~geotessera.GeoTessera.export_embedding_geotiffs` - Export multiple embeddings as GeoTIFF files
+``GeoTessera`` downloads individual tiles, samples points from local
+GeoTIFF or NPY files, and exports rasters on their native UTM grids.
+:meth:`~geotessera.GeoTessera.sample_embeddings_at_points` accepts an
+explicit error policy. See :ref:`sampling-errors` for examples.
 
 .. automodule:: geotessera.core
    :members:
@@ -38,14 +34,8 @@ The main interface for accessing Tessera embeddings. Contains the primary :class
 :mod:`geotessera.registry` -- Registry Management
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Registry management for efficient data discovery and access. Handles the block-based registry system, lazy loading, and metadata management.
-
-**Key Features:**
-
-* :class:`~geotessera.registry.Registry` - Main registry class for data discovery
-* :func:`~geotessera.registry.tile_to_bounds` - Get geographic bounds of a tile
-* :func:`~geotessera.registry.tile_from_world` - Convert geographic to tile coordinates
-* :func:`~geotessera.registry.block_from_world` - Get block coordinates for a tile
+The registry lists available tiles and supplies their download paths,
+file sizes, and spatial bounds.
 
 .. automodule:: geotessera.registry
    :members:
@@ -57,14 +47,10 @@ Registry management for efficient data discovery and access. Handles the block-b
 :mod:`geotessera.visualization` -- Visualization Tools
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Visualization utilities for creating maps, web tiles, and interactive visualizations from GeoTIFF files.
-
-**Key Features:**
-
-* :func:`~geotessera.visualization.visualize_global_coverage` - Create global coverage maps
-* :func:`~geotessera.visualization.create_rgb_mosaic` - Combine multiple GeoTIFFs into a mosaic
-* :func:`~geotessera.web.geotiff_to_web_tiles` - Generate web tiles for interactive maps
-* :func:`~geotessera.web.create_coverage_summary_map` - Create coverage summary visualizations
+Visualization functions create coverage maps, RGB mosaics, and PCA
+images. :func:`~geotessera.visualization.create_pca_mosaic` fits one
+sampled PCA model across the inputs. See :doc:`cli_reference` for the
+corresponding commands.
 
 .. automodule:: geotessera.visualization
    :members:
@@ -76,18 +62,10 @@ Visualization utilities for creating maps, web tiles, and interactive visualizat
 :mod:`geotessera.store` -- Zarr Store Access
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Cloud-native access to Tessera embeddings via Zarr v3 format, with automatic UTM zone routing, point sampling, and region reading. Implements the ``geoemb:`` convention for geospatial embedding stores.
-
-**Key Features:**
-
-* :class:`~geotessera.store.GeoTesseraZarr` - Cloud-native Zarr store for streaming access without downloads
-* :meth:`~geotessera.store.GeoTesseraZarr.sample_points` - Sample embeddings at specific coordinates
-* :meth:`~geotessera.store.GeoTesseraZarr.read_region` - Read rectangular regions as mosaics
-* :meth:`~geotessera.store.GeoTesseraZarr.iter_region` - Stream a region as row strips
-* :meth:`~geotessera.store.GeoTesseraZarr.read_region_quantized` - Read a region as int8 plus scales
-* :meth:`~geotessera.store.GeoTesseraZarr.read_patch` - Read a fixed-size patch centred on a point, merged across UTM zones
-* :meth:`~geotessera.store.GeoTesseraZarr.open_zone` - Open UTM zone as xarray Dataset
-* :meth:`~geotessera.store.GeoTesseraZarr.probe` - Sample a point, reporting why when there is no value
+``GeoTesseraZarr`` reads points, regions, and patches from Zarr stores.
+:meth:`~geotessera.store.GeoTesseraZarr.iter_region` yields row strips, and
+:meth:`~geotessera.store.GeoTesseraZarr.export_geotiffs` writes one GeoTIFF
+per intersecting UTM zone. See :doc:`zarr_quickstart` for examples.
 
 .. automodule:: geotessera.store
    :members:
@@ -99,13 +77,8 @@ Cloud-native access to Tessera embeddings via Zarr v3 format, with automatic UTM
 :mod:`geotessera.tiles` -- Tile Abstraction
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Format-agnostic tile abstraction supporting both GeoTIFF and NPY format tiles with automatic format detection.
-
-**Key Features:**
-
-* :class:`~geotessera.tiles.Tile` - Format-agnostic embedding tile wrapper
-* :func:`~geotessera.tiles.discover_tiles` - Auto-detect and discover tiles in a directory
-* :func:`~geotessera.tiles.discover_formats` - Discover all available tile formats
+``Tile`` reads GeoTIFF and NPY tiles through the same interface.
+``discover_tiles`` finds supported files in a directory.
 
 .. automodule:: geotessera.tiles
    :members:
@@ -117,7 +90,7 @@ Format-agnostic tile abstraction supporting both GeoTIFF and NPY format tiles wi
 :mod:`geotessera.cli` -- Command Line Interface
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Comprehensive command-line interface providing download, visualization, and serving capabilities.
+See :doc:`cli_reference` for command syntax, options, and output behavior.
 
 .. automodule:: geotessera.cli
    :members:

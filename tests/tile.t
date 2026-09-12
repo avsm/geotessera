@@ -26,7 +26,7 @@ Test: Single Tile with --tile Option (Dry Run)
 Test downloading a single tile using the --tile option with a point coordinate.
 The point (0.17, 52.23) should resolve to tile grid_0.15_52.25:
 
-  $ geotessera download \
+  $ geotessera download --source tiles \
   >   --tile "0.17,52.23" \
   >   --year 2024 \
   >   --format tiff \
@@ -43,7 +43,7 @@ Test: Single Tile with 2-coord --bbox (Dry Run)
 Test downloading a single tile using --bbox with only 2 coordinates.
 This should behave identically to --tile:
 
-  $ geotessera download \
+  $ geotessera download --source tiles \
   >   --bbox "0.17,52.23" \
   >   --year 2024 \
   >   --format tiff \
@@ -59,7 +59,7 @@ Test: Mutual Exclusivity of Region Options
 
 Test that specifying multiple region options produces an error:
 
-  $ geotessera download \
+  $ geotessera download --source tiles \
   >   --tile "0.17,52.23" \
   >   --bbox "-0.1,51.3,0.1,51.5" \
   >   --year 2024 \
@@ -72,7 +72,7 @@ Test: Invalid --tile Format (Wrong Number of Coords)
 
 Test that --tile with wrong number of coordinates produces an error:
 
-  $ geotessera download \
+  $ geotessera download --source tiles \
   >   --tile "0.17,52.23,0.20" \
   >   --year 2024 \
   >   --dry-run \
@@ -84,7 +84,7 @@ Test: Invalid --bbox Format (Wrong Number of Coords)
 
 Test that --bbox with 3 coordinates produces an error:
 
-  $ geotessera download \
+  $ geotessera download --source tiles \
   >   --bbox "0.17,52.23,0.20" \
   >   --year 2024 \
   >   --dry-run \
@@ -96,7 +96,7 @@ Test: Download Single Tile (Actual Download)
 
 Download a single tile using --tile option:
 
-  $ geotessera download \
+  $ geotessera download --source tiles \
   >   --tile "0.17,52.23" \
   >   --year 2024 \
   >   --format tiff \

@@ -47,6 +47,7 @@ import math
 import os
 import time
 from datetime import timedelta
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Iterator, List, Optional, Tuple, Union
@@ -312,6 +313,43 @@ def _nearest_indices(coords: np.ndarray, targets: np.ndarray) -> np.ndarray:
     return len(coords) - 1 - nearest if descending else nearest
 
 
+def _time_index(ds, year):
+    matches = np.flatnonzero(ds["time"].values == year)
+    if not len(matches):
+        raise ValueError(f"Year {year} is unavailable; available: {ds.tessera.years}")
+    return int(matches[0])
+
+
+@dataclass(frozen=True)
+class _RegionWindow:
+    x0: int
+    x1: int
+    y0: int
+    y1: int
+    transform: rasterio.transform.Affine
+
+
+def _region_window(ds, bbox):
+    """One coordinate-to-window contract for eager and streamed zone reads."""
+    if len(bbox) != 4 or not np.isfinite(bbox).all():
+        raise ValueError("Region bounds must contain four finite coordinates")
+    west, east = sorted((bbox[0], bbox[2]))
+    south, north = sorted((bbox[1], bbox[3]))
+    xs, ys = ds["x"].values, ds["y"].values
+    x0, x1 = np.searchsorted(xs, west, "left"), np.searchsorted(xs, east, "right")
+    y0, y1 = np.searchsorted(-ys, -north, "left"), np.searchsorted(-ys, -south, "right")
+    if x1 <= x0 or y1 <= y0:
+        raise IndexError("Region does not intersect the zone grid")
+    px = ds.tessera.pixel_size
+    return _RegionWindow(
+        int(x0),
+        int(x1),
+        int(y0),
+        int(y1),
+        rasterio.transform.Affine(px, 0, xs[x0] - 0.5 * px, 0, -px, ys[y0] + 0.5 * px),
+    )
+
+
 def _bulk_sample(
     ds: xr.Dataset,
     es: np.ndarray,
@@ -346,9 +384,8 @@ def _bulk_sample(
 
     xi = _nearest_indices(xs, es[finite_indices])
     yi = _nearest_indices(ys, ns[finite_indices])
-    close = (
-        (np.abs(xs[xi] - es[finite_indices]) <= px)
-        & (np.abs(ys[yi] - ns[finite_indices]) <= px)
+    close = (np.abs(xs[xi] - es[finite_indices]) <= px) & (
+        np.abs(ys[yi] - ns[finite_indices]) <= px
     )
     if not close.any():
         return values, cause
@@ -367,9 +404,9 @@ def _bulk_sample(
             return sel[array].values.T, sel["scales"].values
 
     emb, scales = read(xi, yi)
-    emb = emb.astype(np.float32) * np.where(
-        np.isfinite(scales), scales, np.nan
-    )[:, None]
+    emb = (
+        emb.astype(np.float32) * np.where(np.isfinite(scales), scales, np.nan)[:, None]
+    )
     values[read_indices] = emb
     cause[read_indices] = np.where(
         np.isnan(scales), _WATER, np.where(np.isinf(scales), _HOLE, _OK)
@@ -679,11 +716,12 @@ class TesseraAccessor:
 
     def _window(self, bbox, year, array):
         """Load a bbox window: ``(emb int8 (B, H, W), scales, transform)``."""
-        e_min, e_max = min(bbox[0], bbox[2]), max(bbox[0], bbox[2])
-        n_min, n_max = min(bbox[1], bbox[3]), max(bbox[1], bbox[3])
-
-        # y is descending (north→south), so slice is (n_max, n_min)
-        sub = self._ds.sel(time=year, x=slice(e_min, e_max), y=slice(n_max, n_min))
+        window = _region_window(self._ds, bbox)
+        sub = self._ds.isel(
+            time=_time_index(self._ds, year),
+            x=slice(window.x0, window.x1),
+            y=slice(window.y0, window.y1),
+        )
         h, w = int(sub.sizes["y"]), int(sub.sizes["x"])
         log.info(
             "read_region: %d x %d pixels (%s), %.0fm resolution",
@@ -698,11 +736,7 @@ class TesseraAccessor:
         emb_int8 = sub[array].values
         log.info("read_region: loaded in %.1fs", time.monotonic() - started)
 
-        # Build affine from the selected window's coordinate values
-        x0 = float(sub["x"].values[0]) - 0.5 * self._px  # pixel centre → corner
-        y0 = float(sub["y"].values[0]) + 0.5 * self._px
-        transform = rasterio.transform.Affine(self._px, 0, x0, 0, -self._px, y0)
-        return emb_int8, scales, transform
+        return emb_int8, scales, window.transform
 
     def read_region(
         self,
@@ -770,23 +804,24 @@ class TesseraAccessor:
             strip_rows: Rows per yielded block.
         """
         del progress  # deprecated and ignored; progress is always logged
-        e_min, e_max = min(bbox[0], bbox[2]), max(bbox[0], bbox[2])
-        n_min, n_max = min(bbox[1], bbox[3]), max(bbox[1], bbox[3])
-        sub = self._ds.sel(time=year, x=slice(e_min, e_max), y=slice(n_max, n_min))
+        if strip_rows <= 0:
+            raise ValueError("strip_rows must be positive")
+        window = _region_window(self._ds, bbox)
+        sub = self._ds.isel(
+            time=_time_index(self._ds, year),
+            x=slice(window.x0, window.x1),
+            y=slice(window.y0, window.y1),
+        )
         height = int(sub.sizes["y"])
 
         def load(top):
             strip = sub.isel(y=slice(top, min(top + strip_rows, height)))
             # One or two dask tasks per strip; raise zarr's per-task concurrency.
             with zarr.config.set({"async.concurrency": POINT_CONCURRENCY}):
-                block = self.dequantise(
-                    strip[array].values, strip["scales"].values
-                )
+                block = self.dequantise(strip[array].values, strip["scales"].values)
             x0 = float(strip["x"].values[0]) - 0.5 * self._px
             y0 = float(strip["y"].values[0]) + 0.5 * self._px
-            return block, rasterio.transform.Affine(
-                self._px, 0, x0, 0, -self._px, y0
-            )
+            return block, rasterio.transform.Affine(self._px, 0, x0, 0, -self._px, y0)
 
         tops = list(range(0, height, strip_rows))
         yield from _progress_iter(
@@ -846,9 +881,13 @@ class GeoTesseraZarr:
         )
         try:
             root = zarr.open_group(self._store, mode="r")
-        except (zarr.errors.GroupNotFoundError, zarr.errors.ArrayNotFoundError, KeyError) as e:
+        except (
+            zarr.errors.GroupNotFoundError,
+            zarr.errors.ArrayNotFoundError,
+            KeyError,
+        ) as e:
             from .registry import KNOWN_DATASETS
-            
+
             available = ", ".join(sorted({f"v{v}" for v, _, d in KNOWN_DATASETS if d}))
             raise ValueError(
                 f"Failed to open zarr store at {self.url!r}. "
@@ -857,7 +896,7 @@ class GeoTesseraZarr:
                 f"Use zarr_store_url() to generate correct store URLs, e.g., "
                 f"zarr_store_url('v1') or zarr_store_url('v2')."
             ) from e
-        
+
         self._root = root
         root_attrs = dict(root.attrs)
         self.model_version: str = root_attrs.get("geoemb:model", "")
@@ -889,6 +928,48 @@ class GeoTesseraZarr:
 
     def __repr__(self) -> str:
         return f"GeoTesseraZarr({self.url!r}, years={self.years})"
+
+    def export_geotiffs(self, bbox, year, output_dir, **kwargs):
+        """Export a WGS84 region as one GeoTIFF per intersecting UTM zone.
+
+        Files are named ``tessera_YEAR_utmNN.tif`` and contain float32
+        embeddings on the native grid, with NaN nodata and source metadata.
+        Each completed file replaces its destination. Rerunning repeats
+        the export, including files completed before a failure.
+
+        Args:
+            bbox: WGS84 bounds in west, south, east, north order. Split
+                regions crossing the antimeridian into two requests.
+            year: Select the embedding year.
+            output_dir: Write the GeoTIFF files to this directory.
+            **kwargs: Accept the keyword options described below.
+
+        Keyword Args:
+            bands: Select zero-based band indices in the given order.
+                The default is all bands at the selected depth.
+            depth: Select a published embedding prefix. The default is
+                the full embedding. Band indices refer to this prefix.
+            strip_rows: Limit rows processed at a time. The default is 128.
+            compress: Set GeoTIFF compression. The default is ``"lzw"``.
+            progress_callback: Call ``callback(current, total, status)``
+                after each strip is written.
+            dry_run: Return size estimates without reading embeddings
+                or creating files. The default is ``False``.
+
+        Returns:
+            A list of output paths. With ``dry_run=True``, return a list
+            of dictionaries with ``zone``, ``width``, ``height``, and
+            ``uncompressed_bytes``. Estimates describe uncompressed
+            output, not network transfer or compressed file size.
+
+        Raises:
+            ValueError: If the bounds, bands, or strip size are invalid,
+                no available zone grid intersects the region, or the requested
+                year or depth is unavailable.
+        """
+        from .streaming import export_region
+
+        return export_region(self, bbox, year, output_dir, **kwargs)
 
     # -- Zone access --------------------------------------------------------
 
@@ -1038,7 +1119,10 @@ class GeoTesseraZarr:
                 lons[idx], lats[idx]
             )
             values[idx], cause[idx] = _bulk_sample(
-                ds, es, ns, year,
+                ds,
+                es,
+                ns,
+                year,
                 read=self._point_reader(int(z), ds, year, array),
                 array=array,
             )
@@ -1070,7 +1154,7 @@ class GeoTesseraZarr:
     def _point_reader(self, zone: int, ds: xr.Dataset, year: int, array: str):
         """A pixel-index reader through zarr's own concurrent pipeline."""
         group = self._root[f"utm{zone:02d}"]
-        ti = int(np.flatnonzero(ds["time"].values == year)[0])
+        ti = _time_index(ds, year)
 
         def read(xi, yi):
             bands = np.arange(group[array].shape[1])
@@ -1180,12 +1264,12 @@ class GeoTesseraZarr:
 
         # A strip is one getitem, so its chunk fetches run concurrently.
         group = self._root[f"utm{z:02d}"]
+        if strip_rows <= 0:
+            raise ValueError("strip_rows must be positive")
+        window = _region_window(ds, utm_bbox)
         xs, ys = ds["x"].values, ds["y"].values
-        x0 = int(np.searchsorted(xs, utm_bbox[0], "left"))
-        x1 = int(np.searchsorted(xs, utm_bbox[2], "right"))
-        y0 = int(np.searchsorted(-ys, -utm_bbox[3], "left"))
-        y1 = int(np.searchsorted(-ys, -utm_bbox[1], "right"))
-        ti = int(np.flatnonzero(ds["time"].values == year)[0])
+        x0, x1, y0, y1 = window.x0, window.x1, window.y0, window.y1
+        ti = _time_index(ds, year)
         px = acc.pixel_size
 
         def load(top):
@@ -1237,15 +1321,31 @@ class GeoTesseraZarr:
             year: Embedding year.
             size_px: Patch width and height in pixels.
             dst_crs: Output CRS, for pipelines that need every patch in
-                one CRS; forces the merge path even within one zone.
+                one projected CRS with metre units; forces the merge path
+                even within one zone.
             resampling: rasterio resampling name for the merge path.
                 Only the ``"nearest"`` default leaves vectors unblended.
             progress: Deprecated and ignored; progress is logged
                 through the ``geotessera.store`` logger at INFO.
         """
         del progress
-        if size_px <= 0:
+        from numbers import Integral
+        from pyproj import CRS
+        from .inputs import parse_points
+
+        lon, lat = parse_points([(lon, lat)])[0]
+        if (
+            not isinstance(size_px, Integral)
+            or isinstance(size_px, bool)
+            or size_px <= 0
+        ):
             raise ValueError(f"size_px must be positive, got {size_px}")
+        if dst_crs is not None:
+            crs = CRS.from_user_input(dst_crs)
+            if not crs.is_projected or any(
+                axis.unit_conversion_factor != 1 for axis in crs.axis_info[:2]
+            ):
+                raise ValueError("dst_crs must be a projected CRS with metre units")
         array, n_bands = self._embeddings_array(depth)
 
         centre_ds = self.open_zone(lon=lon)
@@ -1262,14 +1362,20 @@ class GeoTesseraZarr:
         zones = _zones_spanned(corner_lons, lon)
 
         if dst_crs is None and len(zones) == 1:
-            return self._read_patch_native(
-                centre_ds, ce, cn, year, size_px, array
-            )
+            return self._read_patch_native(centre_ds, ce, cn, year, size_px, array)
 
         target_crs = dst_crs or _patch_crs(lon, lat)
         return self._read_patch_merged(
-            zones, target_crs, lon, lat, year, size_px, px,
-            array, n_bands, resampling,
+            zones,
+            target_crs,
+            lon,
+            lat,
+            year,
+            size_px,
+            px,
+            array,
+            n_bands,
+            resampling,
         )
 
     def _read_patch_native(
@@ -1289,8 +1395,10 @@ class GeoTesseraZarr:
         acc = ds.tessera
         px = acc.pixel_size
         xs, ys = ds["x"].values, ds["y"].values
-        ix = int(np.abs(xs - centre_e).argmin())
-        iy = int(np.abs(ys - centre_n).argmin())
+        # Keep the requested location even outside the stored grid. Clamping
+        # the centre to the nearest coordinate would return another location.
+        ix = int(np.ceil((centre_e - xs[0]) / px - 0.5))
+        iy = int(np.ceil((ys[0] - centre_n) / px - 0.5))
         x0, y0 = ix - size_px // 2, iy - size_px // 2
         cx0, cx1 = max(0, x0), min(len(xs), x0 + size_px)
         cy0, cy1 = max(0, y0), min(len(ys), y0 + size_px)
@@ -1298,7 +1406,7 @@ class GeoTesseraZarr:
         out = np.full((size_px, size_px, int(ds[array].shape[1])), np.nan, np.float32)
         if cx1 > cx0 and cy1 > cy0:
             group = self._root[f"utm{int(acc.crs.split(':')[1]) % 100:02d}"]
-            ti = int(np.flatnonzero(ds["time"].values == year)[0])
+            ti = _time_index(ds, year)
             with zarr.config.set({"async.concurrency": POINT_CONCURRENCY}):
                 emb_int8 = group[array][ti, :, cy0:cy1, cx0:cx1]
                 scales = group["scales"][ti, cy0:cy1, cx0:cx1]

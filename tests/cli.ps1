@@ -143,6 +143,7 @@ try {
 
     $dryRunOutput = Invoke-Geotessera -Arguments @(
         "download",
+        "--source", "tiles",
         "--bbox", "-0.1,51.3,0.1,51.5",
         "--year", "2024",
         "--format", "tiff",
@@ -181,6 +182,7 @@ try {
 
     $downloadTiffOutput = Invoke-Geotessera -Arguments @(
         "download",
+        "--source", "tiles",
         "--bbox", "-0.1,51.3,0.1,51.5",
         "--year", "2024",
         "--format", "tiff",
@@ -223,6 +225,7 @@ try {
 
     $downloadNpyOutput = Invoke-Geotessera -Arguments @(
         "download",
+        "--source", "tiles",
         "--bbox", "-0.1,51.3,0.1,51.5",
         "--year", "2024",
         "--format", "npy",
@@ -335,6 +338,7 @@ try {
 
     $resumeOutput = Invoke-Geotessera -Arguments @(
         "download",
+        "--source", "tiles",
         "--bbox", "-0.1,51.3,0.1,51.5",
         "--year", "2024",
         "--format", "npy",

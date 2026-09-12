@@ -6,7 +6,6 @@ visualizations using Leaflet and other web technologies.
 
 from pathlib import Path
 from typing import List, Tuple, Optional, Callable
-import json
 import logging
 
 # Module-level logger
@@ -30,68 +29,34 @@ def prepare_mosaic_for_web(
     Returns:
         Path to web-ready mosaic (may be same as input if no reprojection needed)
     """
-    try:
-        import rasterio
-        from rasterio.warp import reproject, calculate_default_transform, Resampling
-    except ImportError:
-        raise ImportError("rasterio required: pip install rasterio")
+    import rasterio
+    from rasterio.vrt import WarpedVRT
+    from rasterio.shutil import copy as copy_raster
+    from .remote import atomic_output
 
-    if progress_callback:
-        progress_callback(10, 100, "Checking mosaic CRS...")
-
-    # Check if reprojection is needed
     with rasterio.open(input_mosaic) as src:
-        if str(src.crs) == target_crs:
+        if src.crs == rasterio.crs.CRS.from_user_input(target_crs):
             if progress_callback:
-                progress_callback(100, 100, f"Mosaic already in {target_crs}")
+                progress_callback(100, 100, "Mosaic already in the target CRS")
             return input_mosaic
-
-        if progress_callback:
-            progress_callback(
-                20, 100, f"Reprojecting from {src.crs} to {target_crs}..."
-            )
-
-        # Calculate transform and dimensions for target CRS
-        dst_transform, dst_width, dst_height = calculate_default_transform(
-            src.crs, target_crs, src.width, src.height, *src.bounds
-        )
-
-        # Create output profile
-        profile = src.profile.copy()
-        profile.update(
-            {
-                "crs": target_crs,
-                "transform": dst_transform,
-                "width": dst_width,
-                "height": dst_height,
-                "compress": "lzw",
-            }
-        )
-
-        if progress_callback:
-            progress_callback(50, 100, "Writing reprojected mosaic...")
-
-        # Write reprojected mosaic
-        with rasterio.open(output_path, "w", **profile) as dst:
-            for i in range(1, src.count + 1):
-                reproject(
-                    source=rasterio.band(src, i),
-                    destination=rasterio.band(dst, i),
-                    src_transform=src.transform,
-                    src_crs=src.crs,
-                    dst_transform=dst_transform,
-                    dst_crs=target_crs,
-                    resampling=Resampling.bilinear,
+        with WarpedVRT(
+            src,
+            crs=target_crs,
+            add_alpha=src.count == 3,
+            resampling=rasterio.enums.Resampling.bilinear,
+        ) as vrt:
+            with atomic_output(output_path, suffix=".tif") as staged:
+                copy_raster(
+                    vrt,
+                    staged,
+                    driver="GTiff",
+                    compress="lzw",
+                    tiled=True,
+                    BIGTIFF="IF_SAFER",
                 )
-
-            # Copy tags and color interpretation
-            dst.update_tags(**src.tags())
-            dst.colorinterp = src.colorinterp
-
     if progress_callback:
         progress_callback(100, 100, "Mosaic prepared for web visualization")
-
-    return output_path
+    return str(output_path)
 
 
 def geotiff_to_web_tiles(
@@ -155,6 +120,8 @@ def geotiff_to_web_tiles(
                 str(max_zoom),
                 "--tiling-scheme",
                 "WebMercatorQuad",
+                "--convention",
+                "tms",
                 "--resampling",
                 "bilinear",
                 "--webviewer",
@@ -225,32 +192,6 @@ def geotiff_to_web_tiles(
         )
 
 
-def _generate_boundary_js(boundary_geojson: str) -> str:
-    """Generate JavaScript code to add boundary overlay to Leaflet map."""
-    if not boundary_geojson:
-        return "// No boundary to overlay"
-
-    return f"""
-        // Add boundary overlay
-        var boundaryData = {boundary_geojson};
-        var boundaryLayer = L.geoJSON(boundaryData, {{
-            style: {{
-                color: '#ff0000',
-                weight: 2,
-                opacity: 0.8,
-                fillOpacity: 0.1,
-                fillColor: '#ff0000'
-            }}
-        }});
-        boundaryLayer.addTo(map);
-        
-        // Add boundary to layer control
-        overlayMaps["Region Boundary"] = boundaryLayer;
-        map.removeControl(map._controlContainer.querySelector('.leaflet-control-layers'));
-        L.control.layers(baseMaps, overlayMaps).addTo(map);
-    """
-
-
 def create_simple_web_viewer(
     tiles_dir: str,
     output_html: str,
@@ -274,120 +215,49 @@ def create_simple_web_viewer(
     Returns:
         Path to created HTML file
     """
-    # Process region file if provided
-    boundary_geojson = None
+    import os
+    from html import escape
+    from urllib.parse import quote
+    import folium
+    from branca.element import Element
+    from .inputs import read_region_file
+
+    tiles_url = quote(
+        Path(
+            os.path.relpath(
+                Path(tiles_dir).resolve(), Path(output_html).resolve().parent
+            )
+        ).as_posix(),
+        safe="/",
+    )
+    map_ = folium.Map(location=[center_lat, center_lon], zoom_start=zoom)
+    map_.get_root().header.add_child(Element(f"<title>{escape(title)}</title>"))
+    layer = folium.TileLayer(
+        tiles=tiles_url + "/{z}/{x}/{y}.png",
+        name="Tessera Data",
+        attr="GeoTessera data",
+        overlay=True,
+        tms=True,
+        opacity=0.8,
+    ).add_to(map_)
     if region_file:
-        try:
-            import geopandas as gpd
-
-            # Read the region file and convert to GeoJSON
-            gdf = gpd.read_file(region_file)
-            # Convert to WGS84 if not already
-            if gdf.crs != "EPSG:4326":
-                gdf = gdf.to_crs("EPSG:4326")
-
-            # Convert to GeoJSON string
-            boundary_geojson = gdf.__geo_interface__
-            boundary_geojson = json.dumps(boundary_geojson)
-
-        except Exception as e:
-            logger.warning(f"Could not process region file {region_file}: {e}")
-            boundary_geojson = None
-
-    html_content = f"""<!DOCTYPE html>
-<html>
-<head>
-    <title>{title}</title>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-    <style>
-        html, body {{ height: 100%; margin: 0; padding: 0; }}
-        #map {{ height: 100%; }}
-        .opacity-control {{
-            position: absolute;
-            top: 10px;
-            right: 10px;
-            background: white;
-            border-radius: 5px;
-            padding: 10px;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.2);
-            z-index: 1000;
-            font-family: Arial, sans-serif;
-            font-size: 12px;
-        }}
-        .opacity-control label {{
-            display: block;
-            margin-bottom: 5px;
-            font-weight: bold;
-        }}
-        .opacity-control input[type="range"] {{
-            width: 150px;
-        }}
-        .opacity-value {{
-            font-size: 11px;
-            color: #666;
-            margin-top: 2px;
-        }}
-    </style>
-</head>
-<body>
-    <div id="map"></div>
-    
-    <!-- Opacity Control -->
-    <div class="opacity-control">
-        <label for="opacity-slider">GeoTessera Opacity</label>
-        <input type="range" id="opacity-slider" min="0" max="100" value="80" step="5">
-        <div class="opacity-value" id="opacity-value">80%</div>
-    </div>
-    
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-    <script>
-        var map = L.map('map').setView([{center_lat}, {center_lon}], {zoom});
-        
-        // Add OpenStreetMap base layer
-        L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-            attribution: '© OpenStreetMap contributors'
-        }}).addTo(map);
-        
-        // Add GeoTessera layer
-        var tesseraLayer = L.tileLayer('./tiles/{{z}}/{{x}}/{{y}}.png', {{
-            attribution: 'GeoTessera data',
-            opacity: 0.8,
-            tms: true
-        }}).addTo(map);
-        
-        // Layer control
-        var baseMaps = {{
-            "OpenStreetMap": L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png')
-        }};
-        
-        var overlayMaps = {{
-            "Tessera Data": tesseraLayer
-        }};
-        
-        L.control.layers(baseMaps, overlayMaps).addTo(map);
-        
-        // Add boundary layer if provided
-        {_generate_boundary_js(boundary_geojson)}
-        
-        // Opacity slider functionality
-        var opacitySlider = document.getElementById('opacity-slider');
-        var opacityValue = document.getElementById('opacity-value');
-        
-        opacitySlider.addEventListener('input', function() {{
-            var opacity = this.value / 100;
-            tesseraLayer.setOpacity(opacity);
-            opacityValue.textContent = this.value + '%';
-        }});
-    </script>
-</body>
-</html>"""
-
-    with open(output_html, "w", encoding="utf-8") as f:
-        f.write(html_content)
-
-    return output_html
+        frame = read_region_file(region_file)
+        folium.GeoJson(
+            frame,
+            name="Region boundary",
+            style_function=lambda _: {"color": "red", "fillOpacity": 0},
+        ).add_to(map_)
+    folium.LayerControl().add_to(map_)
+    map_.get_root().html.add_child(
+        Element(
+            '<div style="position:absolute;bottom:20px;left:20px;z-index:1000;background:white;padding:10px">'
+            '<label>GeoTessera opacity <input aria-label="GeoTessera opacity" type="range" min="0" max="1" step="0.05" value="0.8" '
+            f'oninput="{layer.get_name()}.setOpacity(Number(this.value))"></label></div>'
+        )
+    )
+    Path(output_html).parent.mkdir(parents=True, exist_ok=True)
+    map_.save(str(output_html))
+    return str(output_html)
 
 
 def create_coverage_summary_map(
@@ -403,124 +273,28 @@ def create_coverage_summary_map(
     Returns:
         Path to created HTML file
     """
+    import folium
+    from html import escape
     from .visualization import analyze_geotiff_coverage
 
-    # Analyze coverage
     coverage = analyze_geotiff_coverage(geotiff_paths)
-
-    if not coverage["tiles"]:
+    if not coverage.get("tiles"):
         raise ValueError("No valid GeoTIFF files found")
-
-    # Calculate center
-    bounds = coverage["bounds"]
-    center_lat = (bounds["min_lat"] + bounds["max_lat"]) / 2
-    center_lon = (bounds["min_lon"] + bounds["max_lon"]) / 2
-
-    # Generate tile rectangles for map
-    tile_geojson = {"type": "FeatureCollection", "features": []}
-
+    map_ = folium.Map()
     for tile in coverage["tiles"]:
-        min_lon, min_lat, max_lon, max_lat = tile["bounds"]
+        west, south, east, north = tile["bounds"]
+        folium.Rectangle(
+            bounds=[[south, west], [north, east]],
+            fill=True,
+            popup=f"{escape(Path(tile['path']).name)}<br>Year: {tile['year']}<br>Bands: {tile['bands']}",
+        ).add_to(map_)
+    bounds = coverage["bounds"]
+    map_.fit_bounds(
+        [[bounds["min_lat"], bounds["min_lon"]], [bounds["max_lat"], bounds["max_lon"]]]
+    )
+    from branca.element import Element
 
-        feature = {
-            "type": "Feature",
-            "geometry": {
-                "type": "Polygon",
-                "coordinates": [
-                    [
-                        [min_lon, min_lat],
-                        [max_lon, min_lat],
-                        [max_lon, max_lat],
-                        [min_lon, max_lat],
-                        [min_lon, min_lat],
-                    ]
-                ],
-            },
-            "properties": {
-                "year": tile["year"],
-                "bands": tile["bands"],
-                "lon": tile["tile_lon"],
-                "lat": tile["tile_lat"],
-                "path": Path(tile["path"]).name,
-            },
-        }
-        tile_geojson["features"].append(feature)
-
-    html_content = f"""<!DOCTYPE html>
-<html>
-<head>
-    <title>{title}</title>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-    <style>
-        html, body {{ height: 100%; margin: 0; padding: 0; }}
-        #map {{ height: 100%; }}
-        .info {{ 
-            padding: 10px; background: white; background: rgba(255,255,255,0.9);
-            box-shadow: 0 0 15px rgba(0,0,0,0.2); border-radius: 5px; 
-            font-family: Arial, sans-serif; font-size: 12px;
-        }}
-        .info h4 {{ margin: 0 0 5px; color: #777; }}
-    </style>
-</head>
-<body>
-    <div id="map"></div>
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-    <script>
-        var map = L.map('map').setView([{center_lat}, {center_lon}], 8);
-        
-        L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-            attribution: '© OpenStreetMap contributors'
-        }}).addTo(map);
-        
-        var geojsonData = {json.dumps(tile_geojson)};
-        
-        function style(feature) {{
-            return {{
-                fillColor: '#3388ff',
-                weight: 1,
-                opacity: 1,
-                color: 'white',
-                fillOpacity: 0.3
-            }};
-        }}
-        
-        function onEachFeature(feature, layer) {{
-            var props = feature.properties;
-            var popupContent = 
-                "<b>Tessera Tile</b><br>" +
-                "Year: " + props.year + "<br>" +
-                "Bands: " + props.bands + "<br>" +
-                "Position: (" + props.lon + ", " + props.lat + ")<br>" +
-                "File: " + props.path;
-            layer.bindPopup(popupContent);
-        }}
-        
-        L.geoJSON(geojsonData, {{
-            style: style,
-            onEachFeature: onEachFeature
-        }}).addTo(map);
-        
-        // Add info control
-        var info = L.control();
-        info.onAdd = function (map) {{
-            this._div = L.DomUtil.create('div', 'info');
-            this.update();
-            return this._div;
-        }};
-        info.update = function (props) {{
-            this._div.innerHTML = '<h4>GeoTessera Coverage</h4>' +
-                'Total tiles: {coverage["total_files"]}<br>' +
-                'Years: {", ".join(coverage["years"])}<br>' +
-                'Click on tiles for details';
-        }};
-        info.addTo(map);
-    </script>
-</body>
-</html>"""
-
-    with open(output_html, "w", encoding="utf-8") as f:
-        f.write(html_content)
-
-    return output_html
+    map_.get_root().header.add_child(Element(f"<title>{escape(title)}</title>"))
+    Path(output_html).parent.mkdir(parents=True, exist_ok=True)
+    map_.save(str(output_html))
+    return str(output_html)

@@ -26,7 +26,8 @@ jobs:
         run: pip install -e . pytest
 
       - name: Run Python API Tests
-        run: pytest tests -v
+        timeout-minutes: 15
+        run: pytest tests -v -o faulthandler_timeout=120
 
       - name: Run CLI Tests
         shell: pwsh

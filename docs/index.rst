@@ -41,17 +41,12 @@ GeoTessera offers two ways in:
 Key Features
 ------------
 
-* **Global Coverage**: Access embeddings for any terrestrial location worldwide where data exists
-* **Flexible Formats**: Export as numpy arrays for analysis or GeoTIFF for GIS integration
-* **Cloud-Native Zarr Access**: Stream embeddings directly via ``GeoTesseraZarr`` without downloading files
-* **Projection Preservation**: Native UTM projections preserved from landmask tiles
-* **High Resolution**: 10m spatial resolution
-* **Temporal Compression**: Full year of satellite observations in each embedding
-* **Multi-spectral**: Combines Sentinel-1 SAR and Sentinel-2 optical data
-* **Country Support**: Download by country name or custom regions
-* **Resume Capability**: Both TIFF and NPY downloads skip existing files automatically
-* **Efficient Registry**: Block-based lazy loading of only required data
-* **Easy Access**: Python API and CLI with automatic caching
+* Read points, regions, and fixed-size patches through the Zarr API.
+* Export selected embedding bands as GeoTIFFs on their native UTM grids.
+* Download individual NPY or GeoTIFF tiles for offline use.
+* Create PCA visualizations or web maps directly from selected embedding bands.
+* Reuse completed web maps and resume individual tile downloads.
+* Select a dataset version, variant, year, and published embedding depth.
 
 Installation
 ------------
@@ -77,8 +72,15 @@ Stream one embedding from the zarr store::
     vec, status = gt.probe(0.12, 52.20, year=2024)   # (128,) float32, 'valid'
 
 The :doc:`zarr_quickstart` continues from here to regions, streams,
-patches, and matryoshka depths. The rest of this section covers the
-tile-download interface.
+patches, GeoTIFF exports, and matryoshka depths.
+
+Export a region or create a web map from Zarr::
+
+    geotessera download --bbox '-3.0,53.4,-2.9,53.5' --year 2024 --output region/
+    geotessera webmap --bbox '-3.0,53.4,-2.9,53.5' --year 2024 --output map/ --serve
+
+See :doc:`cli_reference` for options and restart behavior. The following
+examples use individual tiles with ``--source tiles``.
 
 Check data availability first::
 
@@ -96,18 +98,18 @@ Check data availability first::
 Download embeddings in your preferred format::
 
     # Download as GeoTIFF (default, georeferenced, ready for GIS)
-    geotessera download --bbox "-0.2,51.4,0.1,51.6" --year 2024 --output ./london_tiffs --bands 1,2,3
+    geotessera download --source tiles --bbox "-0.2,51.4,0.1,51.6" --year 2024 --output ./london_tiffs --bands 1,2,3
 
     # Download as quantized numpy arrays (for analysis, includes scales and landmask TIFFs)
-    geotessera download --bbox "-0.2,51.4,0.1,51.6" --format npy --year 2024 --output ./london_arrays
+    geotessera download --source tiles --bbox "-0.2,51.4,0.1,51.6" --format npy --year 2024 --output ./london_arrays
     # NPY format includes: quantized .npy, _scales.npy, and landmask .tiff files
 
-    # Download by country name with precise boundary filtering
-    geotessera download --country "United Kingdom" --year 2024 --output ./uk_tiles
+    # Download tiles within a country's bounding box.
+    geotessera download --source tiles --country "United Kingdom" --year 2024 --output ./uk_tiles
 
     # Download tiles from a region file (supports GeoJSON, Shapefile, or URLs)
-    geotessera download --region-file example/CB.geojson --year 2024 --output ./cambridge
-    geotessera download --region-file https://example.com/region.geojson --year 2024 --output ./remote_region
+    geotessera download --source tiles --region-file example/CB.geojson --year 2024 --output ./cambridge
+    geotessera download --source tiles --region-file https://example.com/region.geojson --year 2024 --output ./remote_region
 
 
 Python API usage::
@@ -346,7 +348,7 @@ Specifying version + variant
 **CLI** — every data-fetching command (``download``, ``coverage``, ``info``)
 accepts both flags::
 
-    geotessera download \
+    geotessera download --source tiles \
         --dataset-version v1.1 \
         --dataset-variant cambridge \
         --region-file area.geojson \
@@ -441,7 +443,7 @@ manifest for its dataset directory and filters by ``dataset_variant`` on
 load. Landmasks are a property of the 0.1° grid, so they stay keyed by
 plain version (``landmasks/v1.1/`` serves every 1.1 variant).
 
-**Local Mirror Structure** (when downloading via ``geotessera download``)::
+**Local Mirror Structure** (when downloading via ``geotessera download --source tiles``)::
 
     output_dir/
     ├── tessera_metadata.json                        # version/variant provenance
@@ -496,10 +498,10 @@ Control where the Parquet registry is cached::
 Or via CLI::
 
     # Specify custom cache directory
-    geotessera download --cache-dir /path/to/cache ...
+    geotessera download --source tiles --cache-dir /path/to/cache ...
 
     # Use default cache location
-    geotessera download ...
+    geotessera download --source tiles ...
 
 Default cache locations (when not specified):
 

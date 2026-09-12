@@ -8,6 +8,7 @@ from .registry import (
     EMBEDDINGS_DIR_NAME,
     LANDMASKS_DIR_NAME,
     tile_to_embedding_paths,
+    tile_to_geotiff_path,
     tile_to_landmask_filename,
 )
 
@@ -92,6 +93,41 @@ class Tile:
             # (bands, H, W) -> (H, W, bands)
             return np.transpose(src.read(), (1, 2, 0))
 
+    def iter_blocks(self, rows=128):
+        """Yield HWC float32 strips, capped for wide regional exports too."""
+        import rasterio
+
+        if rows <= 0:
+            raise ValueError("rows must be positive")
+        if self._format == "geotiff":
+            with rasterio.open(self._geotiff_path) as src:
+                rows = min(rows, max(1, 64 * 1024**2 // (src.width * src.count * 8)))
+                for top in range(0, src.height, rows):
+                    window = rasterio.windows.Window(
+                        0, top, src.width, min(rows, src.height - top)
+                    )
+                    yield (
+                        top,
+                        src.read(window=window, masked=True)
+                        .astype(np.float32)
+                        .filled(np.nan)
+                        .transpose(1, 2, 0),
+                    )
+        else:
+            from .core import dequantize_embedding
+
+            emb = np.load(self._embedding_path, mmap_mode="r")
+            scales = np.load(self._scales_path, mmap_mode="r")
+            rows = min(rows, max(1, 64 * 1024**2 // (emb.shape[1] * emb.shape[2] * 8)))
+            for top in range(0, emb.shape[0], rows):
+                section = slice(top, top + rows)
+                yield (
+                    top,
+                    dequantize_embedding(
+                        emb[section], scales[section] if scales.ndim >= 2 else scales
+                    ),
+                )
+
     def is_available(self, require_landmask: bool = True) -> bool:
         """Check if all required files exist.
 
@@ -161,7 +197,20 @@ class Tile:
             Tile instance backed by GeoTIFF storage
         """
         # Parse coordinates from filename or metadata
-        lon, lat, year = _parse_geotiff_filename(geotiff_path)
+        try:
+            lon, lat, year = _parse_geotiff_filename(geotiff_path)
+        except ValueError:
+            import rasterio
+            from rasterio.warp import transform
+
+            with rasterio.open(geotiff_path) as src:
+                if "TESSERA_YEAR" not in src.tags():
+                    raise ValueError(
+                        f"Raster {geotiff_path} needs a Tessera filename or TESSERA_YEAR tag"
+                    )
+                x, y = src.xy(src.height // 2, src.width // 2)
+                lons, lats = transform(src.crs, "EPSG:4326", [x], [y])
+                lon, lat, year = lons[0], lats[0], int(src.tags()["TESSERA_YEAR"])
         tile = cls(lon, lat, year)
 
         # Set format and path
@@ -226,22 +275,53 @@ class Tile:
         Returns:
             Embedding vector of shape (128,) or array of NaNs if point outside tile
         """
-        if not self.contains_point(lon, lat):
-            return np.full(128, np.nan)
+        return self.sample_points([(lon, lat)])[0]
 
-        # Load embedding data
-        data = self.load_embedding()
-
-        # Transform point to pixel coordinates
+    def sample_points(self, coords) -> np.ndarray:
+        """Sample WGS84 points without materialising the entire embedding tile."""
+        from pyproj import Transformer
         from rasterio.transform import rowcol
+        import rasterio
 
-        row, col = rowcol(self.transform, lon, lat)
+        coords = np.asarray(coords, dtype=float).reshape(-1, 2)
+        x, y = Transformer.from_crs(4326, self.crs, always_xy=True).transform(
+            coords[:, 0], coords[:, 1]
+        )
+        if self._format == "geotiff":
+            with rasterio.open(self._geotiff_path) as src:
+                result = np.full((len(coords), src.count), np.nan, np.float32)
+                finite = np.isfinite(x) & np.isfinite(y)
+                for i, sample in zip(
+                    np.flatnonzero(finite),
+                    src.sample(
+                        zip(np.asarray(x)[finite], np.asarray(y)[finite]), masked=True
+                    ),
+                ):
+                    result[i] = sample.astype(np.float32).filled(np.nan)
+                return result
+        quantized = np.load(self._embedding_path, mmap_mode="r")
+        scales = np.load(self._scales_path, mmap_mode="r")
+        result = np.full((len(coords), quantized.shape[-1]), np.nan, np.float32)
+        finite = np.isfinite(x) & np.isfinite(y)
+        idx = np.flatnonzero(finite)
+        rows, cols = rowcol(
+            self.transform, np.asarray(x)[finite], np.asarray(y)[finite]
+        )
+        rows, cols = np.asarray(rows), np.asarray(cols)
+        inside = (
+            (rows >= 0)
+            & (rows < quantized.shape[0])
+            & (cols >= 0)
+            & (cols < quantized.shape[1])
+        )
+        rows, cols, idx = rows[inside], cols[inside], idx[inside]
+        factors = scales[rows, cols] if scales.ndim >= 2 else scales
+        if scales.ndim == 2:
+            factors = factors[:, None]
+        from .core import dequantize_embedding
 
-        # Check bounds
-        if 0 <= row < self.height and 0 <= col < self.width:
-            return data[row, col, :]
-        else:
-            return np.full(128, np.nan)
+        result[idx] = dequantize_embedding(quantized[rows, cols], factors)
+        return result
 
     def to_dict(self) -> Dict:
         """Convert to dictionary format (for compatibility with visualization code).
@@ -288,27 +368,13 @@ def discover_tiles(directory: Path) -> List[Tile]:
     Returns:
         List of Tile objects with spatial metadata loaded, sorted by (year, lat, lon)
     """
-    # Check for NPY format first by looking for .npy files in embeddings directory
-    # Preferred order is NPY, tiff, as NPY (more efficient, includes scales)
-    embeddings_dir = directory / EMBEDDINGS_DIR_NAME
-    if embeddings_dir.exists() and embeddings_dir.is_dir():
-        # Check if there are any .npy files (not just _scales.npy)
-        # The actual pattern validation happens in discover_npy_tiles()
-        npy_files = [
-            f
-            for f in embeddings_dir.rglob("*.npy")
-            if not f.name.endswith("_scales.npy")
-        ]
-        if npy_files:
-            return discover_npy_tiles(directory)
-
-    # Then try to search GeoTIFF files (will search recursively)
-    tiff_files = discover_geotiff_tiles(directory)
-
-    if tiff_files:
-        return tiff_files
-
-    return []
+    directory = Path(directory)
+    # Prefer NPY per identity, without hiding other TIFF-only tiles.
+    by_identity = {tile: tile for tile in discover_geotiff_tiles(directory)}
+    by_identity.update({tile: tile for tile in discover_npy_tiles(directory)})
+    return sorted(
+        by_identity.values(), key=lambda tile: (tile.year, tile.lat, tile.lon)
+    )
 
 
 def tile_for_coord(base_dir: Path, lon: float, lat: float, year: int) -> Optional[Tile]:
@@ -338,18 +404,26 @@ def tile_for_coord(base_dir: Path, lon: float, lat: float, year: int) -> Optiona
     embedding_path = embeddings_root / embedding_rel
     landmask_path = base_dir / LANDMASKS_DIR_NAME / tile_to_landmask_filename(lon, lat)
 
-    if not (
+    if (
         embedding_path.exists()
         and (embeddings_root / scales_rel).exists()
         and landmask_path.exists()
     ):
-        return None
-
-    try:
-        return Tile.from_npy(embedding_path, base_dir)
-    except Exception as e:
-        logging.warning(f"Failed to load tile {embedding_path}: {e}")
-        return None
+        try:
+            return Tile.from_npy(embedding_path, base_dir)
+        except (OSError, ValueError) as exc:
+            logging.warning("Failed to load tile %s: %s", embedding_path, exc)
+    relative = tile_to_geotiff_path(lon, lat, year)
+    candidates = [embeddings_root / relative, base_dir / Path(relative).name]
+    for candidate in candidates:
+        for path in (
+            candidate,
+            candidate.with_suffix(".tif"),
+            candidate.with_suffix(".tiff"),
+        ):
+            if path.exists():
+                return Tile.from_geotiff(path)
+    return None
 
 
 def tiles_for_coords(
@@ -391,7 +465,6 @@ def discover_npy_tiles(base_dir: Path) -> List[Tile]:
     embeddings_dir = base_dir / EMBEDDINGS_DIR_NAME
 
     if not embeddings_dir.exists():
-        logging.warning(f"Embeddings directory not found: {embeddings_dir}")
         return []
 
     for npy_file in embeddings_dir.rglob("*.npy"):

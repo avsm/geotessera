@@ -43,7 +43,7 @@ Test: Download Dry Run for UK Tile
 Test downloading a single tile covering London, UK using --dry-run to avoid actual downloads.
 Verify key information is present:
 
-  $ geotessera download \
+  $ geotessera download --source tiles \
   >   --bbox "-0.1,51.3,0.1,51.5" \
   >   --year 2024 \
   >   --format tiff \
@@ -65,7 +65,7 @@ Test: Download Single UK Tile (TIFF format)
 
 Download a single tile in TIFF format to a temporary directory:
 
-  $ geotessera download \
+  $ geotessera download --source tiles \
   >   --bbox "-0.1,51.3,0.1,51.5" \
   >   --year 2024 \
   >   --format tiff \
@@ -86,7 +86,7 @@ Test: Download Single UK Tile (NPY format)
 
 Download the same tile in NPY format (quantized arrays with scales):
 
-  $ geotessera download \
+  $ geotessera download --source tiles \
   >   --bbox "-0.1,51.3,0.1,51.5" \
   >   --year 2024 \
   >   --format npy \
@@ -172,7 +172,7 @@ Test: Resume Capability for NPY Downloads
 
 Test that re-running the NPY download skips existing files:
 
-  $ geotessera download \
+  $ geotessera download --source tiles \
   >   --bbox "-0.1,51.3,0.1,51.5" \
   >   --year 2024 \
   >   --format npy \

@@ -217,7 +217,7 @@ A dry-run download against v1.1/cambridge should accept the flags without
 error and resolve the requested point to a tile. NPY format produces three
 files per tile (embedding + scales + landmask):
 
-  $ geotessera download \
+  $ geotessera download --source tiles \
   >   --tile "0.35,51.65" \
   >   --year 2024 \
   >   --format npy \

@@ -22,7 +22,7 @@ The library follows a layered architecture:
 .. code-block::
 
     User Interface Layer
-    ├── CLI Commands (geotessera download, visualize, etc.)
+    ├── CLI Commands (geotessera download, visualize, webmap, etc.)
     └── Python API (GeoTessera class)
             ↓
     Core Processing Layer
@@ -288,7 +288,7 @@ The manifest can be loaded from multiple sources:
 
 **5. CLI Option**::
 
-    geotessera download --cache-dir /custom/cache ...
+    geotessera download --source tiles --cache-dir /custom/cache ...
 
 Data Access Layer
 -----------------
