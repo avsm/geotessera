@@ -10,6 +10,21 @@ Every script verifies up front that the installed geotessera carries the
 fixes it depends on, and refuses to run otherwise — an older build would
 write a plausible-looking but wrong store.
 
+## Icechunk → Zarr on Fargate Spot
+
+`geotessera-registry zarr-transcode-plan` pins an Icechunk snapshot, records
+the work in an S3 state prefix, and initializes the destination. Fargate Spot
+workers run `zarr-transcode` for one UTM/year and resume from shard receipts.
+No configuration file is passed to workers. Both commands run through `uvx`
+after publication:
+
+```sh
+uvx --from 'geotessera[migration]' \
+  geotessera-registry zarr-transcode-plan --help
+```
+
+See the [migration runbook](icechunk-migration/README.md) for the commands.
+
 ## zarr-convert.sh — npy → Zarr, v1/v1.1
 
 Builds a Zarr store from a published npy dataset (defaults to

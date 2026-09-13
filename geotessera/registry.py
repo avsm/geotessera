@@ -501,14 +501,37 @@ def landmask_url(version_path: str, filename: str) -> str:
     return f"{TESSERA_LANDMASKS_MIRROR_URL}/{version_path}/{filename}"
 
 
-def zarr_store_url(version: str) -> str:
+# Zarr publication is independent of NPY manifests. False reserves a target
+# while it is being built; publishing it never enables nonexistent NPY tiles.
+KNOWN_ZARR_STORES = (
+    ("1.0", "vultr", "v1", True),
+    ("1.1", "cambridge", "v1.1", True),
+    ("1.1", "dclimate", "v1.1-dclimate", False),
+    ("2.0", "2B-L~beta1", "v2-2B-L~beta1", True),
+)
+
+
+def published_zarr_datasets() -> List[Tuple[str, str, str]]:
+    """Published Zarr locations, independently of :func:`published_datasets`."""
+    return [(v, variant, path) for v, variant, path, published in KNOWN_ZARR_STORES if published]
+
+
+def zarr_store_url(version: str, variant: Optional[str] = None) -> str:
     """Default URL of the zarr store for *version*.
 
     Accepts a version name (``"v1"``, ``"v2"``), resolved through the
     version's default variant, or an explicit store path such as
-    ``"v2-2B-L~beta1"``.
+    ``"v2-2B-L~beta1"``. An explicit *variant* can resolve a reserved build
+    location, including dClimate; use :func:`published_zarr_datasets` to
+    discover stores that have actually been published.
     """
     version_path, norm = _parse_dataset_version(version)
+    if variant is not None:
+        for v, name, path, _published in KNOWN_ZARR_STORES:
+            if v == norm and name == variant:
+                return f"{TESSERA_MIRROR_URL}/zarr/{path}"
+        # Preserve resolution of other variants supported by streaming clients.
+        return f"{TESSERA_MIRROR_URL}/zarr/{dataset_path(norm, variant)}"
     if norm in VERSION_DEFAULT_VARIANTS:
         variant = default_variant(norm)
         if norm == "1.1":

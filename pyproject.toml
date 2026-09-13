@@ -53,6 +53,15 @@ docs = [
 # because s3fs pulls in botocore (~26 MB), which the core install
 # deliberately does not depend on — https:// reads work without it.
 s3 = ["s3fs"]
+# Maintainer-only Icechunk migration.
+migration = [
+    "icechunk==2.2.0",
+    "zarr==3.3.0",
+    "numcodecs[pcodec]==0.16.5",
+    "pcodec==0.3.6",
+    "s3fs",
+    "boto3",
+]
 
 [project.urls]
 Homepage = "https://github.com/ucam-eo/geotessera"

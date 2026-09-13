@@ -5789,13 +5789,13 @@ Directory Structure:
     )
     zarr_init_parser.add_argument(
         "base_dir",
+        nargs="?",
         help="Base directory containing downloaded tile data, or a URL of a "
-        "repository in the published layout (e.g. s3://bucket/tessera)",
+        "repository in the published layout (e.g. s3://bucket/tessera); omit with --state",
     )
     zarr_init_parser.add_argument(
         "--years",
-        required=True,
-        help="Year range (e.g. 2017-2025 or 2017,2019,2024)",
+        help="Year range (e.g. 2017-2025 or 2017,2019,2024); required without --state",
     )
     zarr_init_parser.add_argument(
         "--output",
@@ -6000,8 +6000,9 @@ Directory Structure:
     )
     zarr_verify_parser.add_argument(
         "base_dir",
+        nargs="?",
         type=str,
-        help="Tile source: local mirror or repository root URL",
+        help="Tile source: local mirror or repository root URL; omit with --state",
     )
     zarr_verify_parser.add_argument(
         "store_path",
@@ -6011,8 +6012,8 @@ Directory Structure:
     zarr_verify_parser.add_argument(
         "--samples",
         type=int,
-        default=1000,
-        help="How many (year, tile) pairs to check (default: 1000)",
+        default=None,
+        help="Samples to check (default: 1000 NPY tiles, or 8 shards per zone/year with --state)",
     )
     zarr_verify_parser.add_argument(
         "--window",
@@ -6448,6 +6449,9 @@ Directory Structure:
     )
     print_parser.set_defaults(func=print_command)
 
+    from .transcode_cli import add_commands
+
+    add_commands(subparsers)
     args = parser.parse_args()
 
     if not args.command:

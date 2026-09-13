@@ -12,8 +12,8 @@ All Tessera data is served over plain HTTPS from the public Source
 Cooperative repository at ``https://data.source.coop/tessera/tessera``,
 which is also reachable as an S3-compatible endpoint (bucket ``tessera``,
 prefix ``tessera/``). The layout is one tree per media type. The ``npy/``
-tree has **one directory per dataset** — a (version, variant) pair — while
-the ``landmasks/`` and ``zarr/`` trees are keyed by plain version::
+tree has one directory per version and variant. Landmasks are keyed by
+version. Zarr store locations are listed separately in ``KNOWN_ZARR_STORES``::
 
     https://data.source.coop/tessera/tessera/
     ├── npy/
@@ -162,6 +162,29 @@ Two layers of caching sit between an uploaded manifest and end users:
   ``If-Modified-Since`` conditional GET keyed on the cached file's
   modification time. Once the CDN serves the new object, clients pick it
   up automatically on their next run — no manual cache clearing needed.
+
+Icechunk Migration
+------------------
+
+The Icechunk migration commands copy a pinned snapshot to Zarr v3. Run
+``zarr-transcode-plan`` once to inventory the source and initialize the
+destination. It takes ordinary CLI options and writes its restart state to a
+separate local or S3 prefix; no configuration file is required. Then run one
+``zarr-transcode`` process per UTM/year. Interrupted workers resume from
+durable shard receipts. All arrays are retained by default, including
+Sentinel observation counts and monthly coverage.
+
+Once the command is published, run it through ``uvx``. Replace ``VERSION``
+with the release used to build the worker image::
+
+    uvx --python 3.13 --from 'geotessera[migration]==VERSION' geotessera-registry zarr-transcode-plan --help
+    uvx --python 3.13 --from 'geotessera[migration]==VERSION' geotessera-registry zarr-transcode --help
+
+The `migration runbook
+<https://github.com/ucam-eo/geotessera/blob/main/scripts/icechunk-migration/README.md>`_
+gives the complete commands. Finalization checks the full plan before
+consolidating metadata. Zarr publication does not enable NPY downloads for
+the same variant.
 
 Related Maintainer Commands
 ---------------------------

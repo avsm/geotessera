@@ -45,6 +45,29 @@ def fake_region():
     return _fake_store({30: ds}), (-2.9504, 52.0497, -2.9496, 52.0503)
 
 
+@pytest.mark.parametrize(
+    "version,variant,path",
+    [
+        ("v1", None, "v1"),
+        ("v1.1", None, "v1.1"),
+        ("v1.1", "cambridge", "v1.1"),
+        ("v1.1", "dclimate", "v1.1-dclimate"),
+        ("v2", "2B-L~beta2", "v2-2B-L~beta2"),
+        ("v2-2B-L~beta1", None, "v2-2B-L~beta1"),
+    ],
+)
+def test_stream_resolves_zarr_variants(version, variant, path, monkeypatch, tmp_path):
+    from geotessera import store
+    from geotessera.workflows import open_stream
+
+    monkeypatch.setattr(store, "GeoTesseraZarr", lambda url, cache_dir: (url, cache_dir))
+    assert open_stream(version, variant, cache_dir=tmp_path) == (
+        f"https://data.source.coop/tessera/tessera/zarr/{path}",
+        tmp_path,
+    )
+    assert open_stream(version, variant, store_url="local.zarr") == ("local.zarr", None)
+
+
 def test_projected_point_inputs_and_sparse_tiff_sampling(tmp_path, monkeypatch):
     path = write_tile(tmp_path / "grid_-2.95_52.05_2024.tif")
     tile = Tile.from_geotiff(path)

@@ -1,3 +1,10 @@
+## v0.10.4
+
+- Add restartable Icechunk-to-Zarr migration that preserves all arrays and
+  runs each UTM/year as a separate Fargate Spot task. Planning and target
+  initialization use one CLI command; workers need only the state URL.
+- Track Zarr publication independently of NPY availability.
+
 ## v0.10.3 (2026-09-12)
 
 - `download` now streams Zarr to native UTM GeoTIFFs with band and depth

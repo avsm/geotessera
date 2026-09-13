@@ -409,7 +409,9 @@ def _bulk_sample(
     )
     values[read_indices] = emb
     cause[read_indices] = np.where(
-        np.isnan(scales), _WATER, np.where(np.isinf(scales), _HOLE, _OK)
+        np.isnan(scales),
+        _HOLE if ds.attrs.get("geotessera:mask_source") == "source_nodata" else _WATER,
+        np.where(np.isinf(scales), _HOLE, _OK),
     )
     return values, cause
 
@@ -670,7 +672,7 @@ class TesseraAccessor:
         ci, cj = yi - y0, xi - x0
 
         centre = scales[ci, cj]
-        if np.isnan(centre):
+        if np.isnan(centre) and self._ds.attrs.get("geotessera:mask_source") != "source_nodata":
             return None, WATER
         if np.isfinite(centre):
             bi, bj = ci, cj

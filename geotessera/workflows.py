@@ -9,21 +9,11 @@ from .inputs import resolve_region
 
 
 def open_stream(version="v1", variant=None, store_url=None, cache_dir=None):
-    from .registry import (
-        zarr_store_url,
-        _parse_dataset_version,
-        default_variant,
-        dataset_path,
-        TESSERA_MIRROR_URL,
-    )
+    from .registry import zarr_store_url
     from .store import GeoTesseraZarr
 
     if store_url is None:
-        _, norm = _parse_dataset_version(version)
-        if variant is None or variant == default_variant(norm):
-            store_url = zarr_store_url(version)
-        else:
-            store_url = f"{TESSERA_MIRROR_URL}/zarr/{dataset_path(norm, variant)}"
+        store_url = zarr_store_url(version, variant)
     return GeoTesseraZarr(store_url, cache_dir=cache_dir)
 
 

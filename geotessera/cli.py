@@ -379,13 +379,22 @@ def info(
 
         # List every known (version, variant) dataset so users can discover
         # valid --dataset-version/--dataset-variant combinations.
-        from geotessera.registry import KNOWN_DATASETS, VERSION_DEFAULT_VARIANTS
+        from geotessera.registry import (
+            KNOWN_DATASETS,
+            KNOWN_ZARR_STORES,
+            VERSION_DEFAULT_VARIANTS,
+        )
 
         datasets_table = create_table(box=None)
         datasets_table.add_column("Version")
         datasets_table.add_column("Variant")
         datasets_table.add_column("Repository dir")
         datasets_table.add_column("Status")
+        datasets_table.add_column("Zarr")
+        zarr_status = {
+            (v, variant): "available" if published else "planned"
+            for v, variant, _path, published in KNOWN_ZARR_STORES
+        }
         for ds_version, ds_variant, ds_dir in KNOWN_DATASETS:
             is_default = VERSION_DEFAULT_VARIANTS.get(ds_version) == ds_variant
             datasets_table.add_row(
@@ -393,6 +402,7 @@ def info(
                 ds_variant + (" (default)" if is_default else ""),
                 ds_dir or "-",
                 "available" if ds_dir else "coming soon",
+                zarr_status.get((ds_version, ds_variant), "-"),
             )
         rprint(datasets_table)
 

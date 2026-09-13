@@ -1,0 +1,3 @@
+# Build wheels without fetching unpinned build dependencies inside the image.
+setuptools
+wheel
