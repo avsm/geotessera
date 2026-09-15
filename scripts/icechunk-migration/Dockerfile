@@ -1,14 +1,41 @@
-# Supply a linux/amd64 Python 3.13 slim image by digest (see README).
-ARG PYTHON_IMAGE=python:3.13-slim@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285
-FROM ${PYTHON_IMAGE}
-ARG PYTHON_IMAGE
-RUN python -c 'import re, sys; assert re.search(r"@sha256:[0-9a-f]{64}$", sys.argv[1]), "Pin PYTHON_IMAGE by digest"' "$PYTHON_IMAGE"
-RUN apt-get update -qq && apt-get install -y --no-install-recommends libexpat1 && rm -rf /var/lib/apt/lists/*
-ENV PYTHONUNBUFFERED=1 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
-WORKDIR /app
-COPY scripts/icechunk-migration/requirements.lock /app/requirements.lock
-RUN python -m pip install --no-cache-dir --only-binary=:all: --require-hashes -r /app/requirements.lock
-COPY pyproject.toml README.md LICENSE.md /app/
-COPY geotessera /app/geotessera
-RUN python -m pip install --no-deps --no-build-isolation . && mkdir /scratch
-CMD ["geotessera-registry", "zarr-transcode", "--help"]
+# syntax=docker/dockerfile:1
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim@sha256:531f855bda2c73cd6ef67d56b733b357cea384185b3022bd09f05e002cd144ca
+
+RUN apt-get update -qq \
+    && apt-get install -y --no-install-recommends ca-certificates git \
+    && rm -rf /var/lib/apt/lists/* \
+    && uv tool install --no-cache \
+       "geotessera[migration] @ git+https://github.com/avsm/geotessera.git@f695b9412ea304f6b6bdd7149f4f8cca0e5b6216"
+
+ENV PATH="/root/.local/bin:${PATH}" \
+    PYTHONUNBUFFERED=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    OMP_NUM_THREADS=1 \
+    ICECHUNK_SOURCE="s3://tessera-embeddings/v1.1/dclimate.icechunk" \
+    ZARR_DESTINATION="s3://us-west-2.opendata.source.coop/tessera/tessera/zarr/v1.1-dclimate" \
+    MIGRATION_STATE="s3://us-west-2.opendata.source.coop/tessera/tessera/migrations/v1.1-dclimate" \
+    AWS_REGION="us-west-2" \
+    UTM_ZONE="" \
+    YEAR="" \
+    WORKERS="8" \
+    IO_CONCURRENCY="16" \
+    READ_ROWS="256" \
+    SPILL_DIR="/scratch"
+
+RUN mkdir -p /scratch
+
+STOPSIGNAL SIGTERM
+ENTRYPOINT exec geotessera-registry zarr-transcode \
+    --state "$MIGRATION_STATE" \
+    --zones "$UTM_ZONE" \
+    --years "$YEAR" \
+    --workers "$WORKERS" \
+    --io-concurrency "$IO_CONCURRENCY" \
+    --read-rows "$READ_ROWS" \
+    --spill-dir "$SPILL_DIR" \
+    --source-anon \
+    --source-region "$AWS_REGION" \
+    --store-region "$AWS_REGION" \
+    --store-acl bucket-owner-full-control \
+    --state-region "$AWS_REGION" \
+    --state-acl bucket-owner-full-control

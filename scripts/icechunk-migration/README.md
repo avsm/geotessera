@@ -26,8 +26,8 @@ target. Repeating it with the same arguments repairs an interrupted run. It
 preserves every source array, including Sentinel observation counts and
 monthly coverage.
 
-Run one Fargate Spot task per UTM/year. Each task receives ordinary command
-arguments; it reads the state and writes receipts at `STATE`.
+Run one AWS Batch Fargate Spot job per UTM/year. Each job receives ordinary
+command arguments; it reads the state and writes receipts at `STATE`.
 
 ```sh
 geotessera-registry zarr-transcode \
@@ -78,6 +78,27 @@ DeleteObject. Supply separate target credentials through
 optionally `GEOTESSERA_STORE_SESSION_TOKEN` when the task role cannot write
 to Source Cooperative.
 
-The included Dockerfile builds the worker image for `linux/amd64` with pinned
-migration dependencies. Give each task enough `/scratch` space for its shard
-buffers. Start with one UTM/year before launching the full sweep.
+Build the worker image from the repository root. The image installs the tested
+migration commit from `avsm/geotessera`.
+
+```sh
+docker build --platform linux/amd64 \
+  --file scripts/icechunk-migration/Dockerfile \
+  --tag geotessera-dclimate .
+```
+
+Set `UTM_ZONE` and `YEAR` in each AWS Batch Fargate job. The ECS task role
+supplies AWS credentials through the standard container credential provider.
+
+```sh
+docker run --rm \
+  --env UTM_ZONE=31 \
+  --env YEAR=2025 \
+  geotessera-dclimate
+```
+
+`WORKERS`, `IO_CONCURRENCY`, `READ_ROWS`, `SPILL_DIR`, `MIGRATION_STATE`, and
+`AWS_REGION` are optional environment overrides. Give each task enough
+ephemeral storage for `SPILL_DIR`. The job role also needs `ecs:DescribeTasks`
+and `batch:DescribeJobs` so a retry can recover ownership from a terminated
+Spot attempt.
