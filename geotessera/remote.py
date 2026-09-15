@@ -321,6 +321,16 @@ def _filesystem_cached(protocol: str, options_key: str):
         config_kwargs.setdefault(
             "read_timeout", int(os.environ.get("GEOTESSERA_READ_TIMEOUT", 120))
         )
+        # botocore pools 10 connections per client. A caller with more
+        # requests in flight than that has the surplus discarded and
+        # reopened, paying a TLS handshake each time and logging
+        # "Connection pool is full, discarding connection". Size the pool
+        # above the concurrency instead: idle sockets are cheap, handshakes
+        # on a busy transfer are not.
+        config_kwargs.setdefault(
+            "max_pool_connections",
+            int(os.environ.get("GEOTESSERA_MAX_POOL_CONNECTIONS", "32")),
+        )
     if protocol in ("http", "https"):
         # The Source Cooperative CDN rejects some default user agents.
         from . import __version__
