@@ -1,3 +1,12 @@
+## Unreleased
+
+- The default dataset is now v1.1. Streamed reads use the AWS Open Data v1.1
+  Icechunk store, known as `1.1-dclimate-icechunk`. NPY tiles still use `cambridge`
+  and may be slower.
+- `GeoTesseraZarr` opens Icechunk repositories (`*.icechunk`), presenting
+  each zone's hemisphere groups as one `utmNN` zone.
+- Adds `icechunk` and `numcodecs[pcodec]` dependencies.
+
 ## v0.10.3 (2026-09-12)
 
 - `download` now streams Zarr to native UTM GeoTIFFs with band and depth

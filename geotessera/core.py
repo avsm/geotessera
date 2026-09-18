@@ -93,7 +93,7 @@ class GeoTessera:
 
     def __init__(
         self,
-        dataset_version: str = "v1",
+        dataset_version: str = "v1.1",
         dataset_variant: Optional[str] = None,
         cache_dir: Optional[Union[str, Path]] = None,
         embeddings_dir: Optional[Union[str, Path]] = None,
@@ -104,7 +104,8 @@ class GeoTessera:
         """Initialize a client for downloading and reading individual tiles.
 
         Args:
-            dataset_version: Select the dataset version. The default is ``v1``.
+            dataset_version: Select the dataset version. The default is
+                ``v1.1``, whose NPY tiles come from the ``cambridge`` variant.
             dataset_variant: Select a variant within the version. The default
                 is the version's published default variant.
             cache_dir: Cache manifests in this directory.

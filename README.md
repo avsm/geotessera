@@ -122,7 +122,7 @@ grid. Patches can combine pixels across zone boundaries.
 ```python
 from geotessera import GeoTesseraZarr
 
-gt = GeoTesseraZarr()
+gt = GeoTesseraZarr()  # v1.1 dClimate Icechunk store
 print(gt.years)  # [2017, ..., 2025]
 
 # One embedding, with a status explaining any missing value
@@ -161,7 +161,13 @@ gt = GeoTesseraZarr(zarr_store_url("v2"))
 X16 = gt.sample_points([(0.12, 52.20)], year=2024, depth=16)  # (N, 16)
 ```
 
-Set `cache_dir` to persist Zarr metadata between runs. Byte-range reads
+A location ending in `.icechunk` opens an Icechunk repository. Its UTM zone
+and hemisphere groups read as one `utmNN` zone on the northern CRS, with
+negative northings south of the equator; NaN scales mark unembedded pixels,
+reported as `nodata`.
+
+Set `cache_dir` to persist Zarr metadata between runs. Icechunk stores
+ignore it. Byte-range reads
 of sharded embeddings are cached within the process.
 
 ```python
@@ -541,12 +547,17 @@ repository's `npy/` tree:
 | `1.0`   | `vultr` (default)      | `v1/`            | available   |
 | `1.1`   | `cambridge` (default)  | `v1.1-cam/`      | available   |
 | `1.1`   | `dclimate`             | —                | coming soon |
+| `1.1`   | `dclimate-icechunk`    | — (Icechunk)     | available, streamed default |
 | `2.0`   | `2B-L~beta1` (default) | `v2-2B-L~beta1/` | available   |
 | `2.0`   | `2B-L~beta2`           | `v2-2B-L~beta2/` | available   |
 
 The v1 series predates the variant-suffix scheme, so all its variants share
-the bare `v1/` directory. The library defaults remain `dataset_version="v1"`
-and `year=2024` — the only combination with full global coverage today.
+the bare `v1/` directory. The default version is `v1.1`. Streamed reads
+(`GeoTesseraZarr()`, `download`, `webmap`) default to `dclimate-icechunk`,
+the global v1.1 [Icechunk store](https://github.com/dClimate/tessera-embeddings/blob/main/docs/global-store.md)
+at `s3://tessera-embeddings/v1.1/dclimate.icechunk`. It has no NPY tiles, so
+`--source tiles` and `GeoTessera` default to `cambridge`. `coverage` and
+`info` read its Parquet tile registry in place of an NPY manifest.
 List the datasets at any time with `geotessera info`, and select them on the
 CLI with `--dataset-version` and `--dataset-variant`, or in Python:
 

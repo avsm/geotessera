@@ -39,7 +39,7 @@ Requires Python 3.12 or later: `pip install geotessera`.
 ```python
 from geotessera import GeoTesseraZarr
 
-gt = GeoTesseraZarr()                    # default v1 store
+gt = GeoTesseraZarr()                    # default v1.1 dClimate Icechunk store
 gt.years                                 # [2017, ..., 2025]
 
 vec, status = gt.probe(lon, lat, year)   # status: valid|water|nodata|outside
@@ -61,7 +61,7 @@ dequantise blockwise as `values * scales`.
 ```python
 from geotessera.registry import zarr_store_url
 
-gt = GeoTesseraZarr(zarr_store_url("v2"))   # "v1", "v2", or an explicit store URL
+gt = GeoTesseraZarr(zarr_store_url("v2"))   # "v1", "v1.1", "v2", or an explicit store URL
 ```
 
 v2 stores publish matryoshka prefixes of each embedding. Passing

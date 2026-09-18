@@ -1,5 +1,6 @@
 """Stream published Zarr embeddings into local GIS products."""
 
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -8,6 +9,8 @@ import rasterio
 from .inputs import parse_bbox
 from .remote import atomic_output
 from .store import _region_window, _time_index, _utm_envelope, _zone_for_lon
+
+log = logging.getLogger(__name__)
 
 
 def region_windows(client, bbox, year):
@@ -21,6 +24,9 @@ def region_windows(client, bbox, year):
         except KeyError:
             continue
         _time_index(ds, year)
+        for group, years in ds.attrs.get("geotessera:years_incomplete", {}).items():
+            if year in years:
+                log.warning("%s has no complete %d; it reads as nodata", group, year)
         zone_bbox = (max(west, zone * 6 - 186), south, min(east, zone * 6 - 180), north)
         try:
             window = _region_window(ds, _utm_envelope(zone_bbox, ds.tessera.crs))
@@ -84,7 +90,7 @@ def export_region(
     completed = 0
     for zone, ds, window in windows:
         rows = rows_for(window)
-        group = client._root[f"utm{zone:02d}"]
+        group = client._zone_arrays(zone)
         ti = _time_index(ds, year)
         path = output_dir / f"tessera_{year}_utm{zone:02d}.tif"
         with atomic_output(path, suffix=".tif") as temporary:

@@ -64,9 +64,41 @@ for _version, _variant, _dir in KNOWN_DATASETS:
         VERSION_DEFAULT_VARIANTS.setdefault(_version, _variant)
 
 
+# Datasets published only as Icechunk repositories, with no NPY tiles:
+# (normalised version, variant) → (repository URL, tile registry URL).
+# The tile registry replaces the NPY manifest for these datasets.
+ICECHUNK_DATASETS: Dict[Tuple[str, str], Tuple[str, str]] = {
+    ("1.1", "dclimate-icechunk"): (
+        "s3://tessera-embeddings/v1.1/dclimate.icechunk",
+        "s3://tessera-embeddings/v1.1/dclimate.registry/parts",
+    ),
+}
+
+# Default dataset version when none is given.
+DEFAULT_VERSION = "v1.1"
+
+# Streamed reads (Zarr or Icechunk) default to these variants; NPY tiles
+# keep VERSION_DEFAULT_VARIANTS.
+STREAM_DEFAULT_VARIANTS: Dict[str, str] = {"1.1": "dclimate-icechunk"}
+
+
 def default_variant(version_norm: str) -> str:
-    """Default variant for *version_norm* (e.g. ``"1.1"`` → ``"cambridge"``)."""
+    """Default NPY variant for *version_norm* (``"1.1"`` → ``"cambridge"``)."""
     return VERSION_DEFAULT_VARIANTS.get(version_norm, DEFAULT_VARIANT)
+
+
+def default_stream_variant(version_norm: str) -> str:
+    """Default streamed variant for *version_norm* (``"1.1"`` → ``"dclimate-icechunk"``)."""
+    return STREAM_DEFAULT_VARIANTS.get(version_norm) or default_variant(version_norm)
+
+
+def icechunk_dataset(version: str, variant: Optional[str] = None):
+    """``(repository URL, tile registry URL)``, or None for other datasets.
+
+    *variant* defaults to the version's streamed default.
+    """
+    norm = _parse_dataset_version(version)[1]
+    return ICECHUNK_DATASETS.get((norm, variant or default_stream_variant(norm)))
 
 
 def known_variants(version_norm: str) -> List[Tuple[str, Optional[str]]]:
@@ -141,6 +173,13 @@ def dataset_path(version_norm: str, variant: str) -> str:
     """
     if version_norm == "1.0":
         return "v1"
+    if (version_norm, variant) in ICECHUNK_DATASETS:
+        raise ValueError(
+            f"Dataset {version_norm}-{variant} is published as an Icechunk "
+            f"store without NPY tiles. Stream it with 'geotessera download "
+            f"--source zarr' or GeoTesseraZarr(zarr_store_url("
+            f"{version_norm!r}, {variant!r}))."
+        )
     for v, var, dirname in KNOWN_DATASETS:
         if v == version_norm and var == variant:
             if dirname is None:
@@ -501,14 +540,20 @@ def landmask_url(version_path: str, filename: str) -> str:
     return f"{TESSERA_LANDMASKS_MIRROR_URL}/{version_path}/{filename}"
 
 
-def zarr_store_url(version: str) -> str:
-    """Default URL of the zarr store for *version*.
+def zarr_store_url(version: str = DEFAULT_VERSION, variant: Optional[str] = None) -> str:
+    """URL of the streamed store for *version* and *variant*.
 
-    Accepts a version name (``"v1"``, ``"v2"``), resolved through the
-    version's default variant, or an explicit store path such as
-    ``"v2-2B-L~beta1"``.
+    Accepts a version name (``"v1"``, ``"v1.1"``, ``"v2"``) or an explicit
+    store path such as ``"v2-2B-L~beta1"``. *variant* defaults to the
+    version's streamed default, so ``"v1.1"`` resolves to the dClimate
+    Icechunk repository and ``("v1.1", "cambridge")`` to its Zarr store.
     """
     version_path, norm = _parse_dataset_version(version)
+    icechunk = icechunk_dataset(version, variant)
+    if icechunk is not None:
+        return icechunk[0]
+    if variant is not None and variant != default_variant(norm):
+        return f"{TESSERA_MIRROR_URL}/zarr/{dataset_path(norm, variant)}"
     if norm in VERSION_DEFAULT_VARIANTS:
         variant = default_variant(norm)
         if norm == "1.1":

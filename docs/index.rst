@@ -312,8 +312,12 @@ variant as a suffix. Known datasets on ``data.source.coop/tessera/tessera``
 | ``2.0``     | ``2B-L~beta2``      | ``v2-2B-L~beta2/`` | 2017–2025      | Second v2 beta run. Experimental.                              |
 +-------------+---------------------+--------------------+----------------+----------------------------------------------------------------+
 
-The library defaults remain ``dataset_version="v1"`` and ``year=2024`` —
-the only combination with full global coverage today.
+``1.1`` / ``dclimate-icechunk`` is the global v1.1 Icechunk store at
+``s3://tessera-embeddings/v1.1/dclimate.icechunk``. It has no NPY tiles
+and is read by streaming only.
+
+The default version is ``v1.1``. Streamed reads default to
+``dclimate-icechunk``; NPY tiles default to ``cambridge``.
 
 Which one should I use?
 ~~~~~~~~~~~~~~~~~~~~~~~
