@@ -1,3 +1,9 @@
+## unreleased
+
+- `GeoTessera(bbox=...)` and `Registry(bbox=...)` load only the manifest
+  rows near an area, cutting load time and memory for regional work.
+  Queries outside the bbox raise `ValueError`.
+
 ## v0.10.3 (2026-09-12)
 
 - `download` now streams Zarr to native UTM GeoTIFFs with band and depth

@@ -832,6 +832,8 @@ class Registry:
         registry_dir: Optional[Union[str, Path]] = None,
         landmasks_registry_url: Optional[str] = None,
         landmasks_registry_path: Optional[Union[str, Path]] = None,
+        bbox: Optional[Tuple[float, float, float, float]] = None,
+        bbox_margin_deg: float = 0.15,
         logger: Optional[logging.Logger] = None,
     ):
         """Initialize Registry manager with optimized Parquet registries.
@@ -856,6 +858,14 @@ class Registry:
             registry_dir: Directory containing manifest.parquet and landmasks.parquet files (alternative to individual paths)
             landmasks_registry_url: URL to download landmasks Parquet registry from (default: remote)
             landmasks_registry_path: Local path to existing landmasks Parquet registry file
+            bbox: Optional (min_lon, min_lat, max_lon, max_lat) in EPSG:4326.
+                Load only manifest rows for tiles near this area. Region
+                queries and tile lookups outside it raise ValueError, and
+                listing methods report only the loaded tiles. Bounds that
+                cross the antimeridian are not supported.
+            bbox_margin_deg: Degrees added to each side of *bbox* before
+                loading (default 0.15). Queries may extend up to
+                ``bbox_margin_deg - 0.05`` beyond *bbox*.
             logger: Optional logger instance. If not provided, creates a new one
         """
         # Resolve version into a path component and a normalised numeric form.
@@ -932,6 +942,26 @@ class Registry:
             Path(landmasks_registry_path) if landmasks_registry_path else None
         )
 
+        # Rows with tile centres inside _scope are loaded; None loads all.
+        self._bbox: Optional[Tuple[float, float, float, float]] = None
+        self._scope: Optional[Tuple[float, float, float, float]] = None
+        if bbox is not None:
+            min_lon, min_lat, max_lon, max_lat = (float(v) for v in bbox)
+            if min_lon > max_lon or min_lat > max_lat:
+                raise ValueError(
+                    f"bbox must be (min_lon, min_lat, max_lon, max_lat) with "
+                    f"min <= max; got {tuple(bbox)}. Bounds crossing the "
+                    f"antimeridian are not supported."
+                )
+            if bbox_margin_deg < 0:
+                raise ValueError(
+                    f"bbox_margin_deg must be non-negative; got {bbox_margin_deg}"
+                )
+            self._bbox = (min_lon, min_lat, max_lon, max_lat)
+            self._bbox_margin_deg = bbox_margin_deg
+            m = bbox_margin_deg
+            self._scope = (min_lon - m, min_lat - m, max_lon + m, max_lat + m)
+
         # Memoizes validate_embeddings_dir() so per-tile fetches don't
         # re-read the sidecar.
         self._embeddings_dir_validated = False
@@ -1000,7 +1030,21 @@ class Registry:
 
         # Load as plain parquet first; promote to GeoDataFrame if needed.
         try:
-            df = pd.read_parquet(registry_path)
+            if self._scope is not None:
+                import pyarrow.parquet as pq
+
+                min_lon, min_lat, max_lon, max_lat = self._scope
+                df = pq.read_table(
+                    str(registry_path),
+                    filters=[
+                        ("lon", ">=", min_lon),
+                        ("lon", "<=", max_lon),
+                        ("lat", ">=", min_lat),
+                        ("lat", "<=", max_lat),
+                    ],
+                ).to_pandas()
+            else:
+                df = pd.read_parquet(registry_path)
         except Exception as e:
             raise RuntimeError(f"Failed to load manifest parquet: {e}") from e
 
@@ -1008,7 +1052,8 @@ class Registry:
         # parquet (multi-source coverage rendering, manifest introspection, …).
         self.manifest_path = Path(registry_path)
 
-        self.logger.info(f"Loaded manifest with {len(df):,} tiles")
+        scoped = f" within bbox {self._bbox}" if self._bbox is not None else ""
+        self.logger.info(f"Loaded manifest with {len(df):,} tiles{scoped}")
 
         # Validate required columns (file-scan inventory schema).
         required_columns = {"lat", "lon", "year", "grid_size"}
@@ -1027,6 +1072,11 @@ class Registry:
             self.logger.info(
                 f"Filtered manifest to version={self._version_norm}, "
                 f"variant={self._variant}: {len(df):,} tiles (from {before:,})"
+            )
+        if df.empty and self._bbox is not None:
+            raise ValueError(
+                f"Manifest has no tiles within bbox {self._bbox} for "
+                f"version={self._version_norm}, variant={self._variant}."
             )
         if df.empty:
             raise ValueError(
@@ -1188,8 +1238,30 @@ class Registry:
         try:
             return self._registry_gdf.loc[(int(year), lon_i, lat_i)]
         except KeyError:
+            self._check_scope((lon, lat, lon, lat), expansion=0.0)
             raise ValueError(
                 f"Tile not found in registry: year={year}, lon={lon:.2f}, lat={lat:.2f}"
+            )
+
+    def _check_scope(
+        self, bounds: Tuple[float, float, float, float], expansion: float
+    ) -> None:
+        """Raise ValueError if bounds, grown by expansion, leave the loaded scope."""
+        if self._scope is None:
+            return
+        eps = 1e-9
+        s_min_lon, s_min_lat, s_max_lon, s_max_lat = self._scope
+        min_lon, min_lat, max_lon, max_lat = bounds
+        if (
+            min_lon - expansion < s_min_lon - eps
+            or min_lat - expansion < s_min_lat - eps
+            or max_lon + expansion > s_max_lon + eps
+            or max_lat + expansion > s_max_lat + eps
+        ):
+            raise ValueError(
+                f"Bounds {tuple(bounds)} extend outside the registry bbox "
+                f"{self._bbox} (margin {self._bbox_margin_deg:g} deg). "
+                f"Construct the registry with a larger bbox, or without one."
             )
 
     def _lookup_landmask(self, lon: float, lat: float) -> pd.Series:
@@ -1238,6 +1310,10 @@ class Registry:
         Yields:
             Tuples of (year, tile_lon, tile_lat) for each tile in the region
 
+        Raises:
+            ValueError: If the registry was built with a bbox that does not
+                cover bounds.
+
         Example:
             >>> registry = Registry('v1')
             >>> bounds = (-0.2, 51.4, 0.1, 51.6)  # London
@@ -1252,6 +1328,7 @@ class Registry:
         # their centers, but tiles are 0.1° x 0.1° boxes, so we need to expand the
         # query to include tiles whose centers are up to 0.05° outside the bounds.
         expansion = 0.05
+        self._check_scope(bounds, expansion)
         tiles = self._registry_gdf.cx[
             min_lon - expansion : max_lon + expansion,
             min_lat - expansion : max_lat + expansion,

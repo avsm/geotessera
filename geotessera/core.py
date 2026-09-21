@@ -100,6 +100,8 @@ class GeoTessera:
         registry_url: Optional[str] = None,
         registry_path: Optional[Union[str, Path]] = None,
         registry_dir: Optional[Union[str, Path]] = None,
+        bbox: Optional[Tuple[float, float, float, float]] = None,
+        bbox_margin_deg: float = 0.15,
     ):
         """Initialize a client for downloading and reading individual tiles.
 
@@ -115,6 +117,11 @@ class GeoTessera:
             registry_path: Read an existing local manifest file.
             registry_dir: Read ``manifest.parquet`` and ``landmasks.parquet``
                 from this directory.
+            bbox: Optional (min_lon, min_lat, max_lon, max_lat) in EPSG:4326.
+                Load only the tiles near this area. Fetching or sampling
+                outside it raises ValueError.
+            bbox_margin_deg: Degrees added to each side of *bbox* before
+                loading (default 0.15).
         """
         self.dataset_version = dataset_version
 
@@ -135,6 +142,8 @@ class GeoTessera:
             registry_url=registry_url,
             registry_path=registry_path,
             registry_dir=registry_dir,
+            bbox=bbox,
+            bbox_margin_deg=bbox_margin_deg,
             logger=self.logger,
         )
         # The resolved variant (per-version default applied when the caller
@@ -976,9 +985,16 @@ class GeoTessera:
                 points_by_tile[tile_key] = []
             points_by_tile[tile_key].append(idx)
 
+        if not points_by_tile:
+            return {}
+
         # Filter to only tiles that exist in the registry
+        lons = [lon for lon, _ in points]
+        lats = [lat for _, lat in points]
         available_tiles = set(
-            self.registry.load_blocks_for_region((-180, -90, 180, 90), year)
+            self.registry.load_blocks_for_region(
+                (min(lons), min(lats), max(lons), max(lats)), year
+            )
         )
 
         # Convert to set of (lon, lat) for faster lookup
