@@ -212,7 +212,7 @@ def info(
         Optional[str],
         typer.Option(
             "--dataset-variant",
-            help="Select the dataset variant. If omitted, use the version's default: dclimate-icechunk for v1.1, or cambridge for v1.1 tiles.",
+            help="Select the dataset variant. If omitted, use the version's default in the chosen format. Run geotessera info to list them.",
         ),
     ] = None,
     verbose: Annotated[
@@ -354,37 +354,29 @@ def info(
     else:
         from geotessera.registry import icechunk_dataset
 
+        rprint(f"geotessera {__version__}")
+        stores = _datasets_table()
         icechunk = icechunk_dataset(dataset_version, dataset_variant)
         if icechunk is not None:
-            _icechunk_info(icechunk[0], verbose)
-            _datasets_table()
-            return
-
-        # Show library info
-        gt = _tiles_client(
-            dataset_version=dataset_version, dataset_variant=dataset_variant
-        )
-        years = gt.registry.get_available_years()
-
-        # Count tiles per year using fast pandas operations
-        tiles_per_year = gt.registry.get_tile_counts_by_year()
-
-        # Count total landmasks using fast pandas operations
-        total_landmasks = gt.registry.get_landmask_count()
-
-        info_table = create_table(show_header=False, box=None)
-        info_table.add_row("Version:", gt.version)
-        info_table.add_row("Available years:", ", ".join(map(str, years)))
-
-        # Show tiles per year
-        for year in years:
-            count = tiles_per_year.get(year, 0)
-            info_table.add_row(f"  {year} tiles:", f"{count:,}")
-
-        info_table.add_row("Total landmasks:", f"{total_landmasks:,}")
-
-        rprint(info_table)
-        _datasets_table()
+            _icechunk_info(icechunk[0], verbose, dataset_version, dataset_variant)
+        else:
+            gt = _tiles_client(
+                dataset_version=dataset_version, dataset_variant=dataset_variant
+            )
+            tiles_per_year = gt.registry.get_tile_counts_by_year()
+            years = sorted(tiles_per_year)
+            table = create_table(show_header=False, box=None)
+            table.add_row(
+                "Selected:", f"{gt.registry.version} {gt.dataset_variant} (NPY)"
+            )
+            table.add_row("Years:", f"{years[0]}-{years[-1]}" if years else "-")
+            table.add_row("Tiles:", f"{sum(tiles_per_year.values()):,}")
+            if verbose:
+                for year in years:
+                    table.add_row(f"  {year}:", f"{tiles_per_year[year]:,}")
+            table.add_row("Landmasks:", f"{gt.registry.get_landmask_count():,}")
+            rprint(table)
+        rprint(stores)
 
 
 def _tiles_client(**kwargs) -> GeoTessera:
@@ -396,63 +388,76 @@ def _tiles_client(**kwargs) -> GeoTessera:
         raise typer.Exit(1) from exc
 
 
-def _icechunk_info(url: str, verbose: bool) -> None:
+def _icechunk_info(url: str, verbose: bool, version: str, variant) -> None:
     """Describe an Icechunk store from its root and group attributes."""
     from .icechunk import IcechunkStore
 
     store = IcechunkStore(url)
     attrs = dict(store.root.attrs)
-    table = create_table(show_header=False, box=None)
-    table.add_row("Version:", __version__)
-    table.add_row("Store:", url)
-    table.add_row("Model:", str(attrs.get("geoemb:model", "-")))
-    table.add_row("Checkpoint:", str(attrs.get("checkpoint_id", "-")))
-    table.add_row("Available years:", ", ".join(map(str, store.years)))
-    table.add_row("Zone groups:", f"{len(store.groups)} ({len(store.zones())} UTM zones)")
+    years = store.years
     incomplete = store.incomplete_years()
+    table = create_table(show_header=False, box=None)
+    from geotessera.registry import _parse_dataset_version, default_variant
+
+    version_path, norm = _parse_dataset_version(version)
+    variant = variant or default_variant(norm, "stream")
+    table.add_row("Selected:", f"{version_path} {variant} (Icechunk)")
+    table.add_row("Checkpoint:", str(attrs.get("checkpoint_id", "-")))
+    table.add_row("Years:", f"{years[0]}-{years[-1]}" if years else "-")
+    table.add_row("UTM zones:", str(len(store.zones())))
     table.add_row(
-        "Incomplete zone-years:",
-        str(sum(len(v) for v in incomplete.values())),
+        "Incomplete zone-years:", str(sum(len(v) for v in incomplete.values()))
     )
     if verbose:
-        for group, years in incomplete.items():
-            table.add_row(f"  {group}:", ", ".join(map(str, years)))
+        for group, group_years in incomplete.items():
+            table.add_row(f"  {group}:", ", ".join(map(str, group_years)))
     rprint(table)
 
 
-def _datasets_table() -> None:
-    """List every known dataset for --dataset-version/--dataset-variant."""
+def _datasets_table():
+    """Print every dataset and its formats; return a table of its stores."""
     from geotessera.registry import (
-        ICECHUNK_DATASETS,
-        KNOWN_DATASETS,
-        STREAM_DEFAULT_VARIANTS,
-        VERSION_DEFAULT_VARIANTS,
+        DATASETS,
+        FORMATS,
+        STREAM_FORMATS,
+        TESSERA_MIRROR_URL,
+        default_variant,
     )
 
+    yes, no = emoji("✓") or "yes", emoji("✗") or "-"
     table = create_table(box=None)
-    table.add_column("Version")
-    table.add_column("Variant")
-    table.add_column("Location")
-    table.add_column("Status")
-    for ds_version, ds_variant, ds_dir in KNOWN_DATASETS:
-        is_default = VERSION_DEFAULT_VARIANTS.get(ds_version) == ds_variant
-        streamed = ds_version in STREAM_DEFAULT_VARIANTS
+    for column in ("Version", "Variant", "NPY", "Zarr", "Icechunk", "Description"):
+        table.add_column(column)
+    stores = create_table(box=None)
+    for column in ("Version", "Variant", "Format", "URL"):
+        stores.add_column(column)
+    notes = []
+    for ds in DATASETS:
+        default = default_variant(ds.version)
         table.add_row(
-            ds_version,
-            ds_variant
-            + (f" (default{' for tiles' if streamed else ''})" if is_default else ""),
-            ds_dir or "-",
-            "available" if ds_dir else "coming soon",
+            f"v{ds.version}",
+            ds.variant + ("*" if ds.variant == default else ""),
+            *(yes if ds.location(fmt) else no for fmt in FORMATS),
+            ds.description,
         )
-    for (ds_version, ds_variant), (url, _) in ICECHUNK_DATASETS.items():
-        is_default = STREAM_DEFAULT_VARIANTS.get(ds_version) == ds_variant
-        table.add_row(
-            ds_version,
-            ds_variant + (" (default)" if is_default else ""),
-            url,
-            "icechunk, no tiles",
-        )
+        for fmt in FORMATS:
+            key = "stream" if fmt in STREAM_FORMATS else fmt
+            fmt_default = default_variant(ds.version, key)
+            if ds.location(fmt) and fmt_default == ds.variant != default:
+                notes.append(f"v{ds.version} {fmt.upper()} defaults to {ds.variant}.")
+        if ds.zarr:
+            url = f"{TESSERA_MIRROR_URL}/zarr/{ds.zarr}"
+            stores.add_row(f"v{ds.version}", ds.variant, "Zarr", url)
+        if ds.icechunk:
+            stores.add_row(f"v{ds.version}", ds.variant, "Icechunk", ds.icechunk)
     rprint(table)
+    rprint(
+        "[dim]* Default variant. "
+        + " ".join(notes)
+        + " Embeddings of different versions or variants cannot be "
+        "interchanged. NPY tiles are deprecated and will be removed.[/dim]"
+    )
+    return stores
 
 
 def _tile_registry_coverage(
@@ -694,7 +699,7 @@ def coverage(
         variant_spec = (
             dataset_variant
             if dataset_variant is not None
-            else default_variant(_parse_dataset_version(version_spec)[1])
+            else default_variant(_parse_dataset_version(version_spec)[1], "npy")
         )
 
     # The placeholder GeoTessera below initialises one Registry to get its
@@ -705,7 +710,7 @@ def coverage(
     )
     # With every variant selected, open the version's default NPY variant.
     init_variant = (
-        default_variant(_parse_dataset_version(init_version)[1])
+        default_variant(_parse_dataset_version(init_version)[1], "npy")
         if (by_source and variant_spec.lower() == "all")
         else variant_spec
     )
@@ -1112,7 +1117,7 @@ def download(
         Optional[str],
         typer.Option(
             "--dataset-variant",
-            help="Select the dataset variant. If omitted, use the version's default: dclimate-icechunk for v1.1, or cambridge for v1.1 tiles.",
+            help="Select the dataset variant. If omitted, use the version's default in the chosen format. Run geotessera info to list them.",
         ),
     ] = None,
     cache_dir: Annotated[
@@ -1233,6 +1238,10 @@ def download(
         return
     if store_url is not None or depth is not None:
         raise typer.BadParameter("--store-url and --depth require --source zarr")
+    rprint(
+        "[yellow]NPY tiles are deprecated and will be removed; "
+        "stream GeoTIFFs with --source zarr.[/yellow]"
+    )
 
     from .inputs import resolve_region
 
@@ -1931,7 +1940,7 @@ def webmap(
         Optional[str],
         typer.Option(
             "--dataset-variant",
-            help="Select the dataset variant. If omitted, use the version's default: dclimate-icechunk for v1.1, or cambridge for v1.1 tiles.",
+            help="Select the dataset variant. If omitted, use the version's default in the chosen format. Run geotessera info to list them.",
         ),
     ] = None,
     store_url: Annotated[

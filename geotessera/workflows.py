@@ -4,15 +4,20 @@ from pathlib import Path
 import tempfile
 import json
 import hashlib
+import logging
 
 from .inputs import resolve_region
 
 
 def open_stream(version="v1.1", variant=None, store_url=None, cache_dir=None):
-    from .registry import zarr_store_url
+    from .registry import _parse_dataset_version, variant_note, zarr_store_url
     from .store import GeoTesseraZarr
 
     if store_url is None:
+        if variant is None and (
+            note := variant_note(_parse_dataset_version(version)[1], "stream")
+        ):
+            logging.getLogger(__name__).warning(note)
         store_url = zarr_store_url(version, variant)
     return GeoTesseraZarr(store_url, cache_dir=cache_dir)
 

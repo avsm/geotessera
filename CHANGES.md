@@ -1,11 +1,18 @@
 ## Unreleased
 
-- The default dataset is now v1.1. Streamed reads use the AWS Open Data v1.1
-  Icechunk store, known as `1.1-dclimate-icechunk`. NPY tiles still use `cambridge`
-  and may be slower.
+- The default dataset is now v1.1 `dclimate`, streamed from the AWS Open
+  Data Icechunk store. NPY tiles of v1.1 exist only for the `cambridge`
+  variant, which is a separate inference which does not interoperate with `dclimate`.
+- `geotessera info` now lists a matrix of the models and variants and formats.
+- Streamed GeoTIFFs record their dataset version and variant in their tags
+  and in the output directory's `tessera_metadata.json`, as tile downloads
+  already did. Downloading into a directory that holds another dataset,
+  and merging GeoTIFFs of different datasets, now fail.
 - `GeoTesseraZarr` opens Icechunk repositories (`*.icechunk`), presenting
   each zone's hemisphere groups as one `utmNN` zone.
-- Adds `icechunk` and `numcodecs[pcodec]` dependencies.
+  Adds `icechunk` and `numcodecs[pcodec]` dependencies.
+- NPY tiles are deprecated and will be removed in a future release.
+  Use Zarr or Icechunk and do let us know if you need NPY for some reason.
 
 ## v0.10.3 (2026-09-12)
 

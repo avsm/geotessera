@@ -65,7 +65,7 @@ from rasterio.warp import Resampling, reproject
 from zarr.abc.store import Store as ZarrStore
 from zarr.storage import ObjectStore
 
-from .registry import zarr_store_url
+from .registry import dataset_for_location, zarr_store_url
 
 log = logging.getLogger(__name__)
 
@@ -868,6 +868,10 @@ class GeoTesseraZarr:
         cache_max_size: Bound the *cache_dir* cache in bytes (default
             unbounded).
 
+    Attributes:
+        dataset: The published :class:`~geotessera.registry.Dataset` at
+            *store_url*, or None for another store. Exports record it.
+
     Example::
 
         from geotessera.store import GeoTesseraZarr
@@ -885,6 +889,7 @@ class GeoTesseraZarr:
     """
 
     _icechunk = None  # IcechunkStore when reading an Icechunk repository
+    dataset = None  # registry.Dataset when reading a published store
 
     def __init__(
         self,
@@ -897,6 +902,7 @@ class GeoTesseraZarr:
         if not isinstance(store_url, ZarrStore):
             store_url = os.fsdecode(os.fspath(store_url)).rstrip("/")
         self.url = str(store_url)
+        self.dataset = dataset_for_location(store_url)
         try:
             if is_icechunk_location(store_url):
                 if cache_dir is not None:
@@ -914,9 +920,9 @@ class GeoTesseraZarr:
             zarr.errors.ArrayNotFoundError,
             KeyError,
         ) as e:
-            from .registry import KNOWN_DATASETS
+            from .registry import DATASETS
 
-            available = ", ".join(sorted({f"v{v}" for v, _, d in KNOWN_DATASETS if d}))
+            available = ", ".join(sorted({f"v{ds.version}" for ds in DATASETS}))
             raise ValueError(
                 f"Failed to open zarr store at {self.url!r}. "
                 f"The store may not exist or the URL may be incorrect.\n"

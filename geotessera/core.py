@@ -16,6 +16,7 @@ from .registry import (
     Registry,
     EMBEDDINGS_DIR_NAME,
     UnwritableDestination,
+    dataset_tags,
     tile_to_geotiff_path,
     tile_from_world,
 )
@@ -1349,9 +1350,7 @@ class GeoTessera:
                 # dataset provenance is recoverable from the TIFF alone, even if
                 # separated from the tessera_metadata.json sidecar.
                 dst.update_tags(
-                    TESSERA_DATASET_VERSION=self.registry._version_norm,
-                    TESSERA_DATASET_VERSION_PATH=self.registry._version_path,
-                    TESSERA_DATASET_VARIANT=self.dataset_variant,
+                    **dataset_tags(self.registry.version, self.dataset_variant),
                     TESSERA_YEAR=str(year),
                     TESSERA_TILE_LAT=f"{lat:.2f}",
                     TESSERA_TILE_LON=f"{lon:.2f}",

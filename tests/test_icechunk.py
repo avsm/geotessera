@@ -165,13 +165,62 @@ def test_geotessera_zarr_reads_icechunk(store_path, tmp_path: Path):
     assert np.isfinite(data).any()
 
 
+def test_exports_are_stamped_and_not_mixed(store_path, tmp_path: Path):
+    from geotessera.raster import merge_geotiffs
+    from geotessera.registry import find_dataset, recorded_dataset
+
+    bbox = (2.9999, -0.0004, 3.0005, 0.0006)
+    gt = GeoTesseraZarr(store_path)
+    gt.dataset = find_dataset("1.1", "dclimate")
+    dclimate = gt.export_geotiffs(bbox, 2025, tmp_path / "a", bands=[1])
+    with rasterio.open(dclimate[0]) as src:
+        assert src.tags()["TESSERA_DATASET_VARIANT"] == "dclimate"
+    assert recorded_dataset(tmp_path / "a") == ("1.1", "dclimate")
+
+    gt.dataset = find_dataset("1.1", "cambridge")
+    with pytest.raises(ValueError, match="cannot be interchanged"):
+        gt.export_geotiffs(bbox, 2025, tmp_path / "a", bands=[1])
+    cambridge = gt.export_geotiffs(bbox, 2025, tmp_path / "b", bands=[1])
+    with pytest.raises(ValueError, match="different datasets"):
+        merge_geotiffs(dclimate + cambridge, tmp_path / "mosaic.tif")
+    merge_geotiffs(dclimate, tmp_path / "mosaic.tif")
+
+
 def test_dataset_resolution():
     url, registry = icechunk_dataset("v1.1")
     assert url.endswith("/v1.1/dclimate.icechunk") and registry.endswith("/parts")
     assert icechunk_dataset("v1.1", "cambridge") is None
     assert icechunk_dataset("v1") is None
-    with pytest.raises(ValueError, match="Icechunk"):
-        dataset_path("1.1", "dclimate-icechunk")
+    with pytest.raises(ValueError, match="not published as NPY"):
+        dataset_path("1.1", "dclimate")
+
+
+def test_format_default_stays_within_version():
+    from geotessera.registry import default_variant, variant_note
+
+    assert default_variant("2.0", "icechunk") == "2B-L~beta1"
+    assert variant_note("2.0", "icechunk") is None
+    assert default_variant("9.9", "npy") == "vultr"
+
+
+def test_zarr_copy_keeps_icechunk_registry(monkeypatch):
+    from geotessera import registry
+
+    ds = registry.find_dataset("1.1", "dclimate")
+    both = registry.Dataset(
+        "1.1",
+        "dclimate",
+        zarr="v1.1-dclimate",
+        icechunk=ds.icechunk,
+        tile_registry=ds.tile_registry,
+    )
+    monkeypatch.setattr(
+        registry,
+        "DATASETS",
+        tuple(both if d is ds else d for d in registry.DATASETS),
+    )
+    assert registry.zarr_store_url("v1.1").endswith("/zarr/v1.1-dclimate")
+    assert registry.icechunk_dataset("v1.1") == (ds.icechunk, ds.tile_registry)
 
 
 def test_tile_registry_keeps_latest_run(tmp_path: Path, monkeypatch):
