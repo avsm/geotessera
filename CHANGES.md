@@ -13,6 +13,9 @@
   Adds `icechunk` and `numcodecs[pcodec]` dependencies.
 - NPY tiles are deprecated and will be removed in a future release.
   Use Zarr or Icechunk and do let us know if you need NPY for some reason.
+- `GeoTessera(bbox=...)` and `Registry(bbox=...)` load only the manifest
+  rows near an area, cutting load time and memory for regional work.
+  Queries outside the bbox raise `ValueError`.
 
 ## v0.10.3 (2026-09-12)
 
