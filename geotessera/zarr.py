@@ -1444,11 +1444,17 @@ def _tile_pixel_offset(
     tile_info: TileInfo,
     grid: UnifiedZoneGrid,
 ) -> Tuple[int, int]:
-    """Pixel offset of a tile within the unified zone grid."""
+    """Pixel offset of a tile within the unified zone grid.
+
+    Floor, because the tile's pixels were laid out by stackstac from
+    ``floor(minx / res) * res`` while ``transform`` carries the unsnapped
+    corner, and the grid origin is snapped. Rounding displaced any tile whose
+    fractional offset reached 0.5 by one pixel (#429).
+    """
     tile_x = tile_info.transform.c
     tile_y = northing_to_canonical(tile_info.transform.f, tile_info.epsg)
-    col = round((tile_x - grid.origin_x) / grid.pixel_size)
-    row = round((grid.origin_y - tile_y) / grid.pixel_size)
+    col = math.floor((tile_x - grid.origin_x) / grid.pixel_size)
+    row = math.floor((grid.origin_y - tile_y) / grid.pixel_size)
     return row, col
 
 
