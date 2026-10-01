@@ -203,22 +203,13 @@ def test_format_default_stays_within_version():
     assert default_variant("9.9", "npy") == "vultr"
 
 
-def test_zarr_copy_keeps_icechunk_registry(monkeypatch):
+def test_zarr_copy_keeps_icechunk_registry():
+    """dclimate is published in both formats: streamed from Zarr, but its tile
+    registry still comes from the Icechunk repository beside it."""
     from geotessera import registry
 
     ds = registry.find_dataset("1.1", "dclimate")
-    both = registry.Dataset(
-        "1.1",
-        "dclimate",
-        zarr="v1.1-dclimate",
-        icechunk=ds.icechunk,
-        tile_registry=ds.tile_registry,
-    )
-    monkeypatch.setattr(
-        registry,
-        "DATASETS",
-        tuple(both if d is ds else d for d in registry.DATASETS),
-    )
+    assert ds.zarr and ds.icechunk
     assert registry.zarr_store_url("v1.1").endswith("/zarr/v1.1-dclimate")
     assert registry.icechunk_dataset("v1.1") == (ds.icechunk, ds.tile_registry)
 

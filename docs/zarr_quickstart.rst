@@ -2,7 +2,7 @@ Zarr Quick Start
 ================
 
 ``GeoTesseraZarr`` reads embeddings from a local or remote Zarr store or
-Icechunk repository. The default is the global v1.1 dClimate Icechunk store.
+Icechunk repository. The default is the global v1.1 dClimate Zarr store.
 Queries select the required UTM zones and return dequantized float32 values.
 GeoTessera requires Python 3.12 or later::
 
@@ -166,8 +166,7 @@ Caching
 
 Set ``cache_dir`` to persist Zarr metadata between runs. Byte-range reads
 of sharded embeddings are cached within the process. Each store uses a
-separate cache subdirectory. Icechunk stores, including the default,
-ignore ``cache_dir``::
+separate cache subdirectory. Icechunk stores ignore ``cache_dir``::
 
     gt = GeoTesseraZarr(zarr_store_url("v2"), cache_dir="tessera-cache")
 

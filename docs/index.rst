@@ -10,7 +10,7 @@ representations optimized for downstream geospatial analysis tasks.
 .. important::
 
    **Multiple Tessera versions are published.** The default is **1.1** /
-   ``dclimate``, a complete global run streamed from Icechunk. Its NPY
+   ``dclimate``, a complete global run streamed from Zarr. Its NPY
    tiles are not published; v1.1 NPY tiles come from the separate
    ``cambridge`` run. **TESSERA v2** betas (``2B-L~beta1``, ``2B-L~beta2``)
    are also published. The legacy 1.0 line is frozen. **Never mix
@@ -302,7 +302,7 @@ with ``geotessera info``:
 +=============+======================+======================+====================+====================================================+===========+
 | ``1.0``     | ``vultr`` (default)  | ``v1/``              | ``v1/``            | —                                                  | 2017–2025 |
 +-------------+----------------------+----------------------+--------------------+----------------------------------------------------+-----------+
-| ``1.1``     | ``dclimate``         | —                    | —                  | ``s3://tessera-embeddings/v1.1/dclimate.icechunk`` | 2017–2025 |
+| ``1.1``     | ``dclimate``         | —                    | ``v1.1-dclimate/`` | ``s3://tessera-embeddings/v1.1/dclimate.icechunk`` | 2017–2025 |
 |             | (default)            |                      |                    |                                                    |           |
 +-------------+----------------------+----------------------+--------------------+----------------------------------------------------+-----------+
 | ``1.1``     | ``cambridge``        | ``v1.1-cam/``        | ``v1.1/``          | —                                                  | 2015–2025 |
@@ -451,12 +451,14 @@ Data Organization
     └── zarr/                                        # Cloud-native zarr stores
         ├── v1/                                      # 1.0 / vultr: 60 UTM zone groups + RGB pyramid
         ├── v1.1/                                    # 1.1 / cambridge
+        ├── v1.1-dclimate/                           # 1.1 / dclimate, the default
         ├── v2-2B-L~beta1/                           # v2 beta, with embeddings_d4/d16
         └── v2-2B-L~beta2/
 
-The ``1.1`` / ``dclimate`` dataset is an Icechunk repository at
-``s3://tessera-embeddings/v1.1/dclimate.icechunk``, with its tile registry
-under ``s3://tessera-embeddings/v1.1/dclimate.registry/``.
+The ``1.1`` / ``dclimate`` dataset is published twice over: as the Zarr store
+above, which streamed reads use, and as an Icechunk repository at
+``s3://tessera-embeddings/v1.1/dclimate.icechunk``, which holds its tile
+registry under ``s3://tessera-embeddings/v1.1/dclimate.registry/``.
 
 Each ``manifest.parquet`` is scoped to one dataset — the npy/ directory
 name encodes the ``(version, variant)`` pair. The client downloads only the

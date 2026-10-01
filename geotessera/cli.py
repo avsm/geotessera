@@ -397,11 +397,19 @@ def _icechunk_info(url: str, verbose: bool, version: str, variant) -> None:
     years = store.years
     incomplete = store.incomplete_years()
     table = create_table(show_header=False, box=None)
-    from geotessera.registry import _parse_dataset_version, default_variant
+    from geotessera.registry import (
+        _parse_dataset_version,
+        default_variant,
+        find_dataset,
+    )
 
     version_path, norm = _parse_dataset_version(version)
     variant = variant or default_variant(norm, "stream")
-    table.add_row("Selected:", f"{version_path} {variant} (Icechunk)")
+    # The counts below come from the Icechunk repository, which holds the tile
+    # registry, but a dataset published in both formats is read from Zarr.
+    ds = find_dataset(norm, variant)
+    streamed = "Zarr" if ds is not None and ds.zarr else "Icechunk"
+    table.add_row("Selected:", f"{version_path} {variant} ({streamed})")
     table.add_row("Checkpoint:", str(attrs.get("checkpoint_id", "-")))
     table.add_row("Years:", f"{years[0]}-{years[-1]}" if years else "-")
     table.add_row("UTM zones:", str(len(store.zones())))

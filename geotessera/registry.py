@@ -90,6 +90,7 @@ DATASETS: Tuple[Dataset, ...] = (
         "1.1",
         "dclimate",
         "Complete global run",
+        zarr="v1.1-dclimate",
         icechunk="s3://tessera-embeddings/v1.1/dclimate.icechunk",
         tile_registry="s3://tessera-embeddings/v1.1/dclimate.registry/parts",
     ),

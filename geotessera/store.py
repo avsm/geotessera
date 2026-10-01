@@ -3,7 +3,7 @@ GeoTesseraZarr — read embeddings from a Tessera zarr store.
 
 The store is UTM-native: embeddings live under one ``utm{NN}`` group per UTM
 zone, on the grid they were produced on.  An Icechunk repository
-(``*.icechunk``), such as the default dClimate v1.1 store, is read through
+(``*.icechunk``), such as the dClimate v1.1 repository, is read through
 :class:`geotessera.icechunk.IcechunkStore`, which presents its hemisphere
 groups in the same layout.  Nothing here reprojects pixels, and
 the two layers each speak one coordinate system:
@@ -899,7 +899,7 @@ class GeoTesseraZarr:
         store_url: Zarr store URL, local path, or a ``zarr.abc.store.Store``
             such as a cache-wrapped store from :func:`zarr_store`. A
             location ending in ``.icechunk`` opens an Icechunk repository.
-            Defaults to the v1.1 dClimate Icechunk store,
+            Defaults to the v1.1 dClimate Zarr store,
             ``zarr_store_url()``.
         cache_dir: Persist reads under this directory, keyed per store
             location (see :func:`zarr_store`). Requires a URL or path

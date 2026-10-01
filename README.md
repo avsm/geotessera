@@ -562,14 +562,15 @@ published in one or more formats:
 | Version | Variant                | NPY tiles (`npy/`)   | Zarr (`zarr/`)   | Icechunk                                         |
 |---------|------------------------|----------------------|------------------|--------------------------------------------------|
 | `1.0`   | `vultr` (default)      | `v1/`                | `v1/`            | —                                                |
-| `1.1`   | `dclimate` (default)   | —                    | —                | `s3://tessera-embeddings/v1.1/dclimate.icechunk` |
+| `1.1`   | `dclimate` (default)   | —                    | `v1.1-dclimate/` | `s3://tessera-embeddings/v1.1/dclimate.icechunk` |
 | `1.1`   | `cambridge`            | `v1.1-cam/`          | `v1.1/`          | —                                                |
 | `2.0`   | `2B-L~beta1` (default) | `v2-2B-L~beta1/`     | `v2-2B-L~beta1/` | —                                                |
 | `2.0`   | `2B-L~beta2`           | `v2-2B-L~beta2/`     | `v2-2B-L~beta2/` | —                                                |
 
 The default version is `v1.1`. Streamed reads (`GeoTesseraZarr()`,
 `download`, `webmap`) use the version's default variant, `dclimate`, read
-from the global [Icechunk store](https://github.com/dClimate/tessera-embeddings/blob/main/docs/global-store.md).
+from its Zarr store on Source Cooperative; the same run is also published as
+an [Icechunk store](https://github.com/dClimate/tessera-embeddings/blob/main/docs/global-store.md).
 NPY tiles of v1.1 exist only for `cambridge`, so `GeoTessera` and
 `download --format npy` fall back to it with a warning; pass
 `--dataset-variant cambridge` to select it explicitly. `coverage` and
@@ -703,6 +704,7 @@ Remote Server (https://data.source.coop/tessera/tessera)
 └── zarr/                                      # Cloud-native zarr stores
     ├── v1/                                    # 1.0 / vultr: 60 UTM zone groups + RGB pyramid
     ├── v1.1/                                  # 1.1 / cambridge
+    ├── v1.1-dclimate/                         # 1.1 / dclimate, the default
     ├── v2-2B-L~beta1/                         # v2 stores add matryoshka
     └── v2-2B-L~beta2/                         # prefix arrays (d4, d16)
 

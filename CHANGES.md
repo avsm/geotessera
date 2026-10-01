@@ -1,29 +1,38 @@
-## v0.11.0 (2026-10-01)
+## v0.11.0
 
-- The default dataset is now v1.1 `dclimate`, a complete global run streamed
-  from its AWS Open Data Icechunk store. `GeoTesseraZarr` opens Icechunk
-  repositories (`*.icechunk`), presenting each zone's hemisphere groups as one
-  `utmNN` zone. Adds `icechunk` and `numcodecs[pcodec]` dependencies.
+- The default dataset is now `v1.1-dclimate`, which is a complete global run.
+  It is published both as a Zarr store on Source Cooperative, which streamed
+  reads use, and as an Icechunk repository on AWS Open Data, which holds its
+  tile registry. The default now honours `cache_dir`, which the Icechunk
+  path ignores.
+
+  `GeoTesseraZarr` now opens Icechunk repositories (`*.icechunk`), presenting
+   each zone's hemisphere groups as one `utmNN` zone. This adds `icechunk` and
+  `numcodecs[pcodec]` dependencies.
+
 - NPY tiles are deprecated and will be removed in a future release. Use Zarr
   or Icechunk, and do let us know if you need NPY for some reason. v1.1 NPY
   exists only for the `cambridge` variant, a separate inference run that does
   not interoperate with `dclimate`.
+
 - `geotessera info` lists every published dataset as a matrix of variants and
   formats, marking the default for each.
+
 - `GeoTessera(bbox=...)` and `Registry(bbox=...)` load only the manifest rows
   near an area, cutting load time and memory for regional work. Queries
   outside the bbox raise `ValueError`. (#414 @WCMC-vblanque)
+
 - Streamed GeoTIFFs record their dataset version and variant in their tags
   and in the output directory's `tessera_metadata.json`, as tile downloads
   already did. Downloading into a directory that holds another dataset,
   and merging GeoTIFFs of different datasets, now fail.
+
 - Zarr stores no longer have a one-pixel nodata seam between adjacent tiles.
   (#429 @mtelvers)
+
 - A `data.source.coop` store is read straight from S3 when the `s3` extra is
   installed, avoiding the HTTPS gateway that drops requests under the volume
   a region read generates. (#430 @KBodolai)
-- Requires `zarr-cm>=0.5`, whose convention registrations newly written
-  stores carry.
 
 ## v0.10.3 (2026-09-12)
 
