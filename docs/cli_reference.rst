@@ -8,8 +8,17 @@ Synopsis
 
 ::
 
-    geotessera COMMAND [OPTIONS]
+    geotessera [GLOBAL OPTIONS] COMMAND [OPTIONS]
     geotessera COMMAND --help
+
+Global options
+--------------
+
+``--via-gateway``
+    Read Source Cooperative stores through the ``data.source.coop`` gateway
+    rather than straight from the bucket. Given before the command name, and
+    equivalent to ``GEOTESSERA_VIA_GATEWAY=1``, which worker processes also
+    see.
 
 Commands
 --------

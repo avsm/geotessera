@@ -161,6 +161,19 @@ Variants are separate inference runs. Use one version and variant per
 analysis: their embeddings cannot be interchanged. See
 :ref:`dataset-versions`.
 
+Where reads go
+--------------
+
+A Source Cooperative store is read straight from the bucket's own endpoint
+rather than through the ``data.source.coop`` gateway, which drops requests
+under the volume a region read generates — sampling one point from the
+default store took 5.8s direct against 163.6s through the gateway. The
+objects, and the anonymous HTTPS they are served over, are the same either
+way. Pass ``via_gateway=True`` (or the ``--via-gateway`` flag, or
+``GEOTESSERA_VIA_GATEWAY=1``) to use the gateway::
+
+    gt = GeoTesseraZarr(via_gateway=True)
+
 Caching
 -------
 

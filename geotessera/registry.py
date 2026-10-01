@@ -624,7 +624,15 @@ def tile_to_bounds(lon: float, lat: float) -> Tuple[float, float, float, float]:
 TESSERA_MIRROR_ENDPOINT = "https://data.source.coop"
 TESSERA_MIRROR_REPO = "tessera/tessera"
 TESSERA_MIRROR_S3_BUCKET = "us-west-2.opendata.source.coop"
+TESSERA_MIRROR_REGION = "us-west-2"
 TESSERA_MIRROR_URL = f"{TESSERA_MIRROR_ENDPOINT}/{TESSERA_MIRROR_REPO}"
+# The bucket's own anonymous endpoint, which serves the same objects without
+# the gateway in front. Path style, because the bucket name carries dots and
+# so cannot be a virtual host under the wildcard certificate.
+TESSERA_MIRROR_S3_HTTP_URL = (
+    f"https://s3.{TESSERA_MIRROR_REGION}.amazonaws.com"
+    f"/{TESSERA_MIRROR_S3_BUCKET}/{TESSERA_MIRROR_REPO}"
+)
 TESSERA_NPY_MIRROR_URL = f"{TESSERA_MIRROR_URL}/npy"
 TESSERA_LANDMASKS_MIRROR_URL = f"{TESSERA_MIRROR_URL}/landmasks"
 

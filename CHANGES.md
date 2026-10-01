@@ -30,9 +30,13 @@
 - Zarr stores no longer have a one-pixel nodata seam between adjacent tiles.
   (#429 @mtelvers)
 
-- A `data.source.coop` store is read straight from S3 when the `s3` extra is
-  installed, avoiding the HTTPS gateway that drops requests under the volume
-  a region read generates. (#430 @KBodolai)
+- Source Cooperative stores are read straight from the bucket rather than
+  through the `data.source.coop` gateway, which drops requests under the
+  volume a region read generates. Sampling a point from the default store
+  took 5.8s this way against 163.6s through the gateway. It is the same
+  anonymous HTTPS either way, so this needs no credentials and no extra.
+  Pass `--via-gateway`, or set `GEOTESSERA_VIA_GATEWAY=1`, for the old
+  route. (#430 @KBodolai)
 
 ## v0.10.3 (2026-09-12)
 

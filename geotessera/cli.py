@@ -107,6 +107,25 @@ app = typer.Typer(
 )
 
 
+@app.callback()
+def global_options(
+    via_gateway: bool = typer.Option(
+        False,
+        "--via-gateway",
+        help="Read Source Cooperative stores through the data.source.coop "
+        "gateway rather than straight from the bucket.",
+    ),
+) -> None:
+    """Options that apply to every command, given before the command name."""
+    if via_gateway:
+        # An environment variable rather than a parameter: zarr fills and
+        # preview builds open the store again in worker processes, which
+        # inherit the environment but not a function argument.
+        from .store import GATEWAY_ENV
+
+        os.environ[GATEWAY_ENV] = "1"
+
+
 # Helper to create tables with appropriate settings for dumb terminals
 def create_table(show_header=True, header_style=None, box=None, **kwargs):
     """Create a Rich Table with appropriate settings for terminal capabilities.

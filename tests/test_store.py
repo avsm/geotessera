@@ -646,32 +646,43 @@ def test_persistent_cache_keying(tmp_path: Path):
         zarr_store(zarr_store(str(tmp_path / "s1")), cache_dir=cache)
 
 
-def test_s3_mirror_location():
-    mirror_url = zarr_store_url("v1")
-    try:
-        import s3fs  # noqa: F401
+def test_s3_mirror_location(monkeypatch):
+    from geotessera.store import GATEWAY_ENV
 
-        s3fs_installed = True
-    except ImportError:
-        s3fs_installed = False
-
-    rewritten = _s3_mirror_location(mirror_url)
-    if s3fs_installed:
-        assert_check(
-            "a Source Cooperative URL rewrites to s3:// with anon path-style options",
-            rewritten is not None
-            and rewritten[0]
-            == "s3://us-west-2.opendata.source.coop/tessera/tessera/zarr/v1"
-            and rewritten[1]["client_kwargs"]["region_name"] == "us-west-2"
-            and rewritten[1]["anon"] is True,
-        )
-    else:
-        assert_check(
-            "without s3fs installed, no rewrite is attempted",
-            rewritten is None,
-        )
-
+    monkeypatch.delenv(GATEWAY_ENV, raising=False)
+    assert_check(
+        "a Source Cooperative URL rewrites to the bucket's own endpoint",
+        _s3_mirror_location(zarr_store_url("v1"))
+        == "https://s3.us-west-2.amazonaws.com"
+        "/us-west-2.opendata.source.coop/tessera/tessera/zarr/v1",
+    )
     assert_check(
         "a non-Source-Cooperative HTTPS URL is never rewritten",
         _s3_mirror_location("https://mirror.example.org/zarr/v1") is None,
+    )
+
+    # The rewrite is what a read actually opens, and the gateway stays
+    # reachable for anyone who needs it -- by flag or by environment.
+    def opened(url, **kwargs):
+        return zarr_store(url, **kwargs).store.url
+
+    direct = "https://s3.us-west-2.amazonaws.com/us-west-2.opendata.source.coop"
+    assert_check(
+        "a read goes straight to the bucket by default",
+        opened(zarr_store_url("v1")).startswith(direct),
+    )
+    assert_check(
+        "via_gateway=True keeps the gateway",
+        opened(zarr_store_url("v1"), via_gateway=True).startswith(
+            "https://data.source.coop"
+        ),
+    )
+    monkeypatch.setenv(GATEWAY_ENV, "1")
+    assert_check(
+        f"{GATEWAY_ENV} keeps the gateway, for worker processes",
+        opened(zarr_store_url("v1")).startswith("https://data.source.coop"),
+    )
+    assert_check(
+        "an explicit via_gateway=False still overrides the environment",
+        opened(zarr_store_url("v1"), via_gateway=False).startswith(direct),
     )
