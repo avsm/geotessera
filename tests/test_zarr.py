@@ -11,6 +11,7 @@ import pytest
 from geotessera import remote
 from geotessera.zarr import (
     REGISTRY_DIR_NAME,
+    _tile_pixel_offset,
     StoreLocation,
     TileInfo,
     TileSource,
@@ -18,6 +19,7 @@ from geotessera.zarr import (
     build_shard_index,
     load_merged_registry,
     merge_tile_registry,
+    project_tile,
     shard_coords_for_tiles,
 )
 
@@ -301,6 +303,46 @@ def test_legacy_registry_merge(tmp_path: Path):
     assert_check(
         "legacy root registry is still read",
         written(legacy, 2024, 31) == {(0.05, 52.05), (0.15, 52.05)},
+    )
+
+
+def test_adjacent_tiles_abut_without_a_seam():
+    """Neighbouring tiles must leave no unwritten column between them (#429).
+
+    project_tile's transform carries the raw projected corner, while the
+    pixels it describes were snapped by stackstac to floor(minx / res) * res.
+    Rounding that offset displaces a tile by one pixel once the fractional
+    part reaches 0.5, and where its neighbour is not displaced the column
+    between them is written by nobody and keeps the +inf no-data fill.
+
+    These are the two tiles either side of lon -79.30 in utm17, the seam
+    reported in #429: the eastern one lands on a fraction of 0.508, only just
+    over the half pixel that used to tip it over.
+    """
+    grid = UnifiedZoneGrid(
+        zone=17,
+        years=[2024],
+        canonical_epsg=32617,
+        origin_x=169670.0,  # as published; snapped, per compute_unified_zone_grid
+        origin_y=9217520.0,
+        width_px=8192,
+        height_px=8192,
+    )
+    cache = {}
+    west = project_tile(-79.35, -0.55, transformer_cache=cache)
+    east = project_tile(-79.25, -0.55, transformer_cache=cache)
+
+    _, west_col = _tile_pixel_offset(west, grid)
+    _, east_col = _tile_pixel_offset(east, grid)
+
+    assert_check(
+        "the eastern tile's offset is the one that used to round up",
+        ((east.transform.c - grid.origin_x) / grid.pixel_size) % 1 > 0.5,
+    )
+    assert_check(
+        "adjacent tiles abut with no unwritten column between them",
+        east_col == west_col + west.width,
+        f"west {west_col}+{west.width} != east {east_col}",
     )
 
 
