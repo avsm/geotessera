@@ -1,11 +1,13 @@
 """Concurrent and interrupted creation of preview metadata."""
 
 import errno
+from operator import itemgetter
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import zarr
+from zarr_cm import convention_metadata
 
 import geotessera.zarr as build
 
@@ -114,11 +116,16 @@ def test_preview_publishes_complete_attributes(preview_store, monkeypatch):
     for snapshot in snapshots:
         assert snapshot == snapshots[-1]
         assert "multiscales" in snapshot
-        assert {c["name"] for c in snapshot["zarr_conventions"]} == {
-            "spatial:",
-            "proj:",
-            "multiscales",
-        }
+        # Each convention spells its own registration (see test_zarr.py), so
+        # ask zarr-cm for the pinned revisions rather than naming them here.
+        assert sorted(snapshot["zarr_conventions"], key=itemgetter("uuid")) == sorted(
+            (
+                convention_metadata("spatial", revision=build.SPATIAL_REVISION),
+                convention_metadata("proj", revision=build.PROJ_REVISION),
+                convention_metadata("multiscales", revision=build.MULTISCALES_REVISION),
+            ),
+            key=itemgetter("uuid"),
+        )
 
 
 @pytest.mark.parametrize("winerror", [5, 32, 33])
