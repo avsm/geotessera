@@ -1,21 +1,29 @@
-## Unreleased
+## v0.11.0 (2026-10-01)
 
-- The default dataset is now v1.1 `dclimate`, streamed from the AWS Open
-  Data Icechunk store. NPY tiles of v1.1 exist only for the `cambridge`
-  variant, which is a separate inference which does not interoperate with `dclimate`.
-- `geotessera info` now lists a matrix of the models and variants and formats.
+- The default dataset is now v1.1 `dclimate`, a complete global run streamed
+  from its AWS Open Data Icechunk store. `GeoTesseraZarr` opens Icechunk
+  repositories (`*.icechunk`), presenting each zone's hemisphere groups as one
+  `utmNN` zone. Adds `icechunk` and `numcodecs[pcodec]` dependencies.
+- NPY tiles are deprecated and will be removed in a future release. Use Zarr
+  or Icechunk, and do let us know if you need NPY for some reason. v1.1 NPY
+  exists only for the `cambridge` variant, a separate inference run that does
+  not interoperate with `dclimate`.
+- `geotessera info` lists every published dataset as a matrix of variants and
+  formats, marking the default for each.
+- `GeoTessera(bbox=...)` and `Registry(bbox=...)` load only the manifest rows
+  near an area, cutting load time and memory for regional work. Queries
+  outside the bbox raise `ValueError`. (#414 @WCMC-vblanque)
 - Streamed GeoTIFFs record their dataset version and variant in their tags
   and in the output directory's `tessera_metadata.json`, as tile downloads
   already did. Downloading into a directory that holds another dataset,
   and merging GeoTIFFs of different datasets, now fail.
-- `GeoTesseraZarr` opens Icechunk repositories (`*.icechunk`), presenting
-  each zone's hemisphere groups as one `utmNN` zone.
-  Adds `icechunk` and `numcodecs[pcodec]` dependencies.
-- NPY tiles are deprecated and will be removed in a future release.
-  Use Zarr or Icechunk and do let us know if you need NPY for some reason.
-- `GeoTessera(bbox=...)` and `Registry(bbox=...)` load only the manifest
-  rows near an area, cutting load time and memory for regional work.
-  Queries outside the bbox raise `ValueError`.
+- Zarr stores no longer have a one-pixel nodata seam between adjacent tiles.
+  (#429 @mtelvers)
+- A `data.source.coop` store is read straight from S3 when the `s3` extra is
+  installed, avoiding the HTTPS gateway that drops requests under the volume
+  a region read generates. (#430 @KBodolai)
+- Requires `zarr-cm>=0.5`, whose convention registrations newly written
+  stores carry.
 
 ## v0.10.3 (2026-09-12)
 
