@@ -109,8 +109,9 @@ GEOEMB_CONVENTION = {
 }
 
 # Revisions of the shared conventions to stamp into ``zarr_conventions``.
-# zarr-cm pins each revision to the spec commit that defined it, so these
-# resolve where a tag-based URL does not. ``multiscales`` has no r3.
+# zarr-cm resolves each revision to the spec that defined it and writes the
+# registration itself, so a revision is all we choose. ``multiscales`` has no
+# r3.
 SPATIAL_REVISION = "r3"
 PROJ_REVISION = "r3"
 MULTISCALES_REVISION = "r2"
@@ -123,33 +124,35 @@ def _geo_convention_attrs(
     transform: Optional[List[float]] = None,
     shape: Optional[List[int]] = None,
     registration: str = "pixel",
+    extra_conventions: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build ``spatial:`` and ``proj:`` attrs plus their registrations.
 
     Arguments left as None are omitted rather than written as nulls, so a
     group that has no single affine transform (the multiscale pyramid root,
     whose geometry is per level) carries only the attributes it can state.
-    """
-    from zarr_cm import geo_proj, spatial
 
-    attrs: Dict[str, Any] = {}
-    attrs = spatial.insert(
-        attrs,
-        spatial.create(
-            revision=SPATIAL_REVISION,
-            dimensions=dimensions,
-            bbox=bbox,
-            transform_type="affine",
-            transform=transform,
-            shape=shape,
-            registration=registration,
-        ),
+    ``extra_conventions`` holds further conventions, each already formed by
+    its own ``create``, to register in the same pass; zarr-cm combines the
+    registrations so no convention can drop another's.
+    """
+    from zarr_cm import create_many, proj, spatial
+
+    return create_many(
+        {
+            "spatial": spatial.create(
+                revision=SPATIAL_REVISION,
+                dimensions=dimensions,
+                bbox=bbox,
+                transform_type="affine",
+                transform=transform,
+                shape=shape,
+                registration=registration,
+            ),
+            "proj": proj.create(revision=PROJ_REVISION, code=crs),
+            **(extra_conventions or {}),
+        }
     )
-    attrs = geo_proj.insert(
-        attrs,
-        geo_proj.create(revision=PROJ_REVISION, code=crs),
-    )
-    return attrs
 
 
 # ---------------------------------------------------------------------------
@@ -5471,20 +5474,18 @@ def _ensure_global_store_once(dest: "StoreLocation", num_levels: int) -> None:
         res *= 2.0
 
     # The pyramid root states no single transform or shape — each level
-    # carries its own in the layout entries above. Insert multiscales last so
-    # it joins the same ``zarr_conventions`` list rather than replacing it.
+    # carries its own in the layout entries above.
     attrs = _geo_convention_attrs(
         dimensions=["lat", "lon"],
         crs="EPSG:4326",
         bbox=[west, south, east, north_],
-    )
-    attrs = multiscales.insert(
-        attrs,
-        multiscales.create(
-            revision=MULTISCALES_REVISION,
-            layout=levels,
-            resampling_method="mean",
-        ),
+        extra_conventions={
+            "multiscales": multiscales.create(
+                revision=MULTISCALES_REVISION,
+                layout=levels,
+                resampling_method="mean",
+            )
+        },
     )
     if any(global_grp.attrs.get(key) != value for key, value in attrs.items()):
         # Attributes.update writes once per key. Publish the complete map in

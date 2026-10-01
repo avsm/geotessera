@@ -41,7 +41,7 @@ dependencies = [
     "dask",
     "fsspec",
     "aiohttp",
-    "zarr-cm>=0.4.1",
+    "zarr-cm>=0.5",
     "contextily",
     "icechunk>=2.2",
     "numcodecs[pcodec]>=0.16",

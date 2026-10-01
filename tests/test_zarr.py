@@ -3,6 +3,7 @@
 import logging
 import warnings
 from itertools import pairwise
+from operator import itemgetter
 from pathlib import Path
 
 import numpy as np
@@ -797,12 +798,16 @@ def test_global_preview_pyramid(tmp_path: Path):
     from concurrent.futures import ThreadPoolExecutor
 
     import zarr
+    from zarr_cm import convention_metadata
 
     from geotessera.zarr import (
         GLOBAL_CHUNK,
         GLOBAL_LEVEL0_H,
         GLOBAL_LEVEL0_W,
         GLOBAL_NUM_BANDS,
+        MULTISCALES_REVISION,
+        PROJ_REVISION,
+        SPATIAL_REVISION,
         _coarsen_zone_pyramid,
         _ensure_global_store,
         _preview_marker_parts,
@@ -823,10 +828,22 @@ def test_global_preview_pyramid(tmp_path: Path):
             == (GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W, GLOBAL_NUM_BANDS),
         )
         assert_check(f"pyramid levels created over {label}", "global_rgb/3/rgb" in root)
+        # How a convention is spelled in zarr_conventions -- name, uuid and
+        # the two URLs -- belongs to the convention, not to us, so expect what
+        # the pinned revisions declare rather than literals that go stale when
+        # zarr-cm restates them.
+        expected = sorted(
+            (
+                convention_metadata("spatial", revision=SPATIAL_REVISION),
+                convention_metadata("proj", revision=PROJ_REVISION),
+                convention_metadata("multiscales", revision=MULTISCALES_REVISION),
+            ),
+            key=itemgetter("uuid"),
+        )
         assert_check(
             f"pyramid registers its conventions over {label}",
-            {c["name"] for c in root["global_rgb"].attrs["zarr_conventions"]}
-            == {"spatial:", "proj:", "multiscales"},
+            sorted(root["global_rgb"].attrs["zarr_conventions"], key=itemgetter("uuid"))
+            == expected,
         )
         assert_check(
             f"pyramid keeps per-level geometry over {label}",
@@ -1134,16 +1151,23 @@ def test_nested_depths_and_preview_source(tmp_path: Path):
         all(zone[depth_band_dim(d)].shape == (d,) for d in (4, 16)),
     )
 
-    # Write one shard the way _fill_and_write_shard does — prefixes first, full
-    # depth last — and check the prefixes really are prefixes.
+    # Write into one shard the way _fill_and_write_shard does — prefixes first,
+    # full depth last — and check the prefixes really are prefixes. Only the
+    # corner the assertions read is written: a whole 4096px shard of random
+    # int8 is 2GiB to hold and, being incompressible, minutes of blosc on a
+    # Windows runner, for no coverage the corner does not already give. The
+    # window is a multiple of every depth's inner chunk, so each write still
+    # fills whole chunks.
+    window = 512
+    assert window % max(depth_inner_chunk(d) for d in (4, 16, N_BANDS)) == 0
     rng = np.random.default_rng(0)
-    emb = rng.integers(-128, 127, size=(N_BANDS, SHARD_SIZE, SHARD_SIZE), dtype=np.int8)
+    emb = rng.integers(-128, 127, size=(N_BANDS, window, window), dtype=np.int8)
 
     _zone_rw = depth_root.open_group(mode="r+", path="utm31", zarr_format=3)
     for _d in (4, 16):
-        _zone_rw[depth_array_name(_d)][0, :, 0:SHARD_SIZE, 0:SHARD_SIZE] = emb[:_d]
-    _zone_rw["embeddings"][0, :, 0:SHARD_SIZE, 0:SHARD_SIZE] = emb
-    _zone_rw["scales"][0, 0:SHARD_SIZE, 0:SHARD_SIZE] = np.float32(0.05)
+        _zone_rw[depth_array_name(_d)][0, :, 0:window, 0:window] = emb[:_d]
+    _zone_rw["embeddings"][0, :, 0:window, 0:window] = emb
+    _zone_rw["scales"][0, 0:window, 0:window] = np.float32(0.05)
 
     assert_check(
         "depth-4 array is the first 4 dims of the full array",
