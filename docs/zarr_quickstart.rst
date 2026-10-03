@@ -164,15 +164,25 @@ analysis: their embeddings cannot be interchanged. See
 Where reads go
 --------------
 
-A Source Cooperative store is read straight from the bucket's own endpoint
-rather than through the ``data.source.coop`` gateway, which drops requests
-under the volume a region read generates — sampling one point from the
-default store took 5.8s direct against 163.6s through the gateway. The
-objects, and the anonymous HTTPS they are served over, are the same either
-way. Pass ``via_gateway=True`` (or the ``--via-gateway`` flag, or
-``GEOTESSERA_VIA_GATEWAY=1``) to use the gateway::
+The default is ``v1.1-dclimate`` in Zarr format, read directly from AWS over
+HTTPS. ``geotessera info`` displays direct AWS HTTPS URLs.
+
+To opt into the Source Cooperative Cloudflare proxy in Python::
 
     gt = GeoTesseraZarr(via_gateway=True)
+
+For the CLI, put the global flag before the command name::
+
+    geotessera --via-gateway download --bbox 0.05,52.15,0.20,52.25 --output tiles
+
+Or set ``GEOTESSERA_VIA_GATEWAY=1`` in the environment. Unset it, or set it to
+``0``, to return to direct reads. In Python, ``via_gateway=False`` explicitly
+selects direct reads even when the environment variable is set.
+
+The option accepts either public mirror URL form, including a direct AWS
+HTTPS URL copied from ``info``. Both routes serve the same objects anonymously,
+require no AWS credentials, and share dataset identity and cache entries.
+Icechunk and unrelated stores are unaffected.
 
 Caching
 -------

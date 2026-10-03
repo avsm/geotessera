@@ -16,7 +16,9 @@
   not interoperate with `dclimate`.
 
 - `geotessera info` lists every published dataset as a matrix of variants and
-  formats, marking the default for each.
+  formats, marking `v1.1-dclimate (Zarr)` as the default. Zarr store URLs point
+  directly to AWS HTTPS. The default note no longer lists format-specific
+  fallback variants.
 
 - `GeoTessera(bbox=...)` and `Registry(bbox=...)` load only the manifest rows
   near an area, cutting load time and memory for regional work. Queries
@@ -35,8 +37,10 @@
   volume a region read generates. Sampling a point from the default store
   took 5.8s this way against 163.6s through the gateway. It is the same
   anonymous HTTPS either way, so this needs no credentials and no extra.
-  Pass `--via-gateway`, or set `GEOTESSERA_VIA_GATEWAY=1`, for the old
-  route. (#430 @KBodolai)
+  Opt into the Source Cooperative proxy with `geotessera --via-gateway COMMAND`,
+  `GEOTESSERA_VIA_GATEWAY=1`, or `GeoTesseraZarr(via_gateway=True)` in Python.
+  This also works with direct AWS HTTPS URLs copied from `info`. Both routes
+  retain dataset identity and share cache entries. (#430 @KBodolai)
 
 ## v0.10.3 (2026-09-12)
 

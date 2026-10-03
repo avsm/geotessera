@@ -2,6 +2,8 @@ CLI Reference
 =============
 
 ``geotessera`` reads, exports, and displays Tessera embeddings.
+The default dataset is ``v1.1-dclimate``, read as Zarr over direct AWS HTTPS.
+``geotessera info`` lists the direct URLs.
 
 Synopsis
 --------
@@ -15,10 +17,22 @@ Global options
 --------------
 
 ``--via-gateway``
-    Read Source Cooperative stores through the ``data.source.coop`` gateway
-    rather than straight from the bucket. Given before the command name, and
-    equivalent to ``GEOTESSERA_VIA_GATEWAY=1``, which worker processes also
-    see.
+    Opt into the Source Cooperative proxy at ``data.source.coop`` for public
+    mirror Zarr reads. Direct AWS HTTPS is the default. Place this flag
+    before the command name::
+
+        geotessera --via-gateway download --bbox 0.05,52.15,0.20,52.25 --output tiles
+
+    Alternatively, set the environment variable for the command and its
+    worker processes::
+
+        GEOTESSERA_VIA_GATEWAY=1 geotessera download --bbox 0.05,52.15,0.20,52.25 --output tiles
+
+    Omit the flag and unset the variable (or set it to ``0``) to use direct
+    AWS reads again. The option works with either the gateway URL or the
+    direct AWS HTTPS URL shown by ``info``. Both routes read the same objects
+    anonymously and share the same cache. Icechunk and unrelated stores are
+    unaffected.
 
 Commands
 --------

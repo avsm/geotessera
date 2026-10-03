@@ -646,7 +646,15 @@ def test_persistent_cache_keying(tmp_path: Path):
         zarr_store(zarr_store(str(tmp_path / "s1")), cache_dir=cache)
 
 
-def test_s3_mirror_location(monkeypatch):
+@pytest.mark.parametrize("version", ["v1", "v1.1", "v2"])
+def test_public_routes_share_cache(version):
+    gateway = zarr_store_url(version)
+    direct = _s3_mirror_location(gateway)
+    assert _store_cache_key(direct + "/") == _store_cache_key(gateway)
+
+
+@pytest.mark.parametrize("direct_input", [False, True])
+def test_s3_mirror_location(monkeypatch, direct_input):
     from geotessera.store import GATEWAY_ENV
 
     monkeypatch.delenv(GATEWAY_ENV, raising=False)
@@ -664,6 +672,8 @@ def test_s3_mirror_location(monkeypatch):
     # The rewrite is what a read actually opens, and the gateway stays
     # reachable for anyone who needs it -- by flag or by environment.
     def opened(url, **kwargs):
+        if direct_input:
+            url = _s3_mirror_location(url)
         return zarr_store(url, **kwargs).store.url
 
     direct = "https://s3.us-west-2.amazonaws.com/us-west-2.opendata.source.coop"

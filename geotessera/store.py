@@ -65,7 +65,7 @@ from rasterio.warp import Resampling, reproject
 from zarr.abc.store import Store as ZarrStore
 from zarr.storage import ObjectStore
 
-from .registry import dataset_for_location, zarr_store_url
+from .registry import canonical_store_location, dataset_for_location, zarr_store_url
 
 log = logging.getLogger(__name__)
 
@@ -108,7 +108,7 @@ def _store_cache_key(location: str) -> str:
 
     from .registry import TESSERA_MIRROR_URL
 
-    location = location.rstrip("/")
+    location = canonical_store_location(location)
     canonical_prefix = f"{TESSERA_MIRROR_URL}/zarr/"
     if location.startswith(canonical_prefix):
         dataset = location[len(canonical_prefix) :]
@@ -165,8 +165,9 @@ def zarr_store(
     endpoint rather than the ``data.source.coop`` gateway, which drops
     requests under the volume a region read generates; pass
     ``via_gateway=True``, or set :data:`GATEWAY_ENV`, to go through the
-    gateway anyway.  The cache key stays the gateway URL either way, so
-    the two routes share one cache.
+    gateway instead. This also applies to direct AWS HTTPS URLs for the
+    public mirror. The two routes share one cache and dataset identity.
+    An explicit *via_gateway* value overrides the environment variable.
 
     Pass *cache_dir* to persist reads locally through zarr's
     experimental ``CacheStore`` (requires ``zarr>=3.3``)::
@@ -189,7 +190,7 @@ def zarr_store(
         return location
     location = os.fsdecode(os.fspath(location)).rstrip("/")
     original_location = location
-    storage_options = None
+    location = canonical_store_location(location)
     if not _via_gateway(via_gateway):
         direct = _s3_mirror_location(location)
         if direct is not None:
@@ -205,7 +206,7 @@ def zarr_store(
     elif "://" in location:
         from zarr.storage import FsspecStore
 
-        store = FsspecStore.from_url(location, storage_options=storage_options)
+        store = FsspecStore.from_url(location)
     else:
         from zarr.storage import LocalStore
 

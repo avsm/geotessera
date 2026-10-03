@@ -85,7 +85,7 @@ class Dataset:
 # Published datasets. The first row of a version is its default variant;
 # the first row of a version with a format is the default for that format.
 DATASETS: Tuple[Dataset, ...] = (
-    Dataset("1.0", "vultr", "Legacy model; frozen", npy="v1", zarr="v1"),
+    Dataset("1.0", "vultr", "Legacy model", npy="v1", zarr="v1"),
     Dataset(
         "1.1",
         "dclimate",
@@ -671,18 +671,25 @@ def zarr_store_url(version: str = DEFAULT_VERSION, variant: Optional[str] = None
     Accepts a version name (``"v1"``, ``"v1.1"``, ``"v2"``) or an explicit
     store path such as ``"v2-2B-L~beta1"``. *variant* defaults to the
     version's streamed default. A dataset published as both Zarr and
-    Icechunk resolves to Zarr.
+    Icechunk resolves to Zarr. Unknown version/variant pairs use
+    ``{version_path}-{variant}`` so newly published stores can be read.
+    An explicit store path cannot be combined with a variant.
 
     Raises:
-        ValueError: If the dataset is published in neither format.
+        ValueError: If the dataset is published in neither format, or an
+            explicit store path is combined with a variant.
     """
-    _, norm = _parse_dataset_version(version)
-    if not known_variants(norm):
+    if "-" in version:
+        if variant is not None:
+            raise ValueError("An explicit store path cannot be combined with a variant")
         return f"{TESSERA_MIRROR_URL}/zarr/{version}"
+    version_path, norm = _parse_dataset_version(version)
+    if not known_variants(norm) and variant is None:
+        return f"{TESSERA_MIRROR_URL}/zarr/{version_path}"
     variant = variant or default_variant(norm, "stream")
     ds = find_dataset(norm, variant)
     if ds is None:
-        return f"{TESSERA_MIRROR_URL}/zarr/{dataset_path(norm, variant)}"
+        return f"{TESSERA_MIRROR_URL}/zarr/{version_path}-{variant}"
     if ds.zarr is not None:
         return f"{TESSERA_MIRROR_URL}/zarr/{ds.zarr}"
     if ds.icechunk is not None:
@@ -690,11 +697,19 @@ def zarr_store_url(version: str = DEFAULT_VERSION, variant: Optional[str] = None
     raise _unavailable(ds, "zarr")
 
 
+def canonical_store_location(location: str) -> str:
+    """Normalize the two public mirror routes to one store identity."""
+    location = location.rstrip("/")
+    if location.startswith(f"{TESSERA_MIRROR_S3_HTTP_URL}/"):
+        return TESSERA_MIRROR_URL + location[len(TESSERA_MIRROR_S3_HTTP_URL) :]
+    return location
+
+
 def dataset_for_location(location) -> Optional[Dataset]:
     """The published dataset whose Zarr or Icechunk store is *location*."""
     if not isinstance(location, (str, os.PathLike)):
         return None
-    location = os.fsdecode(location).rstrip("/")
+    location = canonical_store_location(os.fsdecode(location))
     for ds in DATASETS:
         if ds.zarr and location == f"{TESSERA_MIRROR_URL}/zarr/{ds.zarr}":
             return ds

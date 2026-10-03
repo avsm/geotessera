@@ -31,6 +31,7 @@ from geotessera.registry import (
 )
 from rich.progress import Progress, TaskID, BarColumn, TextColumn, TimeRemainingColumn
 from rich.table import Table
+from rich.text import Text
 from rich import print as rprint
 
 from .core import GeoTessera
@@ -112,8 +113,9 @@ def global_options(
     via_gateway: bool = typer.Option(
         False,
         "--via-gateway",
-        help="Read Source Cooperative stores through the data.source.coop "
-        "gateway rather than straight from the bucket.",
+        help="Opt into the Source Cooperative proxy (data.source.coop). "
+        "Zarr reads use direct AWS HTTPS by default. Place this flag before "
+        "the command, or set GEOTESSERA_VIA_GATEWAY=1.",
     ),
 ) -> None:
     """Options that apply to every command, given before the command name."""
@@ -446,9 +448,9 @@ def _datasets_table():
     from geotessera.registry import (
         DATASETS,
         FORMATS,
-        STREAM_FORMATS,
-        TESSERA_MIRROR_URL,
-        default_variant,
+        TESSERA_MIRROR_S3_HTTP_URL,
+        dataset_for_location,
+        zarr_store_url,
     )
 
     yes, no = emoji("✓") or "yes", emoji("✗") or "-"
@@ -458,32 +460,23 @@ def _datasets_table():
     stores = create_table(box=None)
     for column in ("Version", "Variant", "Format", "URL"):
         stores.add_column(column)
-    notes = []
+    default = dataset_for_location(zarr_store_url())
     for ds in DATASETS:
-        default = default_variant(ds.version)
         table.add_row(
             f"v{ds.version}",
-            ds.variant + ("*" if ds.variant == default else ""),
+            ds.variant + ("*" if ds == default else ""),
             *(yes if ds.location(fmt) else no for fmt in FORMATS),
             ds.description,
         )
-        for fmt in FORMATS:
-            key = "stream" if fmt in STREAM_FORMATS else fmt
-            fmt_default = default_variant(ds.version, key)
-            if ds.location(fmt) and fmt_default == ds.variant != default:
-                notes.append(f"v{ds.version} {fmt.upper()} defaults to {ds.variant}.")
         if ds.zarr:
-            url = f"{TESSERA_MIRROR_URL}/zarr/{ds.zarr}"
+            url = f"{TESSERA_MIRROR_S3_HTTP_URL}/zarr/{ds.zarr}"
             stores.add_row(f"v{ds.version}", ds.variant, "Zarr", url)
         if ds.icechunk:
             stores.add_row(f"v{ds.version}", ds.variant, "Icechunk", ds.icechunk)
     rprint(table)
-    rprint(
-        "[dim]* Default variant. "
-        + " ".join(notes)
-        + " Embeddings of different versions or variants cannot be "
-        "interchanged. NPY tiles are deprecated and will be removed.[/dim]"
-    )
+    if default is not None:
+        fmt = "Zarr" if default.zarr else "Icechunk"
+        rprint(Text(f"* Default: v{default.name} ({fmt}).", style="dim"))
     return stores
 
 
