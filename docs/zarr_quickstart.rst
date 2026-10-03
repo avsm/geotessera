@@ -2,7 +2,7 @@ Zarr Quick Start
 ================
 
 ``GeoTesseraZarr`` reads embeddings from a local or remote Zarr store or
-Icechunk repository. The default is the global v1.1 dClimate Icechunk store.
+Icechunk repository. The default is the global v1.1 dClimate Zarr store.
 Queries select the required UTM zones and return dequantized float32 values.
 GeoTessera requires Python 3.12 or later::
 
@@ -161,13 +161,35 @@ Variants are separate inference runs. Use one version and variant per
 analysis: their embeddings cannot be interchanged. See
 :ref:`dataset-versions`.
 
+Where reads go
+--------------
+
+The default is ``v1.1-dclimate`` in Zarr format, read directly from AWS over
+HTTPS. ``geotessera info`` displays direct AWS HTTPS URLs.
+
+To opt into the Source Cooperative Cloudflare proxy in Python::
+
+    gt = GeoTesseraZarr(via_gateway=True)
+
+For the CLI, put the global flag before the command name::
+
+    geotessera --via-gateway download --bbox 0.05,52.15,0.20,52.25 --output tiles
+
+Or set ``GEOTESSERA_VIA_GATEWAY=1`` in the environment. Unset it, or set it to
+``0``, to return to direct reads. In Python, ``via_gateway=False`` explicitly
+selects direct reads even when the environment variable is set.
+
+The option accepts either public mirror URL form, including a direct AWS
+HTTPS URL copied from ``info``. Both routes serve the same objects anonymously,
+require no AWS credentials, and share dataset identity and cache entries.
+Icechunk and unrelated stores are unaffected.
+
 Caching
 -------
 
 Set ``cache_dir`` to persist Zarr metadata between runs. Byte-range reads
 of sharded embeddings are cached within the process. Each store uses a
-separate cache subdirectory. Icechunk stores, including the default,
-ignore ``cache_dir``::
+separate cache subdirectory. Icechunk stores ignore ``cache_dir``::
 
     gt = GeoTesseraZarr(zarr_store_url("v2"), cache_dir="tessera-cache")
 

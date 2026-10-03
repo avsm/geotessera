@@ -31,6 +31,7 @@ from geotessera.registry import (
 )
 from rich.progress import Progress, TaskID, BarColumn, TextColumn, TimeRemainingColumn
 from rich.table import Table
+from rich.text import Text
 from rich import print as rprint
 
 from .core import GeoTessera
@@ -105,6 +106,26 @@ app = typer.Typer(
     add_completion=False,
     rich_markup_mode="rich",
 )
+
+
+@app.callback()
+def global_options(
+    via_gateway: bool = typer.Option(
+        False,
+        "--via-gateway",
+        help="Opt into the Source Cooperative proxy (data.source.coop). "
+        "Zarr reads use direct AWS HTTPS by default. Place this flag before "
+        "the command, or set GEOTESSERA_VIA_GATEWAY=1.",
+    ),
+) -> None:
+    """Options that apply to every command, given before the command name."""
+    if via_gateway:
+        # An environment variable rather than a parameter: zarr fills and
+        # preview builds open the store again in worker processes, which
+        # inherit the environment but not a function argument.
+        from .store import GATEWAY_ENV
+
+        os.environ[GATEWAY_ENV] = "1"
 
 
 # Helper to create tables with appropriate settings for dumb terminals
@@ -397,11 +418,19 @@ def _icechunk_info(url: str, verbose: bool, version: str, variant) -> None:
     years = store.years
     incomplete = store.incomplete_years()
     table = create_table(show_header=False, box=None)
-    from geotessera.registry import _parse_dataset_version, default_variant
+    from geotessera.registry import (
+        _parse_dataset_version,
+        default_variant,
+        find_dataset,
+    )
 
     version_path, norm = _parse_dataset_version(version)
     variant = variant or default_variant(norm, "stream")
-    table.add_row("Selected:", f"{version_path} {variant} (Icechunk)")
+    # The counts below come from the Icechunk repository, which holds the tile
+    # registry, but a dataset published in both formats is read from Zarr.
+    ds = find_dataset(norm, variant)
+    streamed = "Zarr" if ds is not None and ds.zarr else "Icechunk"
+    table.add_row("Selected:", f"{version_path} {variant} ({streamed})")
     table.add_row("Checkpoint:", str(attrs.get("checkpoint_id", "-")))
     table.add_row("Years:", f"{years[0]}-{years[-1]}" if years else "-")
     table.add_row("UTM zones:", str(len(store.zones())))
@@ -419,9 +448,9 @@ def _datasets_table():
     from geotessera.registry import (
         DATASETS,
         FORMATS,
-        STREAM_FORMATS,
-        TESSERA_MIRROR_URL,
-        default_variant,
+        TESSERA_MIRROR_S3_HTTP_URL,
+        dataset_for_location,
+        zarr_store_url,
     )
 
     yes, no = emoji("✓") or "yes", emoji("✗") or "-"
@@ -431,32 +460,23 @@ def _datasets_table():
     stores = create_table(box=None)
     for column in ("Version", "Variant", "Format", "URL"):
         stores.add_column(column)
-    notes = []
+    default = dataset_for_location(zarr_store_url())
     for ds in DATASETS:
-        default = default_variant(ds.version)
         table.add_row(
             f"v{ds.version}",
-            ds.variant + ("*" if ds.variant == default else ""),
+            ds.variant + ("*" if ds == default else ""),
             *(yes if ds.location(fmt) else no for fmt in FORMATS),
             ds.description,
         )
-        for fmt in FORMATS:
-            key = "stream" if fmt in STREAM_FORMATS else fmt
-            fmt_default = default_variant(ds.version, key)
-            if ds.location(fmt) and fmt_default == ds.variant != default:
-                notes.append(f"v{ds.version} {fmt.upper()} defaults to {ds.variant}.")
         if ds.zarr:
-            url = f"{TESSERA_MIRROR_URL}/zarr/{ds.zarr}"
+            url = f"{TESSERA_MIRROR_S3_HTTP_URL}/zarr/{ds.zarr}"
             stores.add_row(f"v{ds.version}", ds.variant, "Zarr", url)
         if ds.icechunk:
             stores.add_row(f"v{ds.version}", ds.variant, "Icechunk", ds.icechunk)
     rprint(table)
-    rprint(
-        "[dim]* Default variant. "
-        + " ".join(notes)
-        + " Embeddings of different versions or variants cannot be "
-        "interchanged. NPY tiles are deprecated and will be removed.[/dim]"
-    )
+    if default is not None:
+        fmt = "Zarr" if default.zarr else "Icechunk"
+        rprint(Text(f"* Default: v{default.name} ({fmt}).", style="dim"))
     return stores
 
 

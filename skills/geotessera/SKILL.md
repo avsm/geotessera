@@ -42,7 +42,7 @@ Requires Python 3.12 or later: `pip install geotessera`.
 ```python
 from geotessera import GeoTesseraZarr
 
-gt = GeoTesseraZarr()                    # default v1.1 dClimate Icechunk store
+gt = GeoTesseraZarr()                    # default v1.1 dClimate Zarr store
 gt.years                                 # [2017, ..., 2025]
 
 vec, status = gt.probe(lon, lat, year)   # status: valid|water|nodata|outside
@@ -99,9 +99,9 @@ them, and do not add tqdm or other progress wrappers around reads.
 ## Caching and retries
 
 HTTP retries with exponential backoff are built in; do not add a retry
-layer. Pass `cache_dir` to cache reads from a Zarr store locally — store
-metadata persists across runs, chunk data for the session. Icechunk
-stores, including the default, ignore it:
+layer. Pass `cache_dir` to cache reads from a Zarr store locally, the
+default store included — store metadata persists across runs, chunk data
+for the session. Icechunk stores ignore it:
 
 ```python
 gt = GeoTesseraZarr(zarr_store_url("v2"), cache_dir="tessera-cache")

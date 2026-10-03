@@ -1,21 +1,46 @@
-## Unreleased
+## v0.11.0
 
-- The default dataset is now v1.1 `dclimate`, streamed from the AWS Open
-  Data Icechunk store. NPY tiles of v1.1 exist only for the `cambridge`
-  variant, which is a separate inference which does not interoperate with `dclimate`.
-- `geotessera info` now lists a matrix of the models and variants and formats.
+- The default dataset is now `v1.1-dclimate`, which is a complete global run.
+  It is published both as a Zarr store on Source Cooperative, which streamed
+  reads use, and as an Icechunk repository on AWS Open Data, which holds its
+  tile registry. The default now honours `cache_dir`, which the Icechunk
+  path ignores.
+
+  `GeoTesseraZarr` now opens Icechunk repositories (`*.icechunk`), presenting
+   each zone's hemisphere groups as one `utmNN` zone. This adds `icechunk` and
+  `numcodecs[pcodec]` dependencies.
+
+- NPY tiles are deprecated and will be removed in a future release. Use Zarr
+  or Icechunk, and do let us know if you need NPY for some reason. v1.1 NPY
+  exists only for the `cambridge` variant, a separate inference run that does
+  not interoperate with `dclimate`.
+
+- `geotessera info` lists every published dataset as a matrix of variants and
+  formats, marking `v1.1-dclimate (Zarr)` as the default. Zarr store URLs point
+  directly to AWS HTTPS. The default note no longer lists format-specific
+  fallback variants.
+
+- `GeoTessera(bbox=...)` and `Registry(bbox=...)` load only the manifest rows
+  near an area, cutting load time and memory for regional work. Queries
+  outside the bbox raise `ValueError`. (#414 @WCMC-vblanque)
+
 - Streamed GeoTIFFs record their dataset version and variant in their tags
   and in the output directory's `tessera_metadata.json`, as tile downloads
   already did. Downloading into a directory that holds another dataset,
   and merging GeoTIFFs of different datasets, now fail.
-- `GeoTesseraZarr` opens Icechunk repositories (`*.icechunk`), presenting
-  each zone's hemisphere groups as one `utmNN` zone.
-  Adds `icechunk` and `numcodecs[pcodec]` dependencies.
-- NPY tiles are deprecated and will be removed in a future release.
-  Use Zarr or Icechunk and do let us know if you need NPY for some reason.
-- `GeoTessera(bbox=...)` and `Registry(bbox=...)` load only the manifest
-  rows near an area, cutting load time and memory for regional work.
-  Queries outside the bbox raise `ValueError`.
+
+- Zarr stores no longer have a one-pixel nodata seam between adjacent tiles.
+  (#429 @mtelvers)
+
+- Source Cooperative stores are read straight from the bucket rather than
+  through the `data.source.coop` gateway, which drops requests under the
+  volume a region read generates. Sampling a point from the default store
+  took 5.8s this way against 163.6s through the gateway. It is the same
+  anonymous HTTPS either way, so this needs no credentials and no extra.
+  Opt into the Source Cooperative proxy with `geotessera --via-gateway COMMAND`,
+  `GEOTESSERA_VIA_GATEWAY=1`, or `GeoTesseraZarr(via_gateway=True)` in Python.
+  This also works with direct AWS HTTPS URLs copied from `info`. Both routes
+  retain dataset identity and share cache entries. (#430 @KBodolai)
 
 ## v0.10.3 (2026-09-12)
 

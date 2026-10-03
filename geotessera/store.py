@@ -3,7 +3,7 @@ GeoTesseraZarr — read embeddings from a Tessera zarr store.
 
 The store is UTM-native: embeddings live under one ``utm{NN}`` group per UTM
 zone, on the grid they were produced on.  An Icechunk repository
-(``*.icechunk``), such as the default dClimate v1.1 store, is read through
+(``*.icechunk``), such as the dClimate v1.1 repository, is read through
 :class:`geotessera.icechunk.IcechunkStore`, which presents its hemisphere
 groups in the same layout.  Nothing here reprojects pixels, and
 the two layers each speak one coordinate system:
@@ -65,7 +65,7 @@ from rasterio.warp import Resampling, reproject
 from zarr.abc.store import Store as ZarrStore
 from zarr.storage import ObjectStore
 
-from .registry import dataset_for_location, zarr_store_url
+from .registry import canonical_store_location, dataset_for_location, zarr_store_url
 
 log = logging.getLogger(__name__)
 
@@ -108,7 +108,7 @@ def _store_cache_key(location: str) -> str:
 
     from .registry import TESSERA_MIRROR_URL
 
-    location = location.rstrip("/")
+    location = canonical_store_location(location)
     canonical_prefix = f"{TESSERA_MIRROR_URL}/zarr/"
     if location.startswith(canonical_prefix):
         dataset = location[len(canonical_prefix) :]
@@ -119,38 +119,40 @@ def _store_cache_key(location: str) -> str:
     return f"{slug[-80:]}-{digest}"
 
 
-def _s3_mirror_location(location: str) -> Optional[Tuple[str, dict]]:
-    """Rewrite a Source Cooperative HTTPS URL to its anonymous S3 equivalent.
+GATEWAY_ENV = "GEOTESSERA_VIA_GATEWAY"
 
-    ``data.source.coop`` is a Cloudflare-fronted HTTPS gateway that can choke
-    under the request volume a full zarr region read generates; reading the
-    same bucket over S3 instead avoids that proxy. Only attempted when
-    ``s3fs`` is installed, since it is an optional extra.
+
+def _via_gateway(explicit: Optional[bool]) -> bool:
+    """Whether to read Source Cooperative through its gateway rather than S3.
+
+    *explicit* wins; otherwise the :data:`GATEWAY_ENV` environment variable
+    decides, which is how the ``--via-gateway`` flag reaches worker processes.
     """
-    from .registry import (
-        TESSERA_MIRROR_REPO,
-        TESSERA_MIRROR_S3_BUCKET,
-        TESSERA_MIRROR_URL,
-    )
+    if explicit is not None:
+        return explicit
+    return os.environ.get(GATEWAY_ENV, "").strip().lower() not in ("", "0", "false")
 
-    prefix = f"{TESSERA_MIRROR_URL}/"
-    if not location.startswith(prefix):
-        return None
-    try:
-        import s3fs  # noqa: F401
-    except ImportError:
-        return None
-    from .remote import build_storage_options
 
-    suffix = location[len(TESSERA_MIRROR_URL) :]
-    options = build_storage_options(anon=True, region="us-west-2", path_style=True)
-    return f"s3://{TESSERA_MIRROR_S3_BUCKET}/{TESSERA_MIRROR_REPO}{suffix}", options
+def _s3_mirror_location(location: str) -> Optional[str]:
+    """Rewrite a Source Cooperative gateway URL to the bucket's own endpoint.
+
+    ``data.source.coop`` is a Cloudflare-fronted gateway that can choke under
+    the request volume a zarr region read generates, so reads go to the bucket
+    directly. It is the same objects either way, still anonymous and still
+    plain HTTPS, so this needs no credentials and no optional extra.
+    """
+    from .registry import TESSERA_MIRROR_S3_HTTP_URL, TESSERA_MIRROR_URL
+
+    if not location.startswith(f"{TESSERA_MIRROR_URL}/"):
+        return None
+    return TESSERA_MIRROR_S3_HTTP_URL + location[len(TESSERA_MIRROR_URL) :]
 
 
 def zarr_store(
     location: Union[str, os.PathLike[str], ZarrStore],
     cache_dir: Optional[Union[str, Path]] = None,
     cache_max_size: Optional[int] = None,
+    via_gateway: Optional[bool] = None,
 ) -> ZarrStore:
     """Open *location* as a ``zarr.abc.store.Store``.
 
@@ -159,10 +161,13 @@ def zarr_store(
     from an http(s) URL retry failed requests with exponential backoff,
     because a region read issues hundreds of requests and public data
     servers drop some under load.  ``s3://`` and other URL schemes open
-    through fsspec.  A Source Cooperative HTTPS URL is transparently
-    reopened over S3 instead when ``s3fs`` is installed, bypassing the
-    HTTPS gateway's proxy for the (much heavier) request volume a zarr
-    read generates.
+    through fsspec.  A Source Cooperative URL reads from the bucket's own
+    endpoint rather than the ``data.source.coop`` gateway, which drops
+    requests under the volume a region read generates; pass
+    ``via_gateway=True``, or set :data:`GATEWAY_ENV`, to go through the
+    gateway instead. This also applies to direct AWS HTTPS URLs for the
+    public mirror. The two routes share one cache and dataset identity.
+    An explicit *via_gateway* value overrides the environment variable.
 
     Pass *cache_dir* to persist reads locally through zarr's
     experimental ``CacheStore`` (requires ``zarr>=3.3``)::
@@ -185,14 +190,13 @@ def zarr_store(
         return location
     location = os.fsdecode(os.fspath(location)).rstrip("/")
     original_location = location
-    storage_options = None
-    if location.startswith(("http://", "https://")):
-        s3_mirror = _s3_mirror_location(location)
-        if s3_mirror is not None:
-            location, storage_options = s3_mirror
+    location = canonical_store_location(location)
+    if not _via_gateway(via_gateway):
+        direct = _s3_mirror_location(location)
+        if direct is not None:
+            location = direct
             log.info(
-                "s3fs detected; using direct S3 access for Source Cooperative store %s",
-                original_location,
+                "reading %s from the bucket directly: %s", original_location, direct
             )
     if location.startswith(("http://", "https://")):
         http = HTTPStore.from_url(
@@ -202,7 +206,7 @@ def zarr_store(
     elif "://" in location:
         from zarr.storage import FsspecStore
 
-        store = FsspecStore.from_url(location, storage_options=storage_options)
+        store = FsspecStore.from_url(location)
     else:
         from zarr.storage import LocalStore
 
@@ -899,7 +903,7 @@ class GeoTesseraZarr:
         store_url: Zarr store URL, local path, or a ``zarr.abc.store.Store``
             such as a cache-wrapped store from :func:`zarr_store`. A
             location ending in ``.icechunk`` opens an Icechunk repository.
-            Defaults to the v1.1 dClimate Icechunk store,
+            Defaults to the v1.1 dClimate Zarr store,
             ``zarr_store_url()``.
         cache_dir: Persist reads under this directory, keyed per store
             location (see :func:`zarr_store`). Requires a URL or path
@@ -907,6 +911,9 @@ class GeoTesseraZarr:
             repositories.
         cache_max_size: Bound the *cache_dir* cache in bytes (default
             unbounded).
+        via_gateway: Read a Source Cooperative store through the
+            ``data.source.coop`` gateway instead of the bucket directly
+            (see :func:`zarr_store`).
 
     Attributes:
         dataset: The published :class:`~geotessera.registry.Dataset` at
@@ -936,6 +943,7 @@ class GeoTesseraZarr:
         store_url: Union[str, os.PathLike[str], ZarrStore] = DEFAULT_STORE,
         cache_dir: Optional[Union[str, Path]] = None,
         cache_max_size: Optional[int] = None,
+        via_gateway: Optional[bool] = None,
     ):
         from .icechunk import IcechunkStore, is_icechunk_location
 
@@ -952,7 +960,10 @@ class GeoTesseraZarr:
                 root = self._icechunk.root
             else:
                 self._store = zarr_store(
-                    store_url, cache_dir=cache_dir, cache_max_size=cache_max_size
+                    store_url,
+                    cache_dir=cache_dir,
+                    cache_max_size=cache_max_size,
+                    via_gateway=via_gateway,
                 )
                 root = zarr.open_group(self._store, mode="r")
         except (

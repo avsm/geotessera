@@ -141,7 +141,7 @@ tiles fails and names the variants that have them:
   > except ValueError as e:
   >     print('ValueError:', e)
   > "
-  ValueError: Dataset 1.1-dclimate is not published as NPY; it is available as icechunk. NPY variants of v1.1: cambridge. Run 'geotessera info' to list datasets.
+  ValueError: Dataset 1.1-dclimate is not published as NPY; it is available as zarr, icechunk. NPY variants of v1.1: cambridge. Run 'geotessera info' to list datasets.
 
 Omitting ``dataset_variant`` for v1.1 tiles selects cambridge with a
 warning, since the version default ``dclimate`` has no NPY tiles:
