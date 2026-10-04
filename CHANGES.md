@@ -1,4 +1,24 @@
-## v0.11.0
+## v0.11.0 (04-10-2026)
+
+Wall-to-wall v1.1 embeddings are now available by default!  GeoTessera now
+defaults to `v1.1-dclimate`, a complete global inference run available as
+Zarr or Icechunk.
+
+Open `GeoTesseraZarr()` or use the default CLI download workflow to sample
+points and read regions from wall-to-wall embeddings.  Reads go to AWS over
+anonymous HTTPS directly, with no registration step required.
+The Source Cooperative Cloudflare proxy is also available as an opt-in
+if you specify the `--via-gateway` flag:
+
+```bash
+geotessera --via-gateway download --bbox 0.05,52.15,0.20,52.25 --output tiles
+```
+
+Existing versions and variants remain selectable. The Cambridge v1.1 run is a
+separate dataset, so its embeddings should not be mixed with dClimate's.  NPY
+tile downloads are deprecated in favour of streamed reads via Zarr or Icechunk.
+
+Details:
 
 - The default dataset is now `v1.1-dclimate`, which is a complete global run.
   It is published both as a Zarr store on Source Cooperative, which streamed
@@ -33,14 +53,8 @@
   (#429 @mtelvers)
 
 - Source Cooperative stores are read straight from the bucket rather than
-  through the `data.source.coop` gateway, which drops requests under the
-  volume a region read generates. Sampling a point from the default store
-  took 5.8s this way against 163.6s through the gateway. It is the same
-  anonymous HTTPS either way, so this needs no credentials and no extra.
-  Opt into the Source Cooperative proxy with `geotessera --via-gateway COMMAND`,
-  `GEOTESSERA_VIA_GATEWAY=1`, or `GeoTesseraZarr(via_gateway=True)` in Python.
-  This also works with direct AWS HTTPS URLs copied from `info`. Both routes
-  retain dataset identity and share cache entries. (#430 @KBodolai)
+  through the `data.source.coop` gateway, which can throttle requests under the
+  volume a region read generates. (@KBodolai #430)
 
 ## v0.10.3 (2026-09-12)
 
