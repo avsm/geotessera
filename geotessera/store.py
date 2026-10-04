@@ -71,8 +71,7 @@ log = logging.getLogger(__name__)
 
 DEFAULT_STORE = zarr_store_url()
 
-# Shard-aligned chunk sizes so dask tasks match zarr shards
-SHARD_CHUNKS = {"time": 1, "band": 128, "y": 4096, "x": 4096}
+SHARD_CHUNKS = {"band": 128, "y": 4096, "x": 4096}
 
 # obstore retries each request with exponential backoff and jitter, so
 # one dropped response from a busy server costs a chunk, not the read.
