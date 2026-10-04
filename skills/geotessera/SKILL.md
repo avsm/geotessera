@@ -18,9 +18,13 @@ Requires Python 3.12 or later: `pip install geotessera`.
 - Use `GeoTesseraZarr` (the zarr interface), not the tile-download
   `GeoTessera` class, unless the user explicitly needs offline NPY or
   GeoTIFF tile files. NPY tiles are deprecated and will be removed.
-- Never mix embeddings of different dataset versions or variants: train
-  and predict on the same one. v1.1 has two separate runs, `dclimate`
-  (the default) and `cambridge`, whose embeddings cannot be interchanged.
+- Never mix embeddings of different dataset versions or variants in the
+  same analysis. Training, prediction, clustering, similarity search,
+  change detection and mosaics must all read one dataset; embeddings
+  from different versions live in unrelated spaces and cannot be
+  compared. v1.1 has two separate runs, `dclimate` (the default) and
+  `cambridge`, whose embeddings cannot be interchanged. Check
+  `gt.dataset.name` when combining data from several sources.
 - Never reproject embeddings before analysis. Embeddings return on their
   native UTM grid; classify or cluster on that grid, and reproject only
   the final result (predictions, renders).
@@ -35,7 +39,8 @@ Requires Python 3.12 or later: `pip install geotessera`.
 - Sample many points with one `sample_points` call; a per-point loop is
   an order of magnitude slower.
 - Prefer the latest model version for which tiles exist in the coverage
-  for the user's region of interest.
+  for the user's region of interest; `geotessera coverage --bbox ...`
+  maps it.
 
 ## Core calls
 
@@ -53,11 +58,18 @@ for block, transform, crs in gt.iter_region(bbox, year, strip_rows=512):
     ...                                  # row strips, next strip prefetched
 ```
 
-`read_region` mosaics a lon/lat bounding box on the native UTM grid.
-`read_patch` returns a fixed-size square centred on a point, merging
-across UTM zones when the window spans one. `read_region_quantized`
-returns int8 values plus their scales at a quarter of the memory;
-dequantise blockwise as `values * scales`.
+`read_region` and `iter_region` read a lon/lat bounding box on the
+native UTM grid of the zone holding its centre; a box spanning a zone
+boundary is truncated to that zone. `read_patch` returns a fixed-size
+square centred on a point, merging across UTM zones when the window
+spans one. `read_region_quantized` returns `(values, scales, transform,
+crs)` at a quarter of the memory; dequantise rows on demand with
+`geotessera.store.TesseraAccessor.dequantise(values[rows].transpose(2, 0, 1), scales[rows])`,
+which turns water and no-data pixels into NaN.
+
+`gt.export_geotiffs(bbox, year, output_dir, bands=..., depth=...)`
+streams a region to one float32 GeoTIFF per UTM zone on the native
+grid. The `geotessera download` command does the same from the shell.
 
 ## Dataset versions and depth
 
@@ -70,8 +82,9 @@ gt.dataset.name                             # "1.1-cambridge"
 ```
 
 `zarr_store_url` takes a version and optional variant; `geotessera info`
-lists them. `gt.dataset` is None for a store that is not a published
-dataset.
+lists them. `GeoTesseraZarr` also opens Icechunk repositories (URLs
+ending in `.icechunk`), presenting each zone as one `utmNN` group.
+`gt.dataset` is None for a store that is not a published dataset.
 
 v2 stores publish matryoshka prefixes of each embedding. Passing
 `depth=16` (or `depth=4`) to `sample_points`, `read_region`,
@@ -101,7 +114,7 @@ them, and do not add tqdm or other progress wrappers around reads.
 HTTP retries with exponential backoff are built in; do not add a retry
 layer. Pass `cache_dir` to cache reads from a Zarr store locally, the
 default store included — store metadata persists across runs, chunk data
-for the session. Icechunk stores ignore it:
+for the session. Icechunk repositories ignore it:
 
 ```python
 gt = GeoTesseraZarr(zarr_store_url("v2"), cache_dir="tessera-cache")
